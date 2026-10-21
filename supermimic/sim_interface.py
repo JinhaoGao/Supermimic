@@ -50,7 +50,8 @@ class SimInterface:
     self.nj = self.heads.nj
     self.xi_dim = 4 + self.nj
     idx = self.robot.indexing
-    foot_local = self.robot.find_geoms(r"^(left|right)_foot[1-7]_collision$")[0]
+    foot_regex = env.cfg.events["foot_friction"].params["asset_cfg"].geom_names  # per-robot (G1 capsules / E2 mesh)
+    foot_local = self.robot.find_geoms(foot_regex)[0]
     self.foot_geom_gid = int(idx.geom_ids[foot_local[0]].item())
     torso_local = self.robot.body_names.index(self.cmd.cfg.anchor_body_name)
     self.torso_gid = int(idx.body_ids[torso_local].item())
