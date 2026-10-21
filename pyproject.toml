@@ -1,0 +1,13 @@
+[project]
+name = "supermimic"
+version = "0.1.0"
+description = "Reproduction of SuperMimic (arXiv:2610.28480) on top of mjlab."
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["supermimic*"]

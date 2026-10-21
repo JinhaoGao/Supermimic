@@ -1,0 +1,488 @@
+"""SuperMimic training loop (Algorithm A.1 / Appendix D).
+
+Per iteration:
+  1. Collect: roll the policy (+ action noise) in the simulator, push to replay.
+  2. Fit world model on k-step replay windows (autoregressive).
+  3. Improve the policy by BPTT through H imagined steps with a critic
+     bootstrap, then fit the critic to GAE targets of the same rollout.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import time
+from dataclasses import asdict, dataclass, field
+
+import numpy as np
+import torch
+from torch.utils.tensorboard import SummaryWriter
+
+from .env_cfg import make_env_cfg
+from .evaluate import Evaluator
+from .heads import HeadsCfg
+from .policy import Critic, Policy
+from .replay import ReplayBuffer
+from .sim_interface import ObsHistory, SimInterface
+from .world_model import DynamicsModel, WorldModelCfg
+
+
+@dataclass
+class TrainCfg:
+  motion_files: list[str] = field(default_factory=list)
+  num_envs: int = 4096
+  device: str = "cuda:0"
+  seed: int = 0
+  log_dir: str = "logs/supermimic/run"
+  iterations: int = 320_000
+  env_steps_per_iter: float = 1.0
+  action_noise_std: float = 0.1
+  replay_capacity: int = 1000
+  episode_length_s: float = 10.0
+  # Imagination / policy.
+  H: int = 32
+  rollouts_per_update: int = 4096
+  gamma: float = 0.99
+  lam: float = 0.95
+  policy_lr: float = 2e-4
+  policy_betas: tuple[float, float] = (0.9, 0.95)
+  critic_lr: float = 2e-4
+  critic_epochs: int = 5
+  critic_minibatches: int = 4
+  grad_clip_norm: float = 1.0
+  grad_clip_elem: float = 0.1
+  lr_decay_iters: int = 250_000
+  lr_final_ratio: float = 0.03
+  use_critic: bool = True
+  # Logging / eval / checkpoints.
+  log_interval: int = 50
+  eval_interval: int = 2000
+  ckpt_interval: int = 2000
+  eval_enabled: bool = True
+  wm: WorldModelCfg = field(default_factory=WorldModelCfg)
+  heads: HeadsCfg = field(default_factory=HeadsCfg)
+
+
+def cosine_lambda(decay_iters: int, final_ratio: float):
+  def f(it: int) -> float:
+    if it >= decay_iters:
+      return final_ratio
+    return final_ratio + 0.5 * (1.0 - final_ratio) * (1.0 + math.cos(math.pi * it / decay_iters))
+
+  return f
+
+
+def clip_grads(params, norm: float, elem: float | None) -> float:
+  total = torch.nn.utils.clip_grad_norm_(params, norm).item()
+  if elem is not None:
+    for p in params:
+      if p.grad is not None:
+        p.grad.clamp_(-elem, elem)
+  return total
+
+
+class Trainer:
+  def __init__(self, cfg: TrainCfg):
+    self.cfg = cfg
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    self.device = cfg.device
+    os.makedirs(cfg.log_dir, exist_ok=True)
+    with open(os.path.join(cfg.log_dir, "train_cfg.json"), "w") as f:
+      json.dump(asdict(cfg), f, indent=2, default=str)
+    self.writer = SummaryWriter(cfg.log_dir)
+
+    from mjlab.envs import ManagerBasedRlEnv
+
+    env_cfg = make_env_cfg(cfg.motion_files, cfg.num_envs, mode="train", episode_length_s=cfg.episode_length_s)
+    env_cfg.seed = cfg.seed
+    self.env = ManagerBasedRlEnv(cfg=env_cfg, device=self.device)
+    self.sim = SimInterface(self.env, cfg.heads)
+    self.heads = self.sim.heads
+    self.lib = self.sim.lib
+    self.cmd = self.sim.cmd
+    self.nj = self.sim.nj
+    self.xi_dim = self.sim.xi_dim
+    self.E = cfg.num_envs
+    hc = cfg.heads
+    self.dt = self.env.step_dt
+    assert abs(self.dt - hc.dt) < 1e-9, f"env dt {self.dt} != heads dt {hc.dt}"
+
+    self.policy = Policy(self.heads.proprio_dim, hc.hist, self.heads.goal_frame_dim, hc.K, self.nj).to(self.device)
+    self.critic = Critic(self.heads.feat_dim, self.heads.goal_frame_dim, hc.K, self.xi_dim).to(self.device)
+    self.wm = DynamicsModel(self.nj, self.xi_dim, self.dt, cfg.wm).to(self.device)
+    self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.wm.lr)
+    self.opt_pi = torch.optim.Adam(self.policy.parameters(), lr=cfg.policy_lr, betas=cfg.policy_betas)
+    self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic_lr)
+    lam = cosine_lambda(cfg.lr_decay_iters, cfg.lr_final_ratio)
+    self.sched = [torch.optim.lr_scheduler.LambdaLR(o, lam) for o in (self.opt_wm, self.opt_pi, self.opt_v)]
+    self.buffer = ReplayBuffer(self.E, cfg.replay_capacity, self.heads.state_dim, self.nj, self.xi_dim, self.device)
+    self.evaluator: Evaluator | None = None
+    self.it = 0
+    self.env_steps = 0
+    self._step_carry = 0.0
+
+    n_params = lambda m: sum(p.numel() for p in m.parameters())  # noqa: E731
+    print(f"[Trainer] policy {n_params(self.policy)/1e6:.1f}M  critic {n_params(self.critic)/1e6:.2f}M  wm {n_params(self.wm)/1e6:.1f}M")
+    print(f"[Trainer] {self.lib.summary()}")
+    print(f"[Trainer] env_origins max |xy| = {self.sim.env_origins[:, :2].abs().max().item():.2f}")
+
+    # ---- simulator bookkeeping ----
+    self.env.reset()
+    E = self.E
+    self.state = self.sim.state()
+    self.xi = self.sim.xi()
+    self.frame = self.cmd.time_steps.clone()
+    self.clip_end = self.cmd.clip_end_env.clone()
+    self.prev_action = torch.zeros(E, self.nj, device=self.device)
+    self.ep_step = torch.zeros(E, dtype=torch.long, device=self.device)
+    self.kin = self.heads.kin(self.state)
+    self.hist = ObsHistory(E, hc.hist, self.heads.proprio_dim, self.device)
+    obs = self.heads.proprio(self.state, self.prev_action, self.sim.bias_from_xi(self.xi, self.nj), noise=True)
+    self.hist.reset(torch.arange(E, device=self.device), obs)
+    L = self.env.max_episode_length + 2
+    self.ep_bins = torch.zeros(E, L, dtype=torch.long, device=self.device)
+    self.ep_rews = torch.zeros(E, L, device=self.device)
+    self.ep_ret = torch.zeros(E, device=self.device)
+    self._gamma_pow = cfg.gamma ** torch.arange(L, device=self.device, dtype=torch.float32)
+    self._ar = torch.arange(E, device=self.device)
+    # Rolling episode statistics.
+    self.stats = {"ep_return_norm": [], "ep_len": [], "ep_failed": [], "term_mismatch": []}
+
+  # ---------------------------------------------------------------------------
+  # 1. Data collection
+  # ---------------------------------------------------------------------------
+
+  @torch.no_grad()
+  def collect_step(self) -> None:
+    cfg, heads, E = self.cfg, self.heads, self.E
+    bias = self.sim.bias_from_xi(self.xi, self.nj)
+    goal = heads.goal(self.kin, self.frame, self.clip_end)
+    self.policy.obs_norm.update(self.hist.buf[:, -1])
+    self.policy.goal_norm.update(goal)
+    a = self.policy(self.hist.buf, goal)
+    a_exec = a + cfg.action_noise_std * torch.randn_like(a)
+
+    self.env.step(a_exec)
+    next_state = self.sim.state()
+    kin_next = heads.kin(next_state)
+    r = heads.reward(self.kin, kin_next, next_state, a_exec, self.prev_action, self.frame)
+    term_hard, _ = heads.termination(kin_next, self.frame)
+    terminated = self.env.reset_terminated.bool()
+    timeouts = self.env.reset_time_outs.bool()
+    done = terminated | timeouts
+    self.stats["term_mismatch"].append((term_hard != terminated).float().mean().item())
+
+    self.buffer.add(
+      state=self.state, next_state=next_state, action=a_exec, prev_action=self.prev_action, xi=self.xi, reward=r,
+      frame=self.frame, clip_end=self.clip_end, ep_step=self.ep_step, term=terminated, done=done,
+    )
+    # Episode bookkeeping for the return-based sampler and training-return metric.
+    self.ep_bins[self._ar, self.ep_step] = self.lib.bin_of_frame[self.frame]
+    self.ep_rews[self._ar, self.ep_step] = r
+    self.ep_ret += r
+    self.ep_step += 1
+    self.env_steps += 1
+
+    if done.any():
+      ids = done.nonzero(as_tuple=False).squeeze(-1)
+      self._finish_episodes(ids, terminated[ids])
+      self.env.reset(env_ids=ids)
+      xi_new = self.sim.xi()
+      self.xi[ids] = xi_new[ids]
+      self.state = self.sim.state()
+      self.prev_action[ids] = 0.0
+      self.ep_step[ids] = 0
+      self.ep_ret[ids] = 0.0
+    else:
+      self.state = next_state
+    self.prev_action = torch.where(done[:, None], torch.zeros_like(a_exec), a_exec)
+    self.frame = self.cmd.time_steps.clone()
+    self.clip_end = self.cmd.clip_end_env.clone()
+    self.kin = heads.kin(self.state)
+    obs = heads.proprio(self.state, self.prev_action, self.sim.bias_from_xi(self.xi, self.nj), noise=True)
+    self.hist.push(obs)
+    if done.any():
+      self.hist.reset(ids, obs)
+
+  @torch.no_grad()
+  def _finish_episodes(self, ids: torch.Tensor, failed: torch.Tensor) -> None:
+    """Discounted returns-to-go of finished episodes -> bin estimates; log stats."""
+    g = self.cfg.gamma
+    L = self.ep_step[ids]  # episode lengths
+    n = ids.numel()
+    Lmax = int(L.max().item())
+    rews = self.ep_rews[ids, :Lmax]  # [n,Lmax]
+    bins = self.ep_bins[ids, :Lmax]
+    t = torch.arange(Lmax, device=self.device)
+    valid = t[None, :] < L[:, None]
+    # Bootstrap time-outs with r_last/(1-gamma) so truncated tails are not biased low.
+    r_last = rews.gather(1, (L - 1)[:, None]).squeeze(1)
+    boot = torch.where(failed, torch.zeros_like(r_last), r_last / (1.0 - g))
+    w = rews * valid * self._gamma_pow[:Lmax][None, :]
+    S = torch.flip(torch.cumsum(torch.flip(w, [1]), 1), [1])  # sum_{k>=t} g^k r_k
+    R = S / self._gamma_pow[:Lmax][None, :] + boot[:, None] * (g ** (L[:, None] - t[None, :]).float())
+    self.cmd.update_bin_returns(bins[valid], R[valid])
+    rmax = self.cfg.heads.reward_max_per_step
+    norm_ret = self.ep_ret[ids] / (L.float() * rmax)
+    self.stats["ep_return_norm"].extend(norm_ret.tolist())
+    self.stats["ep_len"].extend(L.tolist())
+    self.stats["ep_failed"].extend(failed.float().tolist())
+
+  # ---------------------------------------------------------------------------
+  # 2. World model
+  # ---------------------------------------------------------------------------
+
+  def update_world_model(self) -> dict:
+    cfg = self.cfg.wm
+    self.wm.train()
+    agg: dict[str, float] = {}
+    for _ in range(cfg.batches_per_update):
+      batch = self.buffer.sample_windows(cfg.windows_per_batch, cfg.k)
+      loss, m = self.wm.window_loss(batch, update_stats=True)
+      self.opt_wm.zero_grad(set_to_none=True)
+      loss.backward()
+      m["wm/grad_norm"] = clip_grads(list(self.wm.parameters()), cfg.grad_clip, None)
+      self.opt_wm.step()
+      for k, v in m.items():
+        agg[k] = agg.get(k, 0.0) + v / cfg.batches_per_update
+    return agg
+
+  # ---------------------------------------------------------------------------
+  # 3. Policy + critic through imagination
+  # ---------------------------------------------------------------------------
+
+  def critic_inputs(self, s: torch.Tensor, goal: torch.Tensor):
+    feat = self.wm.features(s)
+    fd = self.heads.feat_dim
+    feat_n = ((feat - self.wm.in_norm.mean[:fd]) / self.wm.in_norm.std[:fd]).clamp(-10, 10)
+    goal_n = self.policy.goal_norm.normalize(goal).clamp(-10, 10)
+    return feat_n, goal_n
+
+  def update_policy(self) -> dict:
+    cfg, heads, H = self.cfg, self.heads, self.cfg.H
+    N = cfg.rollouts_per_update
+    g, lam = cfg.gamma, cfg.lam
+    for p in self.wm.parameters():
+      p.requires_grad_(False)
+    self.wm.eval()
+    st = self.buffer.sample_starts(N, cfg.heads.hist)
+    xi = st["xi"]
+    bias = self.sim.bias_from_xi(xi, self.nj)
+    with torch.no_grad():
+      hs, hp = st["hist_states"], st["hist_prev_action"]
+      hist_n = hs.shape[1]
+      obs_hist = heads.proprio(
+        hs.reshape(-1, hs.shape[-1]), hp.reshape(-1, self.nj), bias[:, None, :].expand(N, hist_n, self.nj).reshape(-1, self.nj), noise=True
+      ).view(N, hist_n, -1)
+    s = st["state"]
+    frame, clip_end, prev_a = st["frame"], st["clip_end"], st["prev_action"]
+    kin = heads.kin(s)
+    c = torch.ones(N, device=self.device)
+    J = torch.zeros(N, device=self.device)
+    feats_n, goals_n, rews, dsoft = [], [], [], []
+    for t in range(H):
+      goal = heads.goal(kin, frame, clip_end)
+      fn, gn = self.critic_inputs(s, goal)
+      feats_n.append(fn.detach())
+      goals_n.append(gn.detach())
+      a = self.policy(obs_hist, goal)
+      s_next = self.wm.step(s, a, xi)
+      kin_next = heads.kin(s_next)
+      r = heads.reward(kin, kin_next, s_next, a, prev_a, frame)
+      _, d = heads.termination(kin_next, frame)
+      J = J + (g**t) * c * r
+      c = c * (1.0 - d)
+      rews.append(r.detach())
+      dsoft.append(d.detach())
+      frame = torch.minimum(frame + 1, clip_end - 1)
+      obs_next = heads.proprio(s_next, a, bias, noise=True)
+      obs_hist = torch.cat([obs_hist[:, 1:], obs_next[:, None]], dim=1)
+      s, kin, prev_a = s_next, kin_next, a
+    goal_H = heads.goal(kin, frame, clip_end)
+    fn_H, gn_H = self.critic_inputs(s, goal_H)
+    if cfg.use_critic:
+      V_H = self.critic(fn_H, gn_H, xi)
+      J = J + (g**H) * c * V_H
+    loss_pi = -J.mean() / H
+    self.opt_pi.zero_grad(set_to_none=True)
+    loss_pi.backward()
+    gn_pi = clip_grads(list(self.policy.parameters()), cfg.grad_clip_norm, cfg.grad_clip_elem)
+    self.opt_pi.step()
+    for p in self.wm.parameters():
+      p.requires_grad_(True)
+
+    metrics = {
+      "pi/imagined_return": (J.mean() / H).item(),
+      "pi/imagined_reward_mean": torch.stack(rews).mean().item() / self.cfg.heads.reward_max_per_step,
+      "pi/survival_H": c.mean().item(),
+      "pi/grad_norm": gn_pi,
+      "pi/loss": loss_pi.item(),
+    }
+    if cfg.use_critic:
+      metrics.update(self._fit_critic(feats_n, goals_n, fn_H.detach(), gn_H.detach(), xi, rews, dsoft))
+    return metrics
+
+  def _fit_critic(self, feats_n, goals_n, fn_H, gn_H, xi, rews, dsoft) -> dict:
+    cfg, H = self.cfg, self.cfg.H
+    g, lam = cfg.gamma, cfg.lam
+    N = xi.shape[0]
+    with torch.no_grad():
+      V = [self.critic(feats_n[t], goals_n[t], xi) for t in range(H)] + [self.critic(fn_H, gn_H, xi)]
+      R = [None] * (H + 1)
+      R[H] = V[H]
+      for t in reversed(range(H)):
+        R[t] = rews[t] + g * (1.0 - dsoft[t]) * ((1.0 - lam) * V[t + 1] + lam * R[t + 1])
+      targets = torch.stack(R[:H], dim=1)  # [N,H]
+    F = torch.stack(feats_n, dim=1).reshape(N * H, -1)
+    G = torch.stack(goals_n, dim=1).reshape(N * H, -1)
+    X = xi[:, None, :].expand(N, H, -1).reshape(N * H, -1)
+    T = targets.reshape(N * H)
+    total = N * H
+    mb = total // cfg.critic_minibatches
+    losses = []
+    for _ in range(cfg.critic_epochs):
+      perm = torch.randperm(total, device=self.device)
+      for i in range(cfg.critic_minibatches):
+        idx = perm[i * mb : (i + 1) * mb]
+        v = self.critic(F[idx], G[idx], X[idx])
+        loss = torch.nn.functional.mse_loss(v, T[idx])
+        self.opt_v.zero_grad(set_to_none=True)
+        loss.backward()
+        clip_grads(list(self.critic.parameters()), cfg.grad_clip_norm, None)
+        self.opt_v.step()
+        losses.append(loss.item())
+    return {"critic/loss": float(np.mean(losses)), "critic/target_mean": T.mean().item(), "critic/value_H_mean": V[H].mean().item()}
+
+  # ---------------------------------------------------------------------------
+  # Loop
+  # ---------------------------------------------------------------------------
+
+  def save(self, tag: str) -> str:
+    path = os.path.join(self.cfg.log_dir, f"model_{tag}.pt")
+    torch.save(
+      {
+        "it": self.it,
+        "env_steps": self.env_steps,
+        "policy": self.policy.state_dict(),
+        "critic": self.critic.state_dict(),
+        "wm": self.wm.state_dict(),
+        "opt_wm": self.opt_wm.state_dict(),
+        "opt_pi": self.opt_pi.state_dict(),
+        "opt_v": self.opt_v.state_dict(),
+        "bin_G": self.cmd.bin_G,
+        "bin_visits": self.cmd.bin_visits,
+        "cfg": asdict(self.cfg),
+        "dims": dict(proprio=self.heads.proprio_dim, hist=self.cfg.heads.hist, goal_frame=self.heads.goal_frame_dim, K=self.cfg.heads.K, nj=self.nj, xi=self.xi_dim),
+      },
+      path,
+    )
+    return path
+
+  def load(self, path: str) -> None:
+    ck = torch.load(path, map_location=self.device)
+    self.policy.load_state_dict(ck["policy"])
+    self.critic.load_state_dict(ck["critic"])
+    self.wm.load_state_dict(ck["wm"])
+    self.opt_wm.load_state_dict(ck["opt_wm"])
+    self.opt_pi.load_state_dict(ck["opt_pi"])
+    self.opt_v.load_state_dict(ck["opt_v"])
+    self.cmd.bin_G.copy_(ck["bin_G"])
+    self.cmd.bin_visits.copy_(ck["bin_visits"])
+    self.it = ck["it"]
+    self.env_steps = ck["env_steps"]
+    for s in self.sched:
+      s.last_epoch = self.it
+    print(f"[Trainer] resumed from {path} at iteration {self.it}")
+
+  def evaluate(self) -> dict:
+    if self.evaluator is None:
+      self.evaluator = Evaluator(self.cfg.motion_files, self.cfg.heads, self.device)
+    return self.evaluator.run(self.policy)
+
+  def train(self) -> None:
+    cfg = self.cfg
+    warmup = max(cfg.wm.k + cfg.heads.hist + 2, 32)
+    t_log = time.time()
+    steps_at_log = self.env_steps
+    agg: dict[str, list[float]] = {}
+    while self.it < cfg.iterations:
+      t0 = time.time()
+      # 1. collect
+      self._step_carry += cfg.env_steps_per_iter
+      n_steps = int(self._step_carry)
+      self._step_carry -= n_steps
+      for _ in range(max(n_steps, 0)):
+        self.collect_step()
+      t1 = time.time()
+      if self.buffer.size < warmup:
+        # Fill the buffer before learning.
+        for _ in range(warmup - self.buffer.size):
+          self.collect_step()
+        continue
+      # 2. world model
+      m_wm = self.update_world_model()
+      t2 = time.time()
+      # 3. policy + critic
+      m_pi = self.update_policy()
+      t3 = time.time()
+      for s in self.sched:
+        s.step()
+      self.it += 1
+      for k, v in {**m_wm, **m_pi, "time/collect": t1 - t0, "time/wm": t2 - t1, "time/policy": t3 - t2, "time/iter": t3 - t0}.items():
+        agg.setdefault(k, []).append(v)
+
+      if self.it % cfg.log_interval == 0:
+        now = time.time()
+        fps = (self.env_steps - steps_at_log) * self.E / max(now - t_log, 1e-6)
+        scal = {k: float(np.mean(v)) for k, v in agg.items()}
+        scal["time/env_fps"] = fps
+        scal["time/iter_per_s"] = cfg.log_interval / max(now - t_log, 1e-6)
+        scal["train/env_steps_per_env"] = self.env_steps
+        scal["train/lr"] = self.opt_pi.param_groups[0]["lr"]
+        if self.stats["ep_return_norm"]:
+          scal["train/ep_return_norm"] = float(np.mean(self.stats["ep_return_norm"]))
+          scal["train/ep_len"] = float(np.mean(self.stats["ep_len"]))
+          scal["train/ep_failed_frac"] = float(np.mean(self.stats["ep_failed"]))
+        scal["train/term_mismatch"] = float(np.mean(self.stats["term_mismatch"])) if self.stats["term_mismatch"] else 0.0
+        scal["sampler/entropy"] = self.cmd.metrics["sampling_entropy"][0].item()
+        scal["sampler/top1_prob"] = self.cmd.metrics["sampling_top1_prob"][0].item()
+        scal["sampler/bins_visited_frac"] = (self.cmd.bin_visits > 0).float().mean().item()
+        for k, v in scal.items():
+          self.writer.add_scalar(k, v, self.it)
+        wall_h = (now - self._t_start) / 3600 if hasattr(self, "_t_start") else 0.0
+        print(
+          f"[it {self.it:7d} | {wall_h:5.2f} h] wm {scal.get('wm/loss', 0):.4f} (e1 {scal.get('wm/err_step1', 0):.3f}, e{cfg.wm.k} {scal.get(f'wm/err_step{cfg.wm.k}', 0):.3f}) "
+          f"| imag_ret {scal.get('pi/imagined_return', 0):.4f} surv {scal.get('pi/survival_H', 0):.3f} | "
+          f"ep_ret {scal.get('train/ep_return_norm', 0):.3f} len {scal.get('train/ep_len', 0):.0f} fail {scal.get('train/ep_failed_frac', 0):.2f} | "
+          f"{scal['time/iter']*1000:.0f} ms/it (c {scal['time/collect']*1000:.0f} wm {scal['time/wm']*1000:.0f} pi {scal['time/policy']*1000:.0f}) fps {fps:.0f}",
+          flush=True,
+        )
+        agg = {}
+        for k in self.stats:
+          self.stats[k] = []
+        t_log, steps_at_log = now, self.env_steps
+
+      if cfg.ckpt_interval and self.it % cfg.ckpt_interval == 0:
+        self.save(str(self.it))
+      if cfg.eval_enabled and cfg.eval_interval and self.it % cfg.eval_interval == 0:
+        te = time.time()
+        try:
+          res = self.evaluate()
+          for k, v in res["scalars"].items():
+            self.writer.add_scalar(f"eval/{k}", v, self.it)
+          self.writer.add_scalar("time/eval", time.time() - te, self.it)
+          print(f"[eval it {self.it}] return {res['scalars']['return_mean']:.4f} min {res['scalars']['return_min']:.3f} failed {int(res['scalars']['failed'])}/{res['num_clips']} ({time.time()-te:.0f}s)", flush=True)
+          with open(os.path.join(cfg.log_dir, "eval.jsonl"), "a") as f:
+            f.write(json.dumps({"it": self.it, "env_steps": self.env_steps, "wall_s": time.time() - self._t_start, **res["scalars"]}) + "\n")
+        except Exception as e:  # noqa: BLE001
+          print(f"[eval] failed: {e!r}", flush=True)
+          cfg.eval_enabled = False
+    self.save("final")
+
+  def run(self) -> None:
+    self._t_start = time.time()
+    self.train()
