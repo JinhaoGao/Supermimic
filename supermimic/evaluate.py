@@ -30,6 +30,7 @@ class Evaluator:
     max_envs: int = 1024,
     compile_: bool = True,
     cache_dir: str = "",
+    robot: str = "g1",
   ):
     from mjlab.envs import ManagerBasedRlEnv
 
@@ -37,7 +38,9 @@ class Evaluator:
     self.eval_clips = tuple(eval_clips) if eval_clips else tuple(range(n_total))
     self.num_clips = len(self.eval_clips)
     self.num_envs = min(self.num_clips, max_envs)
-    env_cfg = make_env_cfg(motion_files, self.num_envs, mode="eval", library_key=library_key, eval_clips=self.eval_clips, cache_dir=cache_dir)
+    env_cfg = make_env_cfg(
+      motion_files, self.num_envs, mode="eval", robot=robot, library_key=library_key, eval_clips=self.eval_clips, cache_dir=cache_dir
+    )
     self.env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
     self.sim = SimInterface(self.env, heads_cfg)
     self.heads = self.sim.heads

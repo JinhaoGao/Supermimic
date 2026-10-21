@@ -415,6 +415,7 @@ class Trainer:
       self.evaluator = Evaluator(
         self.cfg.motion_files, self.cfg.heads, self.device, library_key=self.LIB_KEY, eval_clips=self.eval_clip_ids,
         num_clips_total=self.lib.num_clips, max_envs=self.cfg.eval_envs, compile_=self.cfg.compile, cache_dir=self.cfg.cache_dir,
+        robot=self.cfg.robot,
       )
     return self.evaluator.run(self.policy)
 
