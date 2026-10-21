@@ -213,7 +213,7 @@ class MujocoPlayer:
   # ---- rollout -------------------------------------------------------------
 
   @torch.no_grad()
-  def play(self, ref: Reference, start_s=0.0, seconds=15.0, viewer=False, video=None, slowmo=1.0, width=960, height=600, fps_out=25, stop_on_fall=True):
+  def play(self, ref: Reference, start_s=0.0, seconds=15.0, viewer=False, video=None, slowmo=1.0, width=960, height=600, fps_out=25, stop_on_fall=True, push_times=None, push_v=1.0):
     model, data = self.model, self.data
     f0 = int(start_s / self.dt)
     f_last = min(ref.T - 1, f0 + int(seconds / self.dt))
@@ -252,10 +252,15 @@ class MujocoPlayer:
       render_every = max(1, int(round(1.0 / (self.dt * fps_out))))
 
     sum_r, steps, fell_at = 0.0, 0, None
+    push_steps = {int(round(tp / self.dt)) + f0: i for i, tp in enumerate(push_times or [])}
+    push_dirs = np.array([[1, 0, 0], [0, 1, 0], [-1, 0, 0], [0, -1, 0]], dtype=np.float64)
     for t in range(f0 + 1, f_last + 1):
       goal = self.goal(ref, frame)
       a = self.act(hist, goal)
       data.ctrl[self.act_ids] = self.offset + self.scale * a.numpy().astype(np.float64)
+      if t in push_steps:  # velocity impulse on the root, like mjlab's push_by_setting_velocity
+        data.qvel[self.fv : self.fv + 3] += push_v * push_dirs[push_steps[t] % 4]
+        print(f"[play] push {push_v:.1f} m/s dir {push_dirs[push_steps[t] % 4].tolist()} at t={t * self.dt:.2f}s", flush=True)
       for _ in range(self.decimation):
         mujoco.mj_step(model, data)
       mujoco.mj_forward(model, data)
@@ -316,12 +321,17 @@ def main():
   p.add_argument("--width", type=int, default=960)
   p.add_argument("--height", type=int, default=600)
   p.add_argument("--backend", type=str, default="onnx", choices=["onnx", "torch"], help="policy inference backend (default: the exported ONNX)")
+  p.add_argument("--push_t", type=float, nargs="*", default=None, help="times (s after start) of root velocity pushes, directions cycle +x,+y,-x,-y")
+  p.add_argument("--push_v", type=float, default=1.0, help="push magnitude in m/s")
   args = p.parse_args()
   torch.set_num_threads(4)
   player = MujocoPlayer(os.path.expanduser(args.bundle), backend=args.backend)
   ref = Reference(os.path.expanduser(args.motion), player.meta)
   assert abs(ref.fps - 1.0 / player.dt) < 1e-6, f"reference fps {ref.fps} != control rate {1/player.dt}"
-  res = player.play(ref, args.start_s, args.seconds, viewer=args.viewer, video=args.video, slowmo=args.slowmo, width=args.width, height=args.height, stop_on_fall=not args.keep_going)
+  res = player.play(
+    ref, args.start_s, args.seconds, viewer=args.viewer, video=args.video, slowmo=args.slowmo, width=args.width, height=args.height,
+    stop_on_fall=not args.keep_going, push_times=args.push_t, push_v=args.push_v,
+  )
   print("[play]", json.dumps(res))
 
 
