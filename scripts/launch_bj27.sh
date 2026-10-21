@@ -12,8 +12,8 @@ cd "$HOME/supermimic/mjlab"
 mkdir -p "$HOME/supermimic/runs"
 LOG="$HOME/supermimic/runs/${RUN}.log"
 echo "[launch] GPU=$GPU run=$RUN log=$LOG"
-CUDA_VISIBLE_DEVICES="$GPU" nohup uv run python "$REPO_DIR/scripts/train.py" \
-  --motion_dir "$HOME/supermimic/data/lafan1" \
-  --log_root "$HOME/supermimic/logs" \
-  --run_name "$RUN" "$@" > "$LOG" 2>&1 &
-echo "[launch] pid $!"
+# MuJoCo Warp solver-overflow warnings are filtered out of the log (they spam every step).
+CUDA_VISIBLE_DEVICES="$GPU" PYTHONUNBUFFERED=1 nohup uv run python "$REPO_DIR/scripts/train.py" \
+  --log_root "$HOME/supermimic/logs" --cache_dir "$HOME/supermimic/data/cache" \
+  --run_name "$RUN" "$@" 2>&1 | grep --line-buffered -v "iterations limit reached\|warn_overflow" > "$LOG" &
+echo "[launch] started (log: $LOG)"
