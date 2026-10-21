@@ -7,11 +7,12 @@ export PATH="$HOME/.local/bin:$PATH"
 GPU="${GPU:-4}"
 RUN="${1:?run name}"
 shift || true
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$HOME/supermimic/mjlab"
 mkdir -p "$HOME/supermimic/runs"
 LOG="$HOME/supermimic/runs/${RUN}.log"
 echo "[launch] GPU=$GPU run=$RUN log=$LOG"
-CUDA_VISIBLE_DEVICES="$GPU" nohup uv run python ../supermimic_repro/scripts/train.py \
+CUDA_VISIBLE_DEVICES="$GPU" nohup uv run python "$REPO_DIR/scripts/train.py" \
   --motion_dir "$HOME/supermimic/data/lafan1" \
   --log_root "$HOME/supermimic/logs" \
   --run_name "$RUN" "$@" > "$LOG" 2>&1 &
