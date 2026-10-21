@@ -66,7 +66,10 @@ def _npz_frames(path: str) -> int:
   with zipfile.ZipFile(path) as z:
     with z.open("joint_pos.npy") as f:
       ver = np.lib.format.read_magic(f)
-      shape, _, _ = np.lib.format._read_array_header(f, ver)  # type: ignore[attr-defined]
+      if ver == (1, 0):
+        shape, _, _ = np.lib.format.read_array_header_1_0(f)
+      else:
+        shape, _, _ = np.lib.format.read_array_header_2_0(f)
   return int(shape[0])
 
 
