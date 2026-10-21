@@ -74,7 +74,66 @@ def main():
     json.dump(meta, f, indent=2)
   torch.save(ck["policy"], os.path.join(args.out, "policy.pt"))
   env.close()
-  print(f"[export] wrote {args.out}: scene.mjb, meta.json, policy.pt (iteration {ck['it']})")
+  export_onnx(ck, meta, os.path.join(args.out, "policy.onnx"))
+  print(f"[export] wrote {args.out}: scene.mjb, meta.json, policy.pt, policy.onnx (iteration {ck['it']})")
+
+
+def export_onnx(ck: dict, meta: dict, path: str) -> None:
+  """Policy -> ONNX. Inputs: obs_hist [1, hist, proprio] (oldest first), goal [1, K, 67].
+  Output: action [1, nj] (normalized joint setpoint; target = offset + scale * action).
+  Input normalization is part of the graph. Layout documented in the ONNX metadata."""
+  import onnx
+
+  from supermimic.policy import Policy
+
+  d = meta["dims"]
+  policy = Policy(d["proprio"], d["hist"], d["goal_frame"], d["K"], d["nj"]).eval()
+  policy.load_state_dict(ck["policy"])
+  obs = torch.zeros(1, d["hist"], d["proprio"])
+  goal = torch.zeros(1, d["K"], d["goal_frame"])
+  torch.onnx.export(
+    policy, (obs, goal), path, export_params=True, opset_version=18, input_names=["obs_hist", "goal"],
+    output_names=["action"], dynamic_axes={}, dynamo=False,
+  )
+  nj = d["nj"]
+  layout = {
+    "obs_hist": f"[1,{d['hist']},{d['proprio']}] oldest->newest; per frame: joint_pos-default({nj}), joint_vel({nj}), "
+    f"base_ang_vel_pelvis(3), projected_gravity_pelvis(3), prev_action({nj}); joints in joint_names order",
+    "goal": f"[1,{d['K']},{d['goal_frame']}] future reference frames t..t+K-1 (clamped at clip end); per frame: "
+    f"ref_joint_pos({nj}), ref_joint_vel({nj}), ref_anchor_pos_in_robot_anchor_frame(3), ref_anchor_rot6d_in_robot_anchor_frame(6)",
+    "action": f"[1,{nj}] in action_joint_names order; joint target = action_offset + action_scale * action",
+  }
+  model = onnx.load(path)
+  props = {
+    "iteration": str(meta["iteration"]),
+    "control_dt": str(meta["control_dt"]),
+    "joint_names": json.dumps(meta["joint_names"]),
+    "default_joint_pos": json.dumps(meta["default_joint_pos"]),
+    "action_joint_names": json.dumps(meta["action_joint_names"]),
+    "action_scale": json.dumps(meta["action_scale"]),
+    "action_offset": json.dumps(meta["action_offset"]),
+    "body_names": json.dumps(meta["body_names"]),
+    "anchor_body_name": meta["anchor_body_name"],
+    "layout": json.dumps(layout),
+  }
+  for k, v in props.items():
+    e = model.metadata_props.add()
+    e.key, e.value = k, v
+  onnx.save(model, path)
+  # Verify against torch.
+  try:
+    import onnxruntime as ort
+
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    torch.manual_seed(0)
+    o = torch.randn(1, d["hist"], d["proprio"]) * 0.5
+    g = torch.randn(1, d["K"], d["goal_frame"]) * 0.5
+    with torch.no_grad():
+      ref = policy(o, g).numpy()
+    out = sess.run(None, {"obs_hist": o.numpy(), "goal": g.numpy()})[0]
+    print(f"[export] onnx vs torch max abs diff: {abs(out - ref).max():.2e}")
+  except Exception as e:  # noqa: BLE001
+    print(f"[export] onnxruntime check skipped: {e!r}")
 
 
 if __name__ == "__main__":

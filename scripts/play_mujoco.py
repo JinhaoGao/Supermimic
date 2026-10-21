@@ -66,7 +66,7 @@ class Reference:
 
 
 class MujocoPlayer:
-  def __init__(self, bundle: str, device: str = "cpu"):
+  def __init__(self, bundle: str, device: str = "cpu", backend: str = "onnx"):
     self.meta = json.load(open(os.path.join(bundle, "meta.json")))
     m = self.meta
     self.model = mujoco.MjModel.from_binary_path(os.path.join(bundle, "scene.mjb"))
@@ -100,9 +100,27 @@ class MujocoPlayer:
     self.K, self.hist = int(h["K"]), int(h["hist"])
     self.h = h
     d = m["dims"]
-    self.policy = Policy(d["proprio"], d["hist"], d["goal_frame"], d["K"], d["nj"]).to(device).eval()
-    self.policy.load_state_dict(torch.load(os.path.join(bundle, "policy.pt"), map_location=device))
+    onnx_path = os.path.join(bundle, "policy.onnx")
+    self.sess = None
+    if backend == "onnx" and os.path.exists(onnx_path):
+      import onnxruntime as ort
+
+      self.sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+      self.backend = "onnx"
+      print(f"[play] policy backend: onnxruntime ({onnx_path})")
+    else:
+      self.policy = Policy(d["proprio"], d["hist"], d["goal_frame"], d["K"], d["nj"]).to(device).eval()
+      self.policy.load_state_dict(torch.load(os.path.join(bundle, "policy.pt"), map_location=device))
+      self.backend = "torch"
+      print(f"[play] policy backend: torch ({os.path.join(bundle, 'policy.pt')})")
     self._vel6 = np.zeros(6)
+
+  def act(self, hist: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
+    if self.sess is not None:
+      out = self.sess.run(None, {"obs_hist": hist[None].numpy().astype(np.float32), "goal": goal[None].numpy().astype(np.float32)})[0]
+      return torch.as_tensor(out[0])
+    with torch.no_grad():
+      return self.policy(hist[None], goal[None])[0]
 
   # ---- simulator readouts ---------------------------------------------------
 
@@ -232,7 +250,7 @@ class MujocoPlayer:
     sum_r, steps, fell_at = 0.0, 0, None
     for t in range(f0 + 1, f_last + 1):
       goal = self.goal(ref, frame)
-      a = self.policy(hist[None], goal[None])[0]
+      a = self.act(hist, goal)
       data.ctrl[self.act_ids] = self.offset + self.scale * a.numpy().astype(np.float64)
       for _ in range(self.decimation):
         mujoco.mj_step(model, data)
@@ -293,9 +311,10 @@ def main():
   p.add_argument("--keep_going", action="store_true", help="do not stop at the first fall")
   p.add_argument("--width", type=int, default=960)
   p.add_argument("--height", type=int, default=600)
+  p.add_argument("--backend", type=str, default="onnx", choices=["onnx", "torch"], help="policy inference backend (default: the exported ONNX)")
   args = p.parse_args()
   torch.set_num_threads(4)
-  player = MujocoPlayer(os.path.expanduser(args.bundle))
+  player = MujocoPlayer(os.path.expanduser(args.bundle), backend=args.backend)
   ref = Reference(os.path.expanduser(args.motion), player.meta)
   assert abs(ref.fps - 1.0 / player.dt) < 1e-6, f"reference fps {ref.fps} != control rate {1/player.dt}"
   res = player.play(ref, args.start_s, args.seconds, viewer=args.viewer, video=args.video, slowmo=args.slowmo, width=args.width, height=args.height, stop_on_fall=not args.keep_going)
