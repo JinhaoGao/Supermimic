@@ -56,6 +56,32 @@ def main():
   heads = {k: v for k, v in ck["cfg"]["heads"].items() if k != "extra"}
   nj = ck["dims"]["nj"]
   heads["goal_anchor_pos"] = ck["dims"]["goal_frame"] == 2 * nj + 9  # old checkpoints lack the flag
+  mj = env.sim.mj_model
+  # PD gains per policy joint (mjlab builtin position actuators: gainprm[0] = kp, biasprm[2] = -kd).
+  pd_kp, pd_kd = [], []
+  for n in robot.joint_names:
+    jid = mujoco.mj_name2id(mj, mujoco.mjtObj.mjOBJ_JOINT, f"robot/{n}")
+    acts = [a for a in range(mj.nu) if int(mj.actuator_trnid[a, 0]) == jid]
+    assert len(acts) == 1, f"joint {n}: {len(acts)} actuators"
+    pd_kp.append(float(mj.actuator_gainprm[acts[0], 0]))
+    pd_kd.append(float(-mj.actuator_biasprm[acts[0], 2]))
+  # Kinematic chain root -> anchor (for the deploy side: anchor orientation from IMU + joint encoders).
+  bid_anchor = mujoco.mj_name2id(mj, mujoco.mjtObj.mjOBJ_BODY, f"robot/{cmd.cfg.anchor_body_name}")
+  bid_root = mujoco.mj_name2id(mj, mujoco.mjtObj.mjOBJ_BODY, f"robot/{robot.body_names[0]}")
+  chain = []
+  b = bid_anchor
+  while b != bid_root:
+    jadr, jnum = int(mj.body_jntadr[b]), int(mj.body_jntnum[b])
+    link = {"body": mujoco.mj_id2name(mj, mujoco.mjtObj.mjOBJ_BODY, b).split("/")[-1], "body_quat": mj.body_quat[b].tolist(), "joint": None, "axis": [0.0, 0.0, 1.0], "qpos0": 0.0}
+    if jnum == 1 and int(mj.jnt_type[jadr]) == mujoco.mjtJoint.mjJNT_HINGE:
+      link["joint"] = mujoco.mj_id2name(mj, mujoco.mjtObj.mjOBJ_JOINT, jadr).split("/")[-1]
+      link["axis"] = mj.jnt_axis[jadr].tolist()
+      link["qpos0"] = float(mj.qpos0[int(mj.jnt_qposadr[jadr])])
+    elif jnum != 0:
+      raise RuntimeError(f"unsupported joint layout on body {link['body']}")
+    chain.append(link)
+    b = int(mj.body_parentid[b])
+  chain.reverse()
   meta = {
     "ckpt": os.path.abspath(args.ckpt),
     "iteration": ck["it"],
@@ -74,6 +100,9 @@ def main():
     "root_body_name": robot.body_names[0],
     "heads": heads,
     "dims": ck["dims"],
+    "pd_kp": pd_kp,
+    "pd_kd": pd_kd,
+    "anchor_chain": chain,
   }
   with open(os.path.join(args.out, "meta.json"), "w") as f:
     json.dump(meta, f, indent=2)
