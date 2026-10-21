@@ -81,8 +81,8 @@ class ReplayBuffer:
     episode (clamped at the episode start, repeating the first step).
     """
     env = torch.randint(0, self.E, (n,), device=self.device)
-    lo = min(hist - 1, max(self.size - 1, 0))
-    age = torch.randint(lo, max(self.size, lo + 1), (n,), device=self.device)
+    # The start needs hist-1 older (written) slots: age + hist - 1 <= size - 1.
+    age = torch.randint(0, max(self.size - hist + 1, 1), (n,), device=self.device)
     slot = (self.ptr - 1 - age) % self.C
     ep = self.ep_step[env, slot]
     back = torch.arange(hist - 1, -1, -1, device=self.device)  # hist-1 ... 0

@@ -73,16 +73,14 @@ class SimInterface:
     """Scaled sim context [friction(1), encoder bias(J), torso COM offset(3)]."""
     E = self.env.num_envs
     model = self.env.sim.model
-    fr = model.geom_friction
-    if fr.dim() == 3:
-      friction = fr[:, self.foot_geom_gid, 0]
-    else:
-      friction = fr[self.foot_geom_gid, 0].expand(E)
-    ipos = model.body_ipos
-    if ipos.dim() == 3:
-      com = ipos[:, self.torso_gid] - self.ipos_nominal
-    else:
-      com = (ipos[self.torso_gid] - self.ipos_nominal).expand(E, 3)
+    fr = torch.as_tensor(model.geom_friction)
+    friction = fr[:, self.foot_geom_gid, 0] if fr.dim() == 3 else fr[self.foot_geom_gid, 0].reshape(1)
+    if friction.shape[0] != E:
+      friction = friction.expand(E)
+    ipos = torch.as_tensor(model.body_ipos)
+    com = (ipos[:, self.torso_gid] if ipos.dim() == 3 else ipos[self.torso_gid].reshape(1, 3)) - self.ipos_nominal
+    if com.shape[0] != E:
+      com = com.expand(E, 3)
     bias = self.robot.data.encoder_bias
     lo, hi = self.FRICTION_RANGE
     f_n = (friction - 0.5 * (lo + hi)) / (0.5 * (hi - lo))
