@@ -35,8 +35,13 @@ def main():
   p.add_argument("--height", type=int, default=480)
   p.add_argument("--fps_out", type=int, default=25)
   p.add_argument("--no_video", action="store_true")
+  p.add_argument("--viewer", action="store_true", help="interactive MuJoCo window (policy robot + green reference ghost)")
+  p.add_argument("--slowmo", type=float, default=1.0, help="viewer playback slowdown factor (2 = half speed)")
   args = p.parse_args()
-  os.environ.setdefault("MUJOCO_GL", "egl")
+  if args.viewer:
+    args.no_video = True
+  else:
+    os.environ.setdefault("MUJOCO_GL", "egl")
 
   import mediapy
 
@@ -142,6 +147,24 @@ def run_clip(mf, name, policy, heads_cfg, args, ManagerBasedRlEnv, make_env_cfg,
     cam.trackbodyid = root_bid
     cam.distance, cam.azimuth, cam.elevation = 3.0, 135.0, -12.0
     render_every = max(1, int(round(1.0 / (dt * args.fps_out))))
+  viewer = None
+  if args.viewer:
+    import importlib
+    import time
+
+    mj_viewer = importlib.import_module("mujoco.viewer")  # not `import mujoco.viewer`: would shadow `mujoco` locally
+    viewer = mj_viewer.launch_passive(model, data, show_left_ui=False, show_right_ui=False)
+    viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+    viewer.cam.trackbodyid = root_bid
+    viewer.cam.distance, viewer.cam.azimuth, viewer.cam.elevation = 3.0, 135.0, -12.0
+    viewer.opt.geomgroup[:] = 0
+    viewer.opt.geomgroup[2] = 1
+    ghost_opt = mujoco.MjvOption()
+    ghost_opt.geomgroup[:] = 0
+    ghost_opt.geomgroup[2] = 1
+    pert = mujoco.MjvPerturb()
+    t_wall0 = time.time()
+    print(f"[sim2sim] viewer: {name}  (green ghost = reference; close the window to stop)", flush=True)
 
   # Policy state.
   prev_a = torch.zeros(1, nj, device=dev)
@@ -179,6 +202,20 @@ def run_clip(mf, name, policy, heads_cfg, args, ManagerBasedRlEnv, make_env_cfg,
       renderer.update_scene(data_ref, camera=cam, scene_option=opt)
       img_ref = renderer.render().copy()
       frames.append(np.concatenate([img_sim, img_ref], axis=1))
+    if viewer is not None:
+      if not viewer.is_running():
+        break
+      set_ref(data_ref, t)
+      scn = viewer.user_scn
+      scn.ngeom = 0
+      mujoco.mjv_addGeoms(model, data_ref, ghost_opt, pert, mujoco.mjtCatBit.mjCAT_DYNAMIC, scn)
+      for gi in range(scn.ngeom):
+        scn.geoms[gi].rgba[:] = (0.3, 0.9, 0.4, 0.35)
+      viewer.sync()
+      target_wall = t_wall0 + (t - f0) * dt * args.slowmo
+      lag = target_wall - time.time()
+      if lag > 0:
+        time.sleep(lag)
     if failed:
       break
     prev_a = a
@@ -192,6 +229,8 @@ def run_clip(mf, name, policy, heads_cfg, args, ManagerBasedRlEnv, make_env_cfg,
     out = os.path.join(args.out_dir, f"{name}.mp4")
     mediapy.write_video(out, frames, fps=args.fps_out)
     res["video"] = out
+  if viewer is not None:
+    viewer.close()
   env.close()
   return res
 
