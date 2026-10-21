@@ -21,6 +21,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from .env_cfg import make_env_cfg
 from .evaluate import Evaluator
+from .fns import StepFns
 from .heads import HeadsCfg
 from .policy import Critic, Policy
 from .replay import ReplayBuffer
@@ -40,6 +41,8 @@ class TrainCfg:
   action_noise_std: float = 0.1
   replay_capacity: int = 1000
   episode_length_s: float = 10.0
+  compile: bool = True
+  compile_mode: str | None = None
   # Imagination / policy.
   H: int = 32
   rollouts_per_update: int = 4096
@@ -114,6 +117,7 @@ class Trainer:
     self.policy = Policy(self.heads.proprio_dim, hc.hist, self.heads.goal_frame_dim, hc.K, self.nj).to(self.device)
     self.critic = Critic(self.heads.feat_dim, self.heads.goal_frame_dim, hc.K, self.xi_dim).to(self.device)
     self.wm = DynamicsModel(self.nj, self.xi_dim, self.dt, cfg.wm).to(self.device)
+    self.fns = StepFns(self.heads, self.policy, self.wm, self.critic, compile_=cfg.compile, mode=cfg.compile_mode)
     self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.wm.lr)
     self.opt_pi = torch.optim.Adam(self.policy.parameters(), lr=cfg.policy_lr, betas=cfg.policy_betas)
     self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic_lr)
@@ -124,6 +128,7 @@ class Trainer:
     self.it = 0
     self.env_steps = 0
     self._step_carry = 0.0
+    self._t_start = time.time()
 
     n_params = lambda m: sum(p.numel() for p in m.parameters())  # noqa: E731
     print(f"[Trainer] policy {n_params(self.policy)/1e6:.1f}M  critic {n_params(self.critic)/1e6:.2f}M  wm {n_params(self.wm)/1e6:.1f}M")
@@ -139,9 +144,9 @@ class Trainer:
     self.clip_end = self.cmd.clip_end_env.clone()
     self.prev_action = torch.zeros(E, self.nj, device=self.device)
     self.ep_step = torch.zeros(E, dtype=torch.long, device=self.device)
-    self.kin = self.heads.kin(self.state)
     self.hist = ObsHistory(E, hc.hist, self.heads.proprio_dim, self.device)
-    obs = self.heads.proprio(self.state, self.prev_action, self.sim.bias_from_xi(self.xi, self.nj), noise=True)
+    with torch.no_grad():
+      self.kin, obs = self.fns.refresh(self.state, self.prev_action, self.sim.bias_from_xi(self.xi, self.nj), True)
     self.hist.reset(torch.arange(E, device=self.device), obs)
     L = self.env.max_episode_length + 2
     self.ep_bins = torch.zeros(E, L, dtype=torch.long, device=self.device)
@@ -149,7 +154,6 @@ class Trainer:
     self.ep_ret = torch.zeros(E, device=self.device)
     self._gamma_pow = cfg.gamma ** torch.arange(L, device=self.device, dtype=torch.float32)
     self._ar = torch.arange(E, device=self.device)
-    # Rolling episode statistics.
     self.stats = {"ep_return_norm": [], "ep_len": [], "ep_failed": [], "term_mismatch": []}
 
   # ---------------------------------------------------------------------------
@@ -158,19 +162,15 @@ class Trainer:
 
   @torch.no_grad()
   def collect_step(self) -> None:
-    cfg, heads, E = self.cfg, self.heads, self.E
-    bias = self.sim.bias_from_xi(self.xi, self.nj)
-    goal = heads.goal(self.kin, self.frame, self.clip_end)
+    cfg, E = self.cfg, self.E
+    goal, a = self.fns.act(self.hist.buf, self.kin, self.frame, self.clip_end)
     self.policy.obs_norm.update(self.hist.buf[:, -1])
     self.policy.goal_norm.update(goal)
-    a = self.policy(self.hist.buf, goal)
     a_exec = a + cfg.action_noise_std * torch.randn_like(a)
 
     self.env.step(a_exec)
     next_state = self.sim.state()
-    kin_next = heads.kin(next_state)
-    r = heads.reward(self.kin, kin_next, next_state, a_exec, self.prev_action, self.frame)
-    term_hard, _ = heads.termination(kin_next, self.frame)
+    r, term_hard = self.fns.post(next_state, self.kin, a_exec, self.prev_action, self.frame)
     terminated = self.env.reset_terminated.bool()
     timeouts = self.env.reset_time_outs.bool()
     done = terminated | timeouts
@@ -180,7 +180,6 @@ class Trainer:
       state=self.state, next_state=next_state, action=a_exec, prev_action=self.prev_action, xi=self.xi, reward=r,
       frame=self.frame, clip_end=self.clip_end, ep_step=self.ep_step, term=terminated, done=done,
     )
-    # Episode bookkeeping for the return-based sampler and training-return metric.
     self.ep_bins[self._ar, self.ep_step] = self.lib.bin_of_frame[self.frame]
     self.ep_rews[self._ar, self.ep_step] = r
     self.ep_ret += r
@@ -202,8 +201,7 @@ class Trainer:
     self.prev_action = torch.where(done[:, None], torch.zeros_like(a_exec), a_exec)
     self.frame = self.cmd.time_steps.clone()
     self.clip_end = self.cmd.clip_end_env.clone()
-    self.kin = heads.kin(self.state)
-    obs = heads.proprio(self.state, self.prev_action, self.sim.bias_from_xi(self.xi, self.nj), noise=True)
+    self.kin, obs = self.fns.refresh(self.state, self.prev_action, self.sim.bias_from_xi(self.xi, self.nj), True)
     self.hist.push(obs)
     if done.any():
       self.hist.reset(ids, obs)
@@ -212,18 +210,16 @@ class Trainer:
   def _finish_episodes(self, ids: torch.Tensor, failed: torch.Tensor) -> None:
     """Discounted returns-to-go of finished episodes -> bin estimates; log stats."""
     g = self.cfg.gamma
-    L = self.ep_step[ids]  # episode lengths
-    n = ids.numel()
+    L = self.ep_step[ids]
     Lmax = int(L.max().item())
-    rews = self.ep_rews[ids, :Lmax]  # [n,Lmax]
+    rews = self.ep_rews[ids, :Lmax]
     bins = self.ep_bins[ids, :Lmax]
     t = torch.arange(Lmax, device=self.device)
     valid = t[None, :] < L[:, None]
-    # Bootstrap time-outs with r_last/(1-gamma) so truncated tails are not biased low.
     r_last = rews.gather(1, (L - 1)[:, None]).squeeze(1)
     boot = torch.where(failed, torch.zeros_like(r_last), r_last / (1.0 - g))
     w = rews * valid * self._gamma_pow[:Lmax][None, :]
-    S = torch.flip(torch.cumsum(torch.flip(w, [1]), 1), [1])  # sum_{k>=t} g^k r_k
+    S = torch.flip(torch.cumsum(torch.flip(w, [1]), 1), [1])
     R = S / self._gamma_pow[:Lmax][None, :] + boot[:, None] * (g ** (L[:, None] - t[None, :]).float())
     self.cmd.update_bin_returns(bins[valid], R[valid])
     rmax = self.cfg.heads.reward_max_per_step
@@ -242,11 +238,13 @@ class Trainer:
     agg: dict[str, float] = {}
     for _ in range(cfg.batches_per_update):
       batch = self.buffer.sample_windows(cfg.windows_per_batch, cfg.k)
-      loss, m = self.wm.window_loss(batch, update_stats=True)
+      self.wm.update_stats(batch)
+      loss, e1, ek = self.fns.wm_loss(batch["s0"], batch["actions"], batch["next_states"], batch["xi"], batch["mask"])
       self.opt_wm.zero_grad(set_to_none=True)
       loss.backward()
-      m["wm/grad_norm"] = clip_grads(list(self.wm.parameters()), cfg.grad_clip, None)
+      gn = clip_grads(list(self.wm.parameters()), cfg.grad_clip, None)
       self.opt_wm.step()
+      m = {"wm/loss": loss.item(), "wm/err_step1": e1.item(), f"wm/err_step{cfg.k}": ek.item(), "wm/grad_norm": gn, "wm/valid_frac": batch["mask"].float().mean().item()}
       for k, v in m.items():
         agg[k] = agg.get(k, 0.0) + v / cfg.batches_per_update
     return agg
@@ -255,17 +253,10 @@ class Trainer:
   # 3. Policy + critic through imagination
   # ---------------------------------------------------------------------------
 
-  def critic_inputs(self, s: torch.Tensor, goal: torch.Tensor):
-    feat = self.wm.features(s)
-    fd = self.heads.feat_dim
-    feat_n = ((feat - self.wm.in_norm.mean[:fd]) / self.wm.in_norm.std[:fd]).clamp(-10, 10)
-    goal_n = self.policy.goal_norm.normalize(goal).clamp(-10, 10)
-    return feat_n, goal_n
-
   def update_policy(self) -> dict:
     cfg, heads, H = self.cfg, self.heads, self.cfg.H
     N = cfg.rollouts_per_update
-    g, lam = cfg.gamma, cfg.lam
+    g = cfg.gamma
     for p in self.wm.parameters():
       p.requires_grad_(False)
     self.wm.eval()
@@ -276,34 +267,24 @@ class Trainer:
       hs, hp = st["hist_states"], st["hist_prev_action"]
       hist_n = hs.shape[1]
       obs_hist = heads.proprio(
-        hs.reshape(-1, hs.shape[-1]), hp.reshape(-1, self.nj), bias[:, None, :].expand(N, hist_n, self.nj).reshape(-1, self.nj), noise=True
+        hs.reshape(-1, hs.shape[-1]), hp.reshape(-1, self.nj), bias[:, None, :].expand(N, hist_n, self.nj).reshape(-1, self.nj), True
       ).view(N, hist_n, -1)
+      kin = heads.kin(st["state"])
     s = st["state"]
     frame, clip_end, prev_a = st["frame"], st["clip_end"], st["prev_action"]
-    kin = heads.kin(s)
     c = torch.ones(N, device=self.device)
     J = torch.zeros(N, device=self.device)
     feats_n, goals_n, rews, dsoft = [], [], [], []
     for t in range(H):
-      goal = heads.goal(kin, frame, clip_end)
-      fn, gn = self.critic_inputs(s, goal)
-      feats_n.append(fn.detach())
-      goals_n.append(gn.detach())
-      a = self.policy(obs_hist, goal)
-      s_next = self.wm.step(s, a, xi)
-      kin_next = heads.kin(s_next)
-      r = heads.reward(kin, kin_next, s_next, a, prev_a, frame)
-      _, d = heads.termination(kin_next, frame)
+      s, obs_hist, prev_a, frame, kin, r, d, fn, gn = self.fns.imagine_step(s, obs_hist, prev_a, frame, clip_end, xi, bias, kin)
       J = J + (g**t) * c * r
       c = c * (1.0 - d)
+      feats_n.append(fn.detach())
+      goals_n.append(gn.detach())
       rews.append(r.detach())
       dsoft.append(d.detach())
-      frame = torch.minimum(frame + 1, clip_end - 1)
-      obs_next = heads.proprio(s_next, a, bias, noise=True)
-      obs_hist = torch.cat([obs_hist[:, 1:], obs_next[:, None]], dim=1)
-      s, kin, prev_a = s_next, kin_next, a
     goal_H = heads.goal(kin, frame, clip_end)
-    fn_H, gn_H = self.critic_inputs(s, goal_H)
+    fn_H, gn_H = self.fns.critic_inputs(s, goal_H)
     if cfg.use_critic:
       V_H = self.critic(fn_H, gn_H, xi)
       J = J + (g**H) * c * V_H
@@ -317,7 +298,7 @@ class Trainer:
 
     metrics = {
       "pi/imagined_return": (J.mean() / H).item(),
-      "pi/imagined_reward_mean": torch.stack(rews).mean().item() / self.cfg.heads.reward_max_per_step,
+      "pi/imagined_reward_norm": torch.stack(rews).mean().item() / self.cfg.heads.reward_max_per_step,
       "pi/survival_H": c.mean().item(),
       "pi/grad_norm": gn_pi,
       "pi/loss": loss_pi.item(),
@@ -336,7 +317,7 @@ class Trainer:
       R[H] = V[H]
       for t in reversed(range(H)):
         R[t] = rews[t] + g * (1.0 - dsoft[t]) * ((1.0 - lam) * V[t + 1] + lam * R[t + 1])
-      targets = torch.stack(R[:H], dim=1)  # [N,H]
+      targets = torch.stack(R[:H], dim=1)
     F = torch.stack(feats_n, dim=1).reshape(N * H, -1)
     G = torch.stack(goals_n, dim=1).reshape(N * H, -1)
     X = xi[:, None, :].expand(N, H, -1).reshape(N * H, -1)
@@ -400,7 +381,7 @@ class Trainer:
 
   def evaluate(self) -> dict:
     if self.evaluator is None:
-      self.evaluator = Evaluator(self.cfg.motion_files, self.cfg.heads, self.device)
+      self.evaluator = Evaluator(self.cfg.motion_files, self.cfg.heads, self.device, compile_=self.cfg.compile)
     return self.evaluator.run(self.policy)
 
   def train(self) -> None:
@@ -411,22 +392,18 @@ class Trainer:
     agg: dict[str, list[float]] = {}
     while self.it < cfg.iterations:
       t0 = time.time()
-      # 1. collect
       self._step_carry += cfg.env_steps_per_iter
       n_steps = int(self._step_carry)
       self._step_carry -= n_steps
       for _ in range(max(n_steps, 0)):
         self.collect_step()
-      t1 = time.time()
       if self.buffer.size < warmup:
-        # Fill the buffer before learning.
         for _ in range(warmup - self.buffer.size):
           self.collect_step()
         continue
-      # 2. world model
+      t1 = time.time()
       m_wm = self.update_world_model()
       t2 = time.time()
-      # 3. policy + critic
       m_pi = self.update_policy()
       t3 = time.time()
       for s in self.sched:
@@ -443,6 +420,7 @@ class Trainer:
         scal["time/iter_per_s"] = cfg.log_interval / max(now - t_log, 1e-6)
         scal["train/env_steps_per_env"] = self.env_steps
         scal["train/lr"] = self.opt_pi.param_groups[0]["lr"]
+        scal["train/wall_h"] = (now - self._t_start) / 3600
         if self.stats["ep_return_norm"]:
           scal["train/ep_return_norm"] = float(np.mean(self.stats["ep_return_norm"]))
           scal["train/ep_len"] = float(np.mean(self.stats["ep_len"]))
@@ -453,10 +431,9 @@ class Trainer:
         scal["sampler/bins_visited_frac"] = (self.cmd.bin_visits > 0).float().mean().item()
         for k, v in scal.items():
           self.writer.add_scalar(k, v, self.it)
-        wall_h = (now - self._t_start) / 3600 if hasattr(self, "_t_start") else 0.0
         print(
-          f"[it {self.it:7d} | {wall_h:5.2f} h] wm {scal.get('wm/loss', 0):.4f} (e1 {scal.get('wm/err_step1', 0):.3f}, e{cfg.wm.k} {scal.get(f'wm/err_step{cfg.wm.k}', 0):.3f}) "
-          f"| imag_ret {scal.get('pi/imagined_return', 0):.4f} surv {scal.get('pi/survival_H', 0):.3f} | "
+          f"[it {self.it:7d} | {scal['train/wall_h']:5.2f} h] wm {scal.get('wm/loss', 0):.4f} (e1 {scal.get('wm/err_step1', 0):.3f}, e{cfg.wm.k} {scal.get(f'wm/err_step{cfg.wm.k}', 0):.3f}) "
+          f"| imag_ret {scal.get('pi/imagined_return', 0):.4f} rew {scal.get('pi/imagined_reward_norm', 0):.3f} surv {scal.get('pi/survival_H', 0):.3f} | "
           f"ep_ret {scal.get('train/ep_return_norm', 0):.3f} len {scal.get('train/ep_len', 0):.0f} fail {scal.get('train/ep_failed_frac', 0):.2f} | "
           f"{scal['time/iter']*1000:.0f} ms/it (c {scal['time/collect']*1000:.0f} wm {scal['time/wm']*1000:.0f} pi {scal['time/policy']*1000:.0f}) fps {fps:.0f}",
           flush=True,
@@ -477,7 +454,7 @@ class Trainer:
           self.writer.add_scalar("time/eval", time.time() - te, self.it)
           print(f"[eval it {self.it}] return {res['scalars']['return_mean']:.4f} min {res['scalars']['return_min']:.3f} failed {int(res['scalars']['failed'])}/{res['num_clips']} ({time.time()-te:.0f}s)", flush=True)
           with open(os.path.join(cfg.log_dir, "eval.jsonl"), "a") as f:
-            f.write(json.dumps({"it": self.it, "env_steps": self.env_steps, "wall_s": time.time() - self._t_start, **res["scalars"]}) + "\n")
+            f.write(json.dumps({"it": self.it, "env_steps": self.env_steps, "wall_s": time.time() - self._t_start, **res["scalars"], "failed_clips": res["failed_clips"]}) + "\n")
         except Exception as e:  # noqa: BLE001
           print(f"[eval] failed: {e!r}", flush=True)
           cfg.eval_enabled = False

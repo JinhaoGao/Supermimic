@@ -41,6 +41,8 @@ def main():
   p.add_argument("--ckpt_interval", type=int, default=2000)
   p.add_argument("--no_eval", action="store_true")
   p.add_argument("--resume", type=str, default=None)
+  p.add_argument("--no_compile", action="store_true")
+  p.add_argument("--compile_mode", type=str, default=None, help="e.g. reduce-overhead or max-autotune")
   args = p.parse_args()
 
   from supermimic.trainer import TrainCfg, Trainer
@@ -75,6 +77,8 @@ def main():
     eval_interval=args.eval_interval,
     ckpt_interval=args.ckpt_interval,
     eval_enabled=not args.no_eval,
+    compile=not args.no_compile,
+    compile_mode=args.compile_mode,
     wm=WorldModelCfg(k=args.wm_k, lr=args.lr, batches_per_update=args.wm_batches, windows_per_batch=args.wm_windows),
   )
   print(f"[train] log_dir = {log_dir}")

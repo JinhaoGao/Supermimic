@@ -9,12 +9,13 @@ from __future__ import annotations
 import torch
 
 from .env_cfg import make_env_cfg
+from .fns import StepFns
 from .heads import HeadsCfg
 from .sim_interface import ObsHistory, SimInterface
 
 
 class Evaluator:
-  def __init__(self, motion_files: list[str], heads_cfg: HeadsCfg, device: str, num_envs: int | None = None):
+  def __init__(self, motion_files: list[str], heads_cfg: HeadsCfg, device: str, num_envs: int | None = None, compile_: bool = True):
     from mjlab.envs import ManagerBasedRlEnv
 
     self.num_clips = len(motion_files)
@@ -27,10 +28,20 @@ class Evaluator:
     self.device = device
     self.lib = self.sim.lib
     self.cmd = self.sim.cmd
+    self.compile_ = compile_
+    self._fns: StepFns | None = None
+    self._fns_policy = None
+
+  def _get_fns(self, policy) -> StepFns:
+    if self._fns is None or self._fns_policy is not policy:
+      self._fns = StepFns(self.heads, policy, compile_=self.compile_)
+      self._fns_policy = policy
+    return self._fns
 
   @torch.no_grad()
   def run(self, policy, max_steps: int | None = None) -> dict:
     env, heads, sim, cmd = self.env, self.heads, self.sim, self.cmd
+    fns = self._get_fns(policy)
     E = self.num_envs
     env.reset()
     state = sim.state()
@@ -40,9 +51,9 @@ class Evaluator:
     clip_end = cmd.clip_end_env.clone()
     clip = self.lib.clip_of_frame[frame]
     prev_action = torch.zeros(E, sim.nj, device=self.device)
-    kin = heads.kin(state)
+    kin, obs = fns.refresh(state, prev_action, bias, False)
     hist = ObsHistory(E, self.cfg.hist, heads.proprio_dim, self.device)
-    hist.reset(torch.arange(E, device=self.device), heads.proprio(state, prev_action, bias, noise=False))
+    hist.reset(torch.arange(E, device=self.device), obs)
     sum_r = torch.zeros(E, device=self.device)
     steps_done = torch.zeros(E, device=self.device)
     finished = torch.zeros(E, dtype=torch.bool, device=self.device)
@@ -51,19 +62,17 @@ class Evaluator:
     limit = max_steps or int(clip_len.max().item()) + 5
     policy.eval()
     for _ in range(limit):
-      goal = heads.goal(kin, frame, clip_end)
-      a = policy(hist.buf, goal)
+      _, a = fns.act(hist.buf, kin, frame, clip_end)
       env.step(a)
       next_state = sim.state()
-      kin_next = heads.kin(next_state)
-      r = heads.reward(kin, kin_next, next_state, a, prev_action, frame)
+      r, _ = fns.post(next_state, kin, a, prev_action, frame)
       terminated = env.reset_terminated.bool()
       timeouts = env.reset_time_outs.bool()
       active = ~finished
       sum_r += r * active
       steps_done += active.float()
       failed |= terminated & active
-      finished |= (terminated | timeouts)
+      finished |= terminated | timeouts
       done = terminated | timeouts
       if finished.all():
         break
@@ -77,8 +86,7 @@ class Evaluator:
         prev_action = a
       frame = cmd.time_steps.clone()
       clip_end = cmd.clip_end_env.clone()
-      kin = heads.kin(state)
-      obs = heads.proprio(state, prev_action, bias, noise=False)
+      kin, obs = fns.refresh(state, prev_action, bias, False)
       hist.push(obs)
       if done.any():
         hist.reset(ids, obs)

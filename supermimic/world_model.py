@@ -21,6 +21,7 @@ from .math_utils import (
   quat_inv,
   quat_mul,
   quat_normalize,
+  rot6d_from_quat,
   yaw_quat,
 )
 
@@ -99,8 +100,6 @@ class DynamicsModel(nn.Module):
     return s[..., 0:3], s[..., 3:7], s[..., 7:10], s[..., 10:13], s[..., 13 : 13 + J], s[..., 13 + J : 13 + 2 * J]
 
   def features(self, s: torch.Tensor) -> torch.Tensor:
-    from .math_utils import rot6d_from_quat
-
     p, qw, v, w, q, qd = self.split(s)
     yq = yaw_quat(qw)
     rot_local = quat_mul(quat_inv(yq), qw)
@@ -155,20 +154,23 @@ class DynamicsModel(nn.Module):
 
   def state_error(self, s_pred: torch.Tensor, s_true: torch.Tensor) -> torch.Tensor:
     """Per-sample normalized squared error (mean over components)."""
-    d = self.diffs(s_pred, s_true)  # pred -> true difference, same algebra
+    d = self.diffs(s_pred, s_true)
     return ((d / self.err_norm.std) ** 2).mean(-1)
 
-  def window_loss(self, batch: dict, update_stats: bool = True):
-    """Autoregressive k-step loss on a replay window (see ReplayBuffer.sample_windows)."""
-    s0, actions, next_states, xi, mask = batch["s0"], batch["actions"], batch["next_states"], batch["xi"], batch["mask"]
+  @torch.no_grad()
+  def update_stats(self, batch: dict) -> None:
+    s0, actions, next_states, mask = batch["s0"], batch["actions"], batch["next_states"], batch["mask"]
+    prev = torch.cat([s0[:, None], next_states[:, :-1]], dim=1)[mask]
+    nxt = next_states[mask]
+    D = prev.shape[-1]
+    prev, nxt = prev.reshape(-1, D), nxt.reshape(-1, D)
+    self.in_norm.update(torch.cat([self.features(prev), actions[mask].reshape(-1, self.nj)], -1))
+    self.tgt_norm.update(self.targets(prev, nxt))
+    self.err_norm.update(self.diffs(prev, nxt))
+
+  def window_loss(self, s0: torch.Tensor, actions: torch.Tensor, next_states: torch.Tensor, xi: torch.Tensor, mask: torch.Tensor):
+    """Autoregressive k-step loss. Returns (loss, err_step1, err_stepk) tensors."""
     k = actions.shape[1]
-    if update_stats:
-      with torch.no_grad():
-        prev = torch.cat([s0[:, None], next_states[:, :-1]], dim=1)[mask]
-        nxt = next_states[mask]
-        self.in_norm.update(torch.cat([self.features(prev.reshape(-1, prev.shape[-1])), actions[mask].reshape(-1, self.nj)], -1))
-        self.tgt_norm.update(self.targets(prev.reshape(-1, prev.shape[-1]), nxt.reshape(-1, nxt.shape[-1])))
-        self.err_norm.update(self.diffs(prev.reshape(-1, prev.shape[-1]), nxt.reshape(-1, nxt.shape[-1])))
     s = s0
     errs = []
     for j in range(k):
@@ -178,11 +180,6 @@ class DynamicsModel(nn.Module):
     m = mask.float()
     denom = m.sum().clamp(min=1.0)
     loss = (errs.mean(1) * m).sum() / denom
-    with torch.no_grad():
-      metrics = {
-        "wm/loss": loss.item(),
-        "wm/err_step1": ((errs[:, 0] * m).sum() / denom).item(),
-        f"wm/err_step{k}": ((errs[:, -1] * m).sum() / denom).item(),
-        "wm/valid_frac": m.mean().item(),
-      }
-    return loss, metrics
+    e1 = (errs[:, 0] * m).sum() / denom
+    ek = (errs[:, -1] * m).sum() / denom
+    return loss, e1.detach(), ek.detach()
