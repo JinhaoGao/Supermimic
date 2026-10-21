@@ -18,6 +18,7 @@ from mjlab.utils.lab_api.math import (  # noqa: F401  (re-exported)
   quat_from_angle_axis,
   quat_inv,
   quat_mul,
+  subtract_frame_transforms,
   yaw_quat,
 )
 
