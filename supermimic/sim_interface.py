@@ -57,6 +57,12 @@ class SimInterface:
     self.ipos_nominal = torch.as_tensor(env.sim.mj_model.body_ipos[self.torso_gid], dtype=torch.float32, device=self.device)
     self.env_origins = env.scene.env_origins.to(self.device)
     self.com_scale = torch.tensor(self.COM_RANGE, device=self.device)
+    # MuJoCo Warp prints a solver/linesearch overflow warning every step the
+    # iteration cap is hit (common with random actions); silence it.
+    try:
+      env.sim.wp_model.opt.warn_overflow = 0
+    except Exception:  # noqa: BLE001
+      pass
 
   # ---- state -----------------------------------------------------------------
 
