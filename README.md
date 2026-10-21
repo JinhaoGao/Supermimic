@@ -47,6 +47,23 @@ current robot torso frame); output `action [1,29]`, joint target = `action_offse
 Normalization is inside the graph; joint/action order, scales and the layout text are stored as ONNX
 metadata. `--backend torch` runs the PyTorch weights instead (matches ONNX to 2e-6).
 
+## Full-atlas runs (2026-10-21 night, bj27)
+
+Deployable variant: the goal no longer contains the reference anchor position (needs odometry),
+only ref joint pos/vel + anchor orientation relative to the robot (`--goal_anchor_pos` to re-enable).
+The motion library lives in CPU RAM (page cache of a packed `.npy` cache); the GPU holds only the
+current frames / goal windows of the simulator and one (H+K)-frame window pack per policy update.
+
+| run | data | clips | hours | GPU | first eval (1024-clip subset) |
+| --- | --- | --- | --- | --- | --- |
+| `g1_atlas_v1` | G1 MotionAtlas `g1/g1` minus GMT blacklist | 254,518 | 1474 | bj27:5 | it 4000 (0.77 h): return 0.835, 50 failed |
+| `e2_atlas_v1` | E2 MotionAtlas (4 retargets) minus GMT blacklist | 372,026 | 1744 | bj27:6 | pending |
+
+E2 is not shipped by mjlab: `supermimic/robots/` holds an entity built from the GMT sim2sim MJCF
+(mesh visuals + convex mesh collision against the terrain only, no self-collision), with PD gains,
+torque limits, armature, ankle friction, default pose and action scale copied from the GMT Isaac
+config (`assets/e2/e2.py`); 12 tracked bodies, anchor `waist_pitch_link`.
+
 ## Layout
 
 | file | role |
