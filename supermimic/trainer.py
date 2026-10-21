@@ -5,6 +5,10 @@ Per iteration:
   2. Fit world model on k-step replay windows (autoregressive).
   3. Improve the policy by BPTT through H imagined steps with a critic
      bootstrap, then fit the critic to GAE targets of the same rollout.
+
+Reference motions live in CPU RAM; the simulator loop gathers the current
+frames / goal windows every step and each policy update gathers one
+(H+K)-frame window pack per imagined rollout.
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import time
 from dataclasses import asdict, dataclass, field
 
@@ -32,10 +37,13 @@ from .world_model import DynamicsModel, WorldModelCfg
 @dataclass
 class TrainCfg:
   motion_files: list[str] = field(default_factory=list)
+  robot: str = "g1"
   num_envs: int = 4096
   device: str = "cuda:0"
   seed: int = 0
   log_dir: str = "logs/supermimic/run"
+  cache_dir: str = ""
+  num_workers: int = 32
   iterations: int = 320_000
   env_steps_per_iter: float = 1.0
   action_noise_std: float = 0.1
@@ -63,6 +71,8 @@ class TrainCfg:
   eval_interval: int = 2000
   ckpt_interval: int = 2000
   eval_enabled: bool = True
+  eval_clips: int = 0  # 0 = all clips; otherwise a fixed random subset of this size
+  eval_envs: int = 1024
   wm: WorldModelCfg = field(default_factory=WorldModelCfg)
   heads: HeadsCfg = field(default_factory=HeadsCfg)
 
@@ -86,6 +96,8 @@ def clip_grads(params, norm: float, elem: float | None) -> float:
 
 
 class Trainer:
+  LIB_KEY = "train"
+
   def __init__(self, cfg: TrainCfg):
     self.cfg = cfg
     torch.manual_seed(cfg.seed)
@@ -100,7 +112,10 @@ class Trainer:
 
     from mjlab.envs import ManagerBasedRlEnv
 
-    env_cfg = make_env_cfg(cfg.motion_files, cfg.num_envs, mode="train", episode_length_s=cfg.episode_length_s)
+    env_cfg = make_env_cfg(
+      cfg.motion_files, cfg.num_envs, mode="train", episode_length_s=cfg.episode_length_s, robot=cfg.robot,
+      library_key=self.LIB_KEY, cache_dir=cfg.cache_dir, num_workers=cfg.num_workers,
+    )
     env_cfg.seed = cfg.seed
     self.env = ManagerBasedRlEnv(cfg=env_cfg, device=self.device)
     self.sim = SimInterface(self.env, cfg.heads)
@@ -129,11 +144,16 @@ class Trainer:
     self.env_steps = 0
     self._step_carry = 0.0
     self._t_start = time.time()
+    if cfg.eval_clips and cfg.eval_clips < self.lib.num_clips:
+      rng = random.Random(cfg.seed)
+      self.eval_clip_ids = tuple(sorted(rng.sample(range(self.lib.num_clips), cfg.eval_clips)))
+    else:
+      self.eval_clip_ids = tuple(range(self.lib.num_clips))
 
     n_params = lambda m: sum(p.numel() for p in m.parameters())  # noqa: E731
     print(f"[Trainer] policy {n_params(self.policy)/1e6:.1f}M  critic {n_params(self.critic)/1e6:.2f}M  wm {n_params(self.wm)/1e6:.1f}M")
     print(f"[Trainer] {self.lib.summary()}")
-    print(f"[Trainer] env_origins max |xy| = {self.sim.env_origins[:, :2].abs().max().item():.2f}")
+    print(f"[Trainer] goal_frame_dim={self.heads.goal_frame_dim} (anchor_pos={hc.goal_anchor_pos}), eval clips {len(self.eval_clip_ids)}")
 
     # ---- simulator bookkeeping ----
     self.env.reset()
@@ -162,15 +182,17 @@ class Trainer:
 
   @torch.no_grad()
   def collect_step(self) -> None:
-    cfg, E = self.cfg, self.E
-    goal, a = self.fns.act(self.hist.buf, self.kin, self.frame, self.clip_end)
+    cfg = self.cfg
+    ref_q, ref_qd, ref_ap, ref_aq = self.sim.goal_refs(self.frame, self.clip_end)
+    ref_cur = self.sim.current_ref()  # reference at frame f_t: reward target of this step
+    goal, a = self.fns.act(self.hist.buf, self.kin, ref_q, ref_qd, ref_ap, ref_aq)
     self.policy.obs_norm.update(self.hist.buf[:, -1])
     self.policy.goal_norm.update(goal)
     a_exec = a + cfg.action_noise_std * torch.randn_like(a)
 
     self.env.step(a_exec)
     next_state = self.sim.state()
-    r, term_hard = self.fns.post(next_state, self.kin, a_exec, self.prev_action, self.frame)
+    r, term_hard = self.fns.post(next_state, self.kin, a_exec, self.prev_action, *ref_cur)
     terminated = self.env.reset_terminated.bool()
     timeouts = self.env.reset_time_outs.bool()
     done = terminated | timeouts
@@ -180,7 +202,7 @@ class Trainer:
       state=self.state, next_state=next_state, action=a_exec, prev_action=self.prev_action, xi=self.xi, reward=r,
       frame=self.frame, clip_end=self.clip_end, ep_step=self.ep_step, term=terminated, done=done,
     )
-    self.ep_bins[self._ar, self.ep_step] = self.lib.bin_of_frame[self.frame]
+    self.ep_bins[self._ar, self.ep_step] = self.lib.bin_of_frame[self.frame].long()
     self.ep_rews[self._ar, self.ep_step] = r
     self.ep_ret += r
     self.ep_step += 1
@@ -208,7 +230,6 @@ class Trainer:
 
   @torch.no_grad()
   def _finish_episodes(self, ids: torch.Tensor, failed: torch.Tensor) -> None:
-    """Discounted returns-to-go of finished episodes -> bin estimates; log stats."""
     g = self.cfg.gamma
     L = self.ep_step[ids]
     Lmax = int(L.max().item())
@@ -254,7 +275,7 @@ class Trainer:
   # ---------------------------------------------------------------------------
 
   def update_policy(self) -> dict:
-    cfg, heads, H = self.cfg, self.heads, self.cfg.H
+    cfg, heads, H, K = self.cfg, self.heads, self.cfg.H, self.cfg.heads.K
     N = cfg.rollouts_per_update
     g = cfg.gamma
     for p in self.wm.parameters():
@@ -263,6 +284,7 @@ class Trainer:
     st = self.buffer.sample_starts(N, cfg.heads.hist)
     xi = st["xi"]
     bias = self.sim.bias_from_xi(xi, self.nj)
+    t_g0 = time.time()
     with torch.no_grad():
       hs, hp = st["hist_states"], st["hist_prev_action"]
       hist_n = hs.shape[1]
@@ -270,20 +292,27 @@ class Trainer:
         hs.reshape(-1, hs.shape[-1]), hp.reshape(-1, self.nj), bias[:, None, :].expand(N, hist_n, self.nj).reshape(-1, self.nj), True
       ).view(N, hist_n, -1)
       kin = heads.kin(st["state"])
+      # Reference window pack for this batch: frames f0 .. f0+H+K-1 of every rollout.
+      Lw = H + K
+      pack = self.lib.gather_windows(st["frame"], Lw)
+      f_loc = torch.zeros(N, dtype=torch.long, device=self.device)
+      clip_end_loc = torch.clamp(st["clip_end"] - st["frame"], max=Lw)
+    self._t_gather = time.time() - t_g0
     s = st["state"]
-    frame, clip_end, prev_a = st["frame"], st["clip_end"], st["prev_action"]
+    prev_a = st["prev_action"]
     c = torch.ones(N, device=self.device)
     J = torch.zeros(N, device=self.device)
     feats_n, goals_n, rews, dsoft = [], [], [], []
+    p = (pack["joint_pos"], pack["joint_vel"], pack["body_pos"], pack["body_quat"], pack["body_lin_vel"], pack["body_ang_vel"])
     for t in range(H):
-      s, obs_hist, prev_a, frame, kin, r, d, fn, gn = self.fns.imagine_step(s, obs_hist, prev_a, frame, clip_end, xi, bias, kin)
+      s, obs_hist, prev_a, f_loc, kin, r, d, fn, gn = self.fns.imagine_step(s, obs_hist, prev_a, f_loc, clip_end_loc, xi, bias, kin, *p)
       J = J + (g**t) * c * r
       c = c * (1.0 - d)
       feats_n.append(fn.detach())
       goals_n.append(gn.detach())
       rews.append(r.detach())
       dsoft.append(d.detach())
-    goal_H = heads.goal(kin, frame, clip_end)
+    goal_H = self.fns.goal_from_pack(kin, f_loc, clip_end_loc, p[0], p[1], p[2], p[3])
     fn_H, gn_H = self.fns.critic_inputs(s, goal_H)
     if cfg.use_critic:
       V_H = self.critic(fn_H, gn_H, xi)
@@ -293,8 +322,8 @@ class Trainer:
     loss_pi.backward()
     gn_pi = clip_grads(list(self.policy.parameters()), cfg.grad_clip_norm, cfg.grad_clip_elem)
     self.opt_pi.step()
-    for p in self.wm.parameters():
-      p.requires_grad_(True)
+    for p_ in self.wm.parameters():
+      p_.requires_grad_(True)
 
     metrics = {
       "pi/imagined_return": (J.mean() / H).item(),
@@ -302,6 +331,7 @@ class Trainer:
       "pi/survival_H": c.mean().item(),
       "pi/grad_norm": gn_pi,
       "pi/loss": loss_pi.item(),
+      "time/ref_gather": self._t_gather,
     }
     if cfg.use_critic:
       metrics.update(self._fit_critic(feats_n, goals_n, fn_H.detach(), gn_H.detach(), xi, rews, dsoft))
@@ -371,8 +401,9 @@ class Trainer:
     self.opt_wm.load_state_dict(ck["opt_wm"])
     self.opt_pi.load_state_dict(ck["opt_pi"])
     self.opt_v.load_state_dict(ck["opt_v"])
-    self.cmd.bin_G.copy_(ck["bin_G"])
-    self.cmd.bin_visits.copy_(ck["bin_visits"])
+    if ck["bin_G"].shape == self.cmd.bin_G.shape:
+      self.cmd.bin_G.copy_(ck["bin_G"])
+      self.cmd.bin_visits.copy_(ck["bin_visits"])
     self.it = ck["it"]
     self.env_steps = ck["env_steps"]
     for s in self.sched:
@@ -381,7 +412,10 @@ class Trainer:
 
   def evaluate(self) -> dict:
     if self.evaluator is None:
-      self.evaluator = Evaluator(self.cfg.motion_files, self.cfg.heads, self.device, compile_=self.cfg.compile)
+      self.evaluator = Evaluator(
+        self.cfg.motion_files, self.cfg.heads, self.device, library_key=self.LIB_KEY, eval_clips=self.eval_clip_ids,
+        num_clips_total=self.lib.num_clips, max_envs=self.cfg.eval_envs, compile_=self.cfg.compile, cache_dir=self.cfg.cache_dir,
+      )
     return self.evaluator.run(self.policy)
 
   def train(self) -> None:
@@ -435,7 +469,7 @@ class Trainer:
           f"[it {self.it:7d} | {scal['train/wall_h']:5.2f} h] wm {scal.get('wm/loss', 0):.4f} (e1 {scal.get('wm/err_step1', 0):.3f}, e{cfg.wm.k} {scal.get(f'wm/err_step{cfg.wm.k}', 0):.3f}) "
           f"| imag_ret {scal.get('pi/imagined_return', 0):.4f} rew {scal.get('pi/imagined_reward_norm', 0):.3f} surv {scal.get('pi/survival_H', 0):.3f} | "
           f"ep_ret {scal.get('train/ep_return_norm', 0):.3f} len {scal.get('train/ep_len', 0):.0f} fail {scal.get('train/ep_failed_frac', 0):.2f} | "
-          f"{scal['time/iter']*1000:.0f} ms/it (c {scal['time/collect']*1000:.0f} wm {scal['time/wm']*1000:.0f} pi {scal['time/policy']*1000:.0f}) fps {fps:.0f}",
+          f"{scal['time/iter']*1000:.0f} ms/it (c {scal['time/collect']*1000:.0f} wm {scal['time/wm']*1000:.0f} pi {scal['time/policy']*1000:.0f} ref {scal.get('time/ref_gather', 0)*1000:.0f}) fps {fps:.0f}",
           flush=True,
         )
         agg = {}
@@ -456,6 +490,9 @@ class Trainer:
           with open(os.path.join(cfg.log_dir, "eval.jsonl"), "a") as f:
             f.write(json.dumps({"it": self.it, "env_steps": self.env_steps, "wall_s": time.time() - self._t_start, **res["scalars"], "failed_clips": res["failed_clips"]}) + "\n")
         except Exception as e:  # noqa: BLE001
+          import traceback
+
+          traceback.print_exc()
           print(f"[eval] failed: {e!r}", flush=True)
           cfg.eval_enabled = False
     self.save("final")

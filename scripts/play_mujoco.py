@@ -144,7 +144,11 @@ class MujocoPlayer:
     fr = torch.clamp(torch.arange(self.K) + frame, max=ref.T - 1)
     ap, aq, _, _ = self.body_state(self.anchor_bid)
     rel_p, rel_q = subtract_frame_transforms(ap.expand(self.K, 3), aq.expand(self.K, 4), ref.bp[fr, ref.anchor], ref.bq[fr, ref.anchor])
-    return torch.cat([ref.q[fr], ref.qd[fr], rel_p, rot6d_from_quat(rel_q)], dim=-1)  # [K, 67]
+    parts = [ref.q[fr], ref.qd[fr]]
+    if self.h.get("goal_anchor_pos", True):
+      parts.append(rel_p)  # needs odometry on hardware; off in deployable policies
+    parts.append(rot6d_from_quat(rel_q))
+    return torch.cat(parts, dim=-1)  # [K, 67] or [K, 64]
 
   def set_reference_pose(self, dd: mujoco.MjData, ref: Reference, frame: int, with_velocity: bool = True):
     dd.qpos[self.fq : self.fq + 3] = ref.bp[frame, ref.root].numpy()

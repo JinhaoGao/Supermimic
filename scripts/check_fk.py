@@ -11,29 +11,30 @@ Checks, on random rollouts of a small env:
 from __future__ import annotations
 
 import argparse
-import glob
-import os
 
 import torch
 
 
 def main():
   p = argparse.ArgumentParser()
-  p.add_argument("--motion_dir", type=str, required=True)
+  p.add_argument("--motion_dirs", type=str, nargs="+", required=True)
+  p.add_argument("--robot", type=str, default="g1")
   p.add_argument("--num_envs", type=int, default=64)
   p.add_argument("--steps", type=int, default=30)
   p.add_argument("--device", type=str, default="cuda:0")
+  p.add_argument("--cache_dir", type=str, default="")
   args = p.parse_args()
 
   from mjlab.envs import ManagerBasedRlEnv
 
   from supermimic.env_cfg import make_env_cfg
   from supermimic.heads import HeadsCfg
+  from supermimic.motions import collect_motion_files
   from supermimic.sim_interface import SimInterface
   from supermimic.world_model import DynamicsModel, WorldModelCfg
 
-  files = sorted(glob.glob(os.path.join(os.path.expanduser(args.motion_dir), "*.npz")))[:8]
-  env = ManagerBasedRlEnv(cfg=make_env_cfg(files, args.num_envs, mode="train"), device=args.device)
+  files = collect_motion_files(args.motion_dirs, max_motions=8)
+  env = ManagerBasedRlEnv(cfg=make_env_cfg(files, args.num_envs, mode="train", robot=args.robot, cache_dir=args.cache_dir), device=args.device)
   sim = SimInterface(env, HeadsCfg())
   heads, cmd, robot = sim.heads, sim.cmd, sim.robot
   print("entity bodies:", robot.body_names)
@@ -48,9 +49,7 @@ def main():
   state = sim.state()
   kin = heads.kin(state)
   prev_a = torch.zeros(args.num_envs, sim.nj, device=args.device)
-  frame = cmd.time_steps.clone()
   for t in range(args.steps):
-    # FK vs sim (fresh derived quantities after env.step/reset's forward()).
     pos_sim = robot.data.body_link_pose_w[:, cmd.body_indexes]
     vel_sim = robot.data.body_link_vel_w[:, cmd.body_indexes]
     e_pos = (kin["body_pos"] + sim.env_origins[:, None, :] - pos_sim[..., :3]).abs().max().item()
@@ -61,13 +60,14 @@ def main():
     for k, v in dict(fk_pos=e_pos, fk_quat=e_quat, fk_linvel=e_lin, fk_angvel=e_ang).items():
       worst[k] = max(worst.get(k, 0.0), v)
 
+    ref_cur = sim.current_ref()
+    ref = dict(body_pos=ref_cur[0], body_quat=ref_cur[1], body_lin_vel=ref_cur[2], body_ang_vel=ref_cur[3])
     a = 0.5 * torch.randn(args.num_envs, sim.nj, device=args.device)
     env.step(a)
     next_state = sim.state()
     kin_next = heads.kin(next_state)
-    r, terms = heads.reward(kin, kin_next, next_state, a, prev_a, frame, return_terms=True)
-    hard, soft = heads.termination(kin_next, frame)
-    # Compare with mjlab managers (stale by one substep -> small gap expected).
+    r, terms = heads.reward(kin, kin_next, next_state, a, prev_a, ref, return_terms=True)
+    hard, soft = heads.termination(kin_next, ref["body_pos"][:, heads.anchor], ref["body_quat"][:, heads.anchor])
     rm = env.reward_manager
     name_map = {
       "root_pos": "motion_global_root_pos", "root_ori": "motion_global_root_ori", "body_pos": "motion_body_pos",
@@ -76,7 +76,7 @@ def main():
     }
     for k, mk in name_map.items():
       try:
-        sim_term = rm._step_reward[:, rm.active_terms.index(mk)] * env.step_dt  # weight*value, scaled by dt here
+        sim_term = rm._step_reward[:, rm.active_terms.index(mk)] * env.step_dt
       except Exception:  # noqa: BLE001
         sim_term = None
       if sim_term is not None:
@@ -84,7 +84,6 @@ def main():
     worst["rew_total"] = max(worst.get("rew_total", 0.0), (r - env.reward_buf).abs().max().item())
     term_sim = env.reset_terminated.bool()
     worst["term_mismatch"] = max(worst.get("term_mismatch", 0.0), (hard != term_sim).float().mean().item())
-    # WM algebra round trip.
     tg = wm.targets(state, next_state)
     rt = wm.compose(state, tg)
     worst["wm_roundtrip"] = max(worst.get("wm_roundtrip", 0.0), (rt - next_state).abs().max().item())
@@ -98,8 +97,11 @@ def main():
     else:
       state = next_state
       prev_a = a
-    frame = cmd.time_steps.clone()
     kin = heads.kin(state)
+  # Goal refs sanity.
+  ref_q, ref_qd, ref_ap, ref_aq = sim.goal_refs(cmd.time_steps.clone(), cmd.clip_end_env.clone())
+  g = heads.goal(kin, ref_q, ref_qd, ref_ap, ref_aq)
+  print("goal shape:", tuple(g.shape), "finite:", bool(torch.isfinite(g).all()))
   print("\nmax abs errors over rollout:")
   for k, v in worst.items():
     print(f"  {k:16s} {v:.3e}")

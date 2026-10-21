@@ -1,7 +1,8 @@
 """Thin interface between the mjlab env and the SuperMimic learner.
 
 Extracts the minimal state vector and the sim context xi from the simulator,
-owns the FK / analytic heads, and keeps the proprioceptive history buffer.
+owns the FK / analytic heads, fetches goal references from the in-RAM motion
+library, and keeps the proprioceptive history buffer.
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from __future__ import annotations
 import torch
 
 from .fk import TorchFK
-from .heads import AnalyticHeads, HeadsCfg
+from .heads import AnalyticHeads, HeadsCfg, window_frames
 
 
 class ObsHistory:
@@ -40,7 +41,6 @@ class SimInterface:
     self.fk = TorchFK(env.sim.mj_model, self.robot, self.device, needed_bodies=tracked_local)
     self.heads = AnalyticHeads(
       self.fk,
-      self.lib,
       tracked_local,
       int(self.cmd.motion_anchor_body_index),
       self.robot.data.default_joint_pos[0],
@@ -52,7 +52,7 @@ class SimInterface:
     idx = self.robot.indexing
     foot_local = self.robot.find_geoms(r"^(left|right)_foot[1-7]_collision$")[0]
     self.foot_geom_gid = int(idx.geom_ids[foot_local[0]].item())
-    torso_local = self.robot.body_names.index("torso_link")
+    torso_local = self.robot.body_names.index(self.cmd.cfg.anchor_body_name)
     self.torso_gid = int(idx.body_ids[torso_local].item())
     self.ipos_nominal = torch.as_tensor(env.sim.mj_model.body_ipos[self.torso_gid], dtype=torch.float32, device=self.device)
     self.env_origins = env.scene.env_origins.to(self.device)
@@ -95,3 +95,25 @@ class SimInterface:
   @staticmethod
   def bias_from_xi(xi: torch.Tensor, nj: int) -> torch.Tensor:
     return xi[:, 1 : 1 + nj] * SimInterface.BIAS_RANGE
+
+  # ---- references ------------------------------------------------------------
+
+  @torch.no_grad()
+  def goal_refs(self, frame: torch.Tensor, clip_end: torch.Tensor):
+    """K-frame goal references for all envs: (ref_q [E,K,J], ref_qd, ref_ap [E,K,3], ref_aq [E,K,4])."""
+    K = self.heads.cfg.K
+    E = frame.shape[0]
+    fr = window_frames(frame, clip_end, K).reshape(-1)
+    g = self.lib.gather(fr, fields=["joint_pos", "joint_vel", "body_pos", "body_quat"])
+    a = self.heads.anchor
+    return (
+      g["joint_pos"].view(E, K, -1),
+      g["joint_vel"].view(E, K, -1),
+      g["body_pos"].view(E, K, -1, 3)[:, :, a],
+      g["body_quat"].view(E, K, -1, 4)[:, :, a],
+    )
+
+  def current_ref(self) -> tuple:
+    """Reference body fields at the command's current frame (for the reward of the next step)."""
+    c = self.cmd.current_ref()
+    return c["body_pos"], c["body_quat"], c["body_lin_vel"], c["body_ang_vel"]

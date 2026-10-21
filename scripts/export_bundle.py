@@ -35,7 +35,8 @@ def main():
   from supermimic.env_cfg import make_env_cfg
 
   ck = torch.load(args.ckpt, map_location="cpu")
-  env = ManagerBasedRlEnv(cfg=make_env_cfg([args.motion], 1, mode="eval"), device=args.device)
+  robot_name = ck["cfg"].get("robot", "g1")
+  env = ManagerBasedRlEnv(cfg=make_env_cfg([args.motion], 1, mode="eval", robot=robot_name), device=args.device)
   robot = env.scene["robot"]
   cmd = env.command_manager.get_term("motion")
   term = env.action_manager.get_term("joint_pos")
@@ -52,9 +53,13 @@ def main():
     mjlab_commit = subprocess.check_output(["git", "-C", os.path.dirname(__import__("mjlab").__file__), "rev-parse", "HEAD"], text=True).strip()
   except Exception:  # noqa: BLE001
     mjlab_commit = "unknown"
+  heads = {k: v for k, v in ck["cfg"]["heads"].items() if k != "extra"}
+  nj = ck["dims"]["nj"]
+  heads["goal_anchor_pos"] = ck["dims"]["goal_frame"] == 2 * nj + 9  # old checkpoints lack the flag
   meta = {
     "ckpt": os.path.abspath(args.ckpt),
     "iteration": ck["it"],
+    "robot": robot_name,
     "mjlab_commit": mjlab_commit,
     "control_dt": env.step_dt,
     "decimation": env.cfg.decimation,
@@ -67,7 +72,7 @@ def main():
     "body_names": list(cmd.cfg.body_names),
     "anchor_body_name": cmd.cfg.anchor_body_name,
     "root_body_name": robot.body_names[0],
-    "heads": {k: v for k, v in ck["cfg"]["heads"].items() if k != "extra"},
+    "heads": heads,
     "dims": ck["dims"],
   }
   with open(os.path.join(args.out, "meta.json"), "w") as f:
@@ -100,7 +105,9 @@ def export_onnx(ck: dict, meta: dict, path: str) -> None:
     "obs_hist": f"[1,{d['hist']},{d['proprio']}] oldest->newest; per frame: joint_pos-default({nj}), joint_vel({nj}), "
     f"base_ang_vel_pelvis(3), projected_gravity_pelvis(3), prev_action({nj}); joints in joint_names order",
     "goal": f"[1,{d['K']},{d['goal_frame']}] future reference frames t..t+K-1 (clamped at clip end); per frame: "
-    f"ref_joint_pos({nj}), ref_joint_vel({nj}), ref_anchor_pos_in_robot_anchor_frame(3), ref_anchor_rot6d_in_robot_anchor_frame(6)",
+    f"ref_joint_pos({nj}), ref_joint_vel({nj}), "
+    + ("ref_anchor_pos_in_robot_anchor_frame(3), " if meta["heads"]["goal_anchor_pos"] else "")
+    + "ref_anchor_rot6d_in_robot_anchor_frame(6)",
     "action": f"[1,{nj}] in action_joint_names order; joint target = action_offset + action_scale * action",
   }
   model = onnx.load(path)

@@ -32,10 +32,12 @@ def main():
   else:
     files = ck["cfg"]["motion_files"]
   d = ck["dims"]
-  heads_cfg = HeadsCfg(**{k: v for k, v in ck["cfg"]["heads"].items() if k != "extra"})
+  hk = {k: v for k, v in ck["cfg"]["heads"].items() if k != "extra"}
+  hk["goal_anchor_pos"] = d["goal_frame"] == 2 * d["nj"] + 9
+  heads_cfg = HeadsCfg(**hk)
   policy = Policy(d["proprio"], d["hist"], d["goal_frame"], d["K"], d["nj"]).to(args.device)
   policy.load_state_dict(ck["policy"])
-  ev = Evaluator(files, heads_cfg, args.device, compile_=not args.no_compile)
+  ev = Evaluator(files, heads_cfg, args.device, compile_=not args.no_compile, cache_dir=ck["cfg"].get("cache_dir", ""))
   res = ev.run(policy)
   print(json.dumps(res["scalars"], indent=2))
   print("failed clips:", res["failed_clips"])

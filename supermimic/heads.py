@@ -8,6 +8,10 @@ State vector layout (float32, D = 13 + 2*J):
   [13:13+J]     joint positions
   [13+J:13+2J]  joint velocities
 
+Reference data is passed in explicitly (tensors already gathered from the
+motion library), so the same code serves the simulator loop (global frame
+indices) and imagined rollouts (per-rollout window packs).
+
 All heads are differentiable w.r.t. the state so that the policy gradient can
 flow through them during imagined rollouts (paper §3.2: heads may be analytic).
 Reward and termination mirror mjlab's BeyondMimic tracking task (Appendix A of
@@ -32,7 +36,6 @@ from .math_utils import (
   subtract_frame_transforms,
   yaw_quat,
 )
-from .motions import MotionLibrary
 
 
 @dataclass
@@ -40,6 +43,7 @@ class HeadsCfg:
   K: int = 10  # future reference frames fed to the goal encoder
   hist: int = 10  # proprioceptive history length
   dt: float = 0.02
+  goal_anchor_pos: bool = False  # include ref anchor position relative to the robot anchor (needs odometry on hardware)
   # Sensor noise (uniform half-widths), Table A.1.
   noise_joint_pos: float = 0.01
   noise_joint_vel: float = 0.5
@@ -74,30 +78,33 @@ class HeadsCfg:
     ) * self.dt
 
 
+def window_frames(frame: torch.Tensor, clip_end: torch.Tensor, K: int) -> torch.Tensor:
+  """[B] -> [B,K] frame indices frame..frame+K-1 clamped at clip_end-1 (same index space)."""
+  return torch.minimum(frame[:, None] + torch.arange(K, device=frame.device)[None, :], clip_end[:, None] - 1)
+
+
 class AnalyticHeads:
   def __init__(
     self,
     fk: TorchFK,
-    lib: MotionLibrary,
     tracked_local_ids: list[int],
-    anchor_lib_index: int,
+    anchor_index: int,
     default_joint_pos: torch.Tensor,
     soft_joint_limits: torch.Tensor,
     cfg: HeadsCfg,
   ):
     self.fk = fk
-    self.lib = lib
     self.cfg = cfg
     self.device = fk.device
     self.tracked = torch.as_tensor(tracked_local_ids, device=self.device)
-    self.anchor_lib = anchor_lib_index
-    self.anchor_local = int(tracked_local_ids[anchor_lib_index])
+    self.anchor = anchor_index  # index within the tracked-body list
+    self.anchor_local = int(tracked_local_ids[anchor_index])
     self.nj = default_joint_pos.shape[-1]
     self.q0 = default_joint_pos.to(self.device).reshape(-1)
     self.soft_lim = soft_joint_limits.to(self.device).reshape(self.nj, 2)
     self.gravity = torch.tensor([0.0, 0.0, -1.0], device=self.device)
     self.proprio_dim = 3 * self.nj + 6
-    self.goal_frame_dim = 2 * self.nj + 9
+    self.goal_frame_dim = 2 * self.nj + 6 + (3 if cfg.goal_anchor_pos else 0)
     self.state_dim = 13 + 2 * self.nj
     self.feat_dim = 13 + 2 * self.nj  # 1 + 6 + 3 + 3 + 2J
 
@@ -121,8 +128,8 @@ class AnalyticHeads:
       body_lin_vel=lin[:, self.tracked],
       body_ang_vel=ang[:, self.tracked],
     )
-    out["anchor_pos"] = out["body_pos"][:, self.anchor_lib]
-    out["anchor_quat"] = out["body_quat"][:, self.anchor_lib]
+    out["anchor_pos"] = out["body_pos"][:, self.anchor]
+    out["anchor_quat"] = out["body_quat"][:, self.anchor]
     return out
 
   def state_features(self, s: torch.Tensor) -> torch.Tensor:
@@ -149,30 +156,25 @@ class AnalyticHeads:
       q_rel, qd, w_b, g_b = u(q_rel, c.noise_joint_pos), u(qd, c.noise_joint_vel), u(w_b, c.noise_ang_vel), u(g_b, c.noise_gravity)
     return torch.cat([q_rel, qd, w_b, g_b, prev_action], dim=-1)
 
-  def goal(self, kin: dict, frame: torch.Tensor, clip_end: torch.Tensor) -> torch.Tensor:
-    """K future reference frames expressed relative to the robot anchor. [B,K,67]."""
-    K = self.cfg.K
-    B = frame.shape[0]
-    fr = torch.minimum(frame[:, None] + torch.arange(K, device=self.device)[None, :], clip_end[:, None] - 1)
-    ref_q = self.lib.joint_pos[fr]  # [B,K,J]
-    ref_qd = self.lib.joint_vel[fr]
-    ref_ap = self.lib.body_pos_w[fr, self.anchor_lib]  # [B,K,3]
-    ref_aq = self.lib.body_quat_w[fr, self.anchor_lib]  # [B,K,4]
+  def goal(self, kin: dict, ref_q: torch.Tensor, ref_qd: torch.Tensor, ref_ap: torch.Tensor, ref_aq: torch.Tensor) -> torch.Tensor:
+    """K reference frames relative to the robot anchor. Inputs [B,K,*] -> [B,K,G]."""
+    B, K = ref_q.shape[0], ref_q.shape[1]
     rob_ap = kin["anchor_pos"][:, None, :].expand(B, K, 3).reshape(-1, 3)
     rob_aq = kin["anchor_quat"][:, None, :].expand(B, K, 4).reshape(-1, 4)
     rel_p, rel_q = subtract_frame_transforms(rob_ap, rob_aq, ref_ap.reshape(-1, 3), ref_aq.reshape(-1, 4))
-    rel_6d = rot6d_from_quat(rel_q)
-    return torch.cat([ref_q, ref_qd, rel_p.view(B, K, 3), rel_6d.view(B, K, 6)], dim=-1)
+    parts = [ref_q, ref_qd]
+    if self.cfg.goal_anchor_pos:
+      parts.append(rel_p.view(B, K, 3))
+    parts.append(rot6d_from_quat(rel_q).view(B, K, 6))
+    return torch.cat(parts, dim=-1)
 
   # ---- reward --------------------------------------------------------------
 
-  def relative_reference(self, kin_prev: dict, frame: torch.Tensor):
-    """Reference bodies at ``frame`` re-anchored to the robot anchor of the
-    pre-step state (mjlab ``update_relative_body_poses``)."""
-    ref_bp = self.lib.body_pos_w[frame]  # [B,Bt,3]
-    ref_bq = self.lib.body_quat_w[frame]
-    ref_ap = ref_bp[:, self.anchor_lib]
-    ref_aq = ref_bq[:, self.anchor_lib]
+  def relative_reference(self, kin_prev: dict, ref_bp: torch.Tensor, ref_bq: torch.Tensor):
+    """Reference bodies re-anchored to the robot anchor of the pre-step state
+    (mjlab ``update_relative_body_poses``). ref_bp [B,Bt,3], ref_bq [B,Bt,4]."""
+    ref_ap = ref_bp[:, self.anchor]
+    ref_aq = ref_bq[:, self.anchor]
     rob_ap, rob_aq = kin_prev["anchor_pos"], kin_prev["anchor_quat"]
     Bt = ref_bp.shape[1]
     delta_pos = torch.cat([rob_ap[:, :2], ref_ap[:, 2:3]], dim=-1)
@@ -182,28 +184,18 @@ class AnalyticHeads:
     body_pos_rel = delta_pos[:, None, :] + quat_apply(dori, (ref_bp - ref_ap[:, None, :]).reshape(-1, 3)).view(-1, Bt, 3)
     return body_pos_rel, body_quat_rel, ref_ap, ref_aq
 
-  def reward(
-    self,
-    kin_prev: dict,
-    kin_next: dict,
-    s_next: torch.Tensor,
-    action: torch.Tensor,
-    prev_action: torch.Tensor,
-    frame: torch.Tensor,
-    return_terms: bool = False,
-  ):
+  def reward(self, kin_prev: dict, kin_next: dict, s_next: torch.Tensor, action: torch.Tensor, prev_action: torch.Tensor, ref: dict, return_terms: bool = False):
+    """ref: dict with body_pos/body_quat/body_lin_vel/body_ang_vel [B,Bt,*] at the target frame."""
     c = self.cfg
-    body_pos_rel, body_quat_rel, ref_ap, ref_aq = self.relative_reference(kin_prev, frame)
-    ref_blv = self.lib.body_lin_vel_w[frame]
-    ref_bav = self.lib.body_ang_vel_w[frame]
+    body_pos_rel, body_quat_rel, ref_ap, ref_aq = self.relative_reference(kin_prev, ref["body_pos"], ref["body_quat"])
     bp, bq = kin_next["body_pos"], kin_next["body_quat"]
     Bt = bp.shape[1]
     e_root_pos = ((ref_ap - kin_next["anchor_pos"]) ** 2).sum(-1)
     e_root_ori = quat_error_magnitude(ref_aq, kin_next["anchor_quat"]) ** 2
     e_body_pos = ((body_pos_rel - bp) ** 2).sum(-1).mean(-1)
     e_body_ori = (quat_error_magnitude(body_quat_rel.reshape(-1, 4), bq.reshape(-1, 4)).view(-1, Bt) ** 2).mean(-1)
-    e_lin = ((ref_blv - kin_next["body_lin_vel"]) ** 2).sum(-1).mean(-1)
-    e_ang = ((ref_bav - kin_next["body_ang_vel"]) ** 2).sum(-1).mean(-1)
+    e_lin = ((ref["body_lin_vel"] - kin_next["body_lin_vel"]) ** 2).sum(-1).mean(-1)
+    e_ang = ((ref["body_ang_vel"] - kin_next["body_ang_vel"]) ** 2).sum(-1).mean(-1)
     _, _, _, _, q, _ = self.split(s_next)
     lim = (-(q - self.soft_lim[:, 0]).clamp(max=0.0) + (q - self.soft_lim[:, 1]).clamp(min=0.0)).sum(-1)
     terms = {
@@ -223,12 +215,10 @@ class AnalyticHeads:
 
   # ---- termination ---------------------------------------------------------
 
-  def termination(self, kin_next: dict, frame: torch.Tensor):
-    """Returns (hard_bool [B], soft_prob [B])."""
+  def termination(self, kin_next: dict, ref_ap: torch.Tensor, ref_aq: torch.Tensor):
+    """ref anchor pose [B,3]/[B,4] at the target frame. Returns (hard_bool [B], soft_prob [B])."""
     c = self.cfg
-    ref_ap = self.lib.body_pos_w[frame, self.anchor_lib]
-    ref_aq = self.lib.body_quat_w[frame, self.anchor_lib]
-    B = frame.shape[0]
+    B = ref_ap.shape[0]
     g = self.gravity.expand(B, 3)
     dz = (ref_ap[:, 2] - kin_next["anchor_pos"][:, 2]).abs()
     tilt = (quat_apply_inverse(ref_aq, g)[:, 2] - quat_apply_inverse(kin_next["anchor_quat"], g)[:, 2]).abs()
