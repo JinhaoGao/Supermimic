@@ -76,7 +76,7 @@ def main():
     }
     for k, mk in name_map.items():
       try:
-        sim_term = rm._step_reward[:, rm.active_terms.index(mk)]  # per-step, already scaled by dt
+        sim_term = rm._step_reward[:, rm.active_terms.index(mk)] * env.step_dt  # weight*value, scaled by dt here
       except Exception:  # noqa: BLE001
         sim_term = None
       if sim_term is not None:
