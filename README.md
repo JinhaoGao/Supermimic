@@ -64,6 +64,21 @@ E2 is not shipped by mjlab: `supermimic/robots/` holds an entity built from the 
 torque limits, armature, ankle friction, default pose and action scale copied from the GMT Isaac
 config (`assets/e2/e2.py`); 12 tracked bodies, anchor `waist_pitch_link`.
 
+## Deploy on the G1 (unitree_mujoco `State_SuperMimic`)
+
+The deployable G1 policy (goal without anchor position) runs as FSM mode `SuperMimic` in
+`~/Workspace/unitree_mujoco/deploy/robots/g1_29dof` (Velocity → RB + left), offline npz or online Redis
+(GMR-CPP stream). Details, observation contract and test results: `SUPERMIMIC_DEPLOY_NOTES.md` there.
+
+```bash
+bash scripts/deploy_from_server.sh g1_atlas_v1 latest      # export on bj27 -> named ONNX + deploy.yaml in unitree_mujoco
+# then set SuperMimic.policy_file in config.yaml to the printed name; no rebuild needed
+```
+
+Headless closed loop (original `scene_29dof.xml`, iteration 20000): dance 25 s and jumps 25 s offline, dance 31 s
+online, no falls, joint mean abs error 0.10 / 0.12 / 0.12 rad; controller observations / goal / action match an
+independent Python recomputation to ≤ 6e-8.
+
 ## Layout
 
 | file | role |
