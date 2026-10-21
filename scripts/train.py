@@ -78,7 +78,8 @@ def main():
     wm=WorldModelCfg(k=args.wm_k, lr=args.lr, batches_per_update=args.wm_batches, windows_per_batch=args.wm_windows),
   )
   print(f"[train] log_dir = {log_dir}")
-  with open(os.path.join(os.path.dirname(log_dir) if os.path.dirname(log_dir) else ".", "last_run.txt"), "a") as f:
+  os.makedirs(log_dir, exist_ok=True)
+  with open(os.path.join(args.log_root, "last_run.txt"), "a") as f:
     f.write(log_dir + "\n")
   trainer = Trainer(cfg)
   if args.resume:
