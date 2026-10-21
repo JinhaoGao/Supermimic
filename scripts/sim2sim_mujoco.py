@@ -92,8 +92,9 @@ def run_clip(mf, name, policy, heads_cfg, args, ManagerBasedRlEnv, make_env_cfg,
   for a in range(model.nu):
     jid = int(model.actuator_trnid[a, 0])
     jname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, jid)
-    jname2act[jname] = a
-  act_ids = np.array([jname2act[n.split("/")[-1]] if n.split("/")[-1] in jname2act else jname2act[n] for n in tnames])
+    jname2act[jname.split("/")[-1]] = a  # scene joints are namespaced "robot/<joint>"
+  act_ids = np.array([jname2act[n.split("/")[-1]] for n in tnames])
+  assert len(set(act_ids.tolist())) == nj, "action -> actuator mapping is not one-to-one"
   dt = env.step_dt
   decimation = env.cfg.decimation
   assert abs(model.opt.timestep * decimation - dt) < 1e-9
