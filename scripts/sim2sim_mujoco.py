@@ -141,7 +141,7 @@ def run_clip(mf, name, policy, heads_cfg, args, ManagerBasedRlEnv, make_env_cfg,
     renderer = mujoco.Renderer(model, args.height, args.width)
     opt = mujoco.MjvOption()
     opt.geomgroup[:] = 0
-    opt.geomgroup[2] = 1  # visual meshes only
+    opt.geomgroup[0] = opt.geomgroup[1] = opt.geomgroup[2] = 1  # floor + visual meshes, no collision capsules
     cam = mujoco.MjvCamera()
     cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
     cam.trackbodyid = root_bid
@@ -158,7 +158,7 @@ def run_clip(mf, name, policy, heads_cfg, args, ManagerBasedRlEnv, make_env_cfg,
     viewer.cam.trackbodyid = root_bid
     viewer.cam.distance, viewer.cam.azimuth, viewer.cam.elevation = 3.0, 135.0, -12.0
     viewer.opt.geomgroup[:] = 0
-    viewer.opt.geomgroup[2] = 1
+    viewer.opt.geomgroup[0] = viewer.opt.geomgroup[1] = viewer.opt.geomgroup[2] = 1  # keep the floor
     ghost_opt = mujoco.MjvOption()
     ghost_opt.geomgroup[:] = 0
     ghost_opt.geomgroup[2] = 1
