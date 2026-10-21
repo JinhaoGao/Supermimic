@@ -25,8 +25,27 @@ Paper reference points on the same data: SuperMimic reaches 0.82 after 1.2 h on 
 H100; PPO-Sim reaches 0.72 after 18 h on eight GPUs. Benchmark protocol = Appendix F
 (each clip from frame 0, friction 1.0, no DR / noise, failure = training termination).
 
-sim2sim (checkpoint 16000 in CPU MuJoCo, `scripts/sim2sim_mujoco.py`): dance 0.97,
-sprint 0.93, jumps 0.90, fall-and-get-up 0.88, fight 0.86 normalized return, no falls.
+sim2sim (checkpoint 16000 exported to ONNX, run by onnxruntime in plain CPU MuJoCo via
+`scripts/play_mujoco.py`, 40 s per clip, no falls): walk 0.98, run 0.95, dance1 0.94,
+dance2 0.94, sprint 0.92, jumps 0.89, fight 0.87, fall-and-get-up 0.86 normalized return.
+
+## Deploy / playback chain
+
+```bash
+# 1. once, where mjlab is installed (CPU is fine): compiled scene + ONNX policy + metadata
+uv run python scripts/export_bundle.py --ckpt model_16000.pt --motion <any clip.npz> --out ~/supermimic/bundle_16000
+# 2. anywhere with mujoco + torch + onnxruntime: interactive viewer (floor + green reference ghost) or mp4
+python scripts/play_mujoco.py --bundle ~/supermimic/bundle_16000 --motion <clip.npz> --seconds 20 --viewer
+python scripts/play_mujoco.py --bundle ~/supermimic/bundle_16000 --motion <clip.npz> --video out.mp4
+bash scripts/view_local.sh jumps1_subject1 20 1.5        # local shortcut (clip, seconds, slow-motion factor)
+```
+
+`policy.onnx` interface: inputs `obs_hist [1,10,93]` (oldest first; per frame joint_pos−default,
+joint_vel, pelvis angular velocity, projected gravity, previous action) and `goal [1,10,67]`
+(next 10 reference frames; per frame ref joint pos/vel, ref torso position and 6D rotation in the
+current robot torso frame); output `action [1,29]`, joint target = `action_offset + action_scale * action`.
+Normalization is inside the graph; joint/action order, scales and the layout text are stored as ONNX
+metadata. `--backend torch` runs the PyTorch weights instead (matches ONNX to 2e-6).
 
 ## Layout
 
