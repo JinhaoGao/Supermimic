@@ -41,6 +41,11 @@ class RunningMeanStd(nn.Module):
     if n == 0:
       return
     bm, bv = x.mean(0), x.var(0, unbiased=False)
+    self.update_moments(n, bm, bv)
+
+  @torch.no_grad()
+  def update_moments(self, n: int, bm: torch.Tensor, bv: torch.Tensor):
+    """Merge a batch given by its size, mean and (biased) variance (DistCtx.rms_update combines ranks first)."""
     tot = self.count + n
     delta = bm - self.mean
     self.mean += delta * n / tot
@@ -158,15 +163,23 @@ class DynamicsModel(nn.Module):
     return ((d / self.err_norm.std) ** 2).mean(-1)
 
   @torch.no_grad()
-  def update_stats(self, batch: dict) -> None:
+  def stats_pairs(self, batch: dict) -> list:
+    """[(normalizer, samples)] for one replay batch (the inputs do not depend on the normalizers)."""
     s0, actions, next_states, mask = batch["s0"], batch["actions"], batch["next_states"], batch["mask"]
     prev = torch.cat([s0[:, None], next_states[:, :-1]], dim=1)[mask]
     nxt = next_states[mask]
     D = prev.shape[-1]
     prev, nxt = prev.reshape(-1, D), nxt.reshape(-1, D)
-    self.in_norm.update(torch.cat([self.features(prev), actions[mask].reshape(-1, self.nj)], -1))
-    self.tgt_norm.update(self.targets(prev, nxt))
-    self.err_norm.update(self.diffs(prev, nxt))
+    return [
+      (self.in_norm, torch.cat([self.features(prev), actions[mask].reshape(-1, self.nj)], -1)),
+      (self.tgt_norm, self.targets(prev, nxt)),
+      (self.err_norm, self.diffs(prev, nxt)),
+    ]
+
+  @torch.no_grad()
+  def update_stats(self, batch: dict) -> None:
+    for rms, x in self.stats_pairs(batch):
+      rms.update(x)
 
   def window_loss(self, s0: torch.Tensor, actions: torch.Tensor, next_states: torch.Tensor, xi: torch.Tensor, mask: torch.Tensor):
     """Autoregressive k-step loss. Returns (loss, err_step1, err_stepk) tensors."""

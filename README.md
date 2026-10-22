@@ -64,6 +64,37 @@ E2 is not shipped by mjlab: `supermimic/robots/` holds an entity built from the 
 torque limits, armature, ankle friction, default pose and action scale copied from the GMT Isaac
 config (`assets/e2/e2.py`); 12 tracked bodies, anchor `waist_pitch_link`.
 
+## One model on several GPUs (torchrun data parallel)
+
+The paper is a single-GPU method; `scripts/train.py` started by `torchrun` trains **one** model on N GPUs of
+one machine. Every rank keeps the per-GPU config (4096 envs, own replay, 4096 imagined rollouts; seed + rank),
+so the global batch is N× (8 GPUs: 32768 envs / 32768 rollouts per update); LR is not scaled (`--lr_scale`
+to change it). The ranks stay one model (`supermimic/distributed.py`):
+
+* rank 0's initial parameters / buffers are broadcast (so rank 0 starts from the single-GPU seed-`--seed` model);
+* after every backward (WM ×10, policy ×1, critic ×20 per iteration) the gradients are flattened, all-reduced and
+  averaged, then clipped / stepped exactly as before (no DDP wrapper: the step functions are compiled free functions);
+* RunningMeanStd normalizers (policy obs / goal, WM in / tgt / err) are updated with the batch moments of all ranks
+  (all-gather, combined in rank order) -> bitwise identical on every rank;
+* the return-based reset sampler (bin_G / bin_visits / bin_weight_hist) is merged every `--sampler_sync_interval`
+  iterations (default = `--log_interval`): visit-weighted mean of what each rank learned since the last merge;
+* rank 0 alone writes TensorBoard (metrics averaged over ranks, episode stats pooled, `time/env_fps` = all ranks,
+  `dist/*_max` = slowest rank), checkpoints and runs the benchmark; the others wait in a CPU (gloo) barrier
+  (`--dist_timeout_min`, default 120, must exceed one evaluation and a cache build);
+* every `--param_check_interval` iterations (default 1000, plus start / end) all learned state (models, normalizers,
+  Adam moments, sampler, counters) is hashed on every rank; any difference to rank 0 stops the run;
+* `--resume` loads the checkpoint on every rank (equality checked at start).
+
+Without torchrun (or with one process) the code path is the original single-GPU one (bitwise identical results).
+
+```bash
+# bj31: 8 GPUs, data / logs / cache on /data2 (prebuild the cache with scripts/build_cache.py first)
+bash scripts/launch_bj31_ddp.sh g1_full_ddp8 --motion_dirs ~/motion_dataset/g1_atlas_full \
+    --blacklist /data2/supermimic/lists/atlas_full_blacklist_motion50_1010.json \
+    --eval_clip_names /data2/supermimic/lists/eval_1024.txt --eval_interval 4000
+bash scripts/stop_bj31_ddp.sh g1_full_ddp8       # kill -9 all ranks + the torchrun agent
+```
+
 ## Deploy on the G1 (unitree_mujoco `State_SuperMimic`)
 
 The deployable G1 policy (goal without anchor position) runs as FSM mode `SuperMimic` in
@@ -100,6 +131,9 @@ independent Python recomputation to ≤ 6e-8.
 | `scripts/eval_ckpt.py` | offline benchmark evaluation of a checkpoint |
 | `scripts/sim2sim_mujoco.py` | checkpoint → CPU MuJoCo rollout + side-by-side video vs reference |
 | `scripts/launch_bj27.sh` | nohup launcher used on the server |
+| `supermimic/distributed.py` | torchrun data parallel: gradient / normalizer / sampler sync, cross-rank state check |
+| `scripts/launch_bj31_ddp.sh`, `scripts/stop_bj31_ddp.sh` | detached 8-GPU torchrun launcher / stopper (bj31) |
+| `tests/test_ddp_sync.py` | multi-process (CPU / gloo) checks of the sync helpers |
 
 ## Setup and run
 

@@ -9,6 +9,9 @@ Examples:
       --cache_dir ~/supermimic/data/cache --eval_clips 1024 --run_name g1_atlas
   # Same, but the eval subset fixed by npz basename (comparable across file lists) and 24 CPU threads
   python scripts/train.py ... --eval_clip_names eval_1024.txt --num_threads 24
+  # One model on 8 GPUs of one machine (data parallel; every rank keeps the per-GPU config above,
+  # so the global batch is 8x: 32768 envs / 32768 imagined rollouts). See scripts/launch_bj31_ddp.sh.
+  torchrun --standalone --nproc_per_node 8 scripts/train.py ... --num_threads 24
 """
 
 from __future__ import annotations
@@ -55,6 +58,11 @@ def main():
   p.add_argument("--no_compile", action="store_true")
   p.add_argument("--compile_mode", type=str, default=None, help="e.g. reduce-overhead or max-autotune")
   p.add_argument("--num_threads", type=int, default=0, help="CPU threads: OMP/MKL/OpenBLAS env + torch.set_num_threads (0 = leave defaults)")
+  # Data parallel (only active under torchrun with more than one process).
+  p.add_argument("--lr_scale", type=float, default=1.0, help="multiply policy / critic / world-model LR (e.g. for the larger DDP batch); default 1 = paper LR")
+  p.add_argument("--dist_timeout_min", type=float, default=120.0, help="process-group timeout; must exceed one evaluation on rank 0 (and a cache build)")
+  p.add_argument("--sampler_sync_interval", type=int, default=0, help="iterations between reset-sampler merges across ranks (0 = --log_interval)")
+  p.add_argument("--param_check_interval", type=int, default=1000, help="iterations between cross-rank learned-state hash checks (0 = start/end only)")
   args = p.parse_args()
 
   if args.num_threads > 0:
@@ -69,16 +77,28 @@ def main():
     args.eval_clip_names = os.path.abspath(os.path.expanduser(args.eval_clip_names))
     assert os.path.isfile(args.eval_clip_names), f"--eval_clip_names {args.eval_clip_names} not found"
 
+  from supermimic.distributed import DistCtx
+
+  # torchrun -> one process per GPU (device = cuda:LOCAL_RANK); plain python -> disabled, single-GPU code path.
+  dctx = DistCtx.from_env(args.device, args.dist_timeout_min)
+  args.device = dctx.device
+
   from supermimic.heads import HeadsCfg
   from supermimic.motions import collect_motion_files
   from supermimic.trainer import TrainCfg, Trainer
   from supermimic.world_model import WorldModelCfg
 
-  files = collect_motion_files(args.motion_dirs, args.blacklist, args.name_exclude, args.max_motions)
-  assert files, "no motion files found"
-  print(f"[train] {len(files)} motion files")
-
-  log_dir = os.path.join(args.log_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_" + args.run_name)
+  # Rank 0 resolves the file list and the run directory; the others take them verbatim (the cache key
+  # is the exact ordered path list, and every rank must log into the same directory).
+  if dctx.is_main:
+    files = collect_motion_files(args.motion_dirs, args.blacklist, args.name_exclude, args.max_motions)
+    assert files, "no motion files found"
+    print(f"[train] {len(files)} motion files")
+    log_dir = os.path.join(args.log_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_" + args.run_name)
+  else:
+    files, log_dir = None, None
+  files, log_dir = dctx.broadcast_object((files, log_dir))
+  lr = args.lr * args.lr_scale
   cfg = TrainCfg(
     motion_files=files,
     robot=args.robot,
@@ -93,8 +113,8 @@ def main():
     H=args.H,
     rollouts_per_update=args.rollouts,
     use_critic=not args.no_critic,
-    policy_lr=args.lr,
-    critic_lr=args.lr,
+    policy_lr=lr,
+    critic_lr=lr,
     lr_decay_iters=args.lr_decay_iters,
     log_interval=args.log_interval,
     eval_interval=args.eval_interval,
@@ -106,19 +126,30 @@ def main():
     eval_enabled=not args.no_eval,
     compile=not args.no_compile,
     compile_mode=args.compile_mode,
-    wm=WorldModelCfg(k=args.wm_k, lr=args.lr, batches_per_update=args.wm_batches, windows_per_batch=args.wm_windows),
+    world_size=dctx.world,
+    base_lr_scale=args.lr_scale,
+    sampler_sync_interval=args.sampler_sync_interval,
+    param_check_interval=args.param_check_interval,
+    dist_timeout_min=args.dist_timeout_min,
+    wm=WorldModelCfg(k=args.wm_k, lr=lr, batches_per_update=args.wm_batches, windows_per_batch=args.wm_windows),
     heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos),
   )
-  print(f"[train] log_dir = {log_dir}")
   os.makedirs(log_dir, exist_ok=True)
-  with open(os.path.join(args.log_root, "last_run.txt"), "a") as f:
-    f.write(log_dir + "\n")
-  with open(os.path.join(log_dir, "motion_files.txt"), "w") as f:
-    f.write("\n".join(files))
-  trainer = Trainer(cfg)
+  if dctx.is_main:
+    print(f"[train] log_dir = {log_dir}")
+    if args.lr_scale != 1.0:
+      print(f"[train] lr_scale {args.lr_scale}: policy / critic / world-model lr = {lr:g}")
+    with open(os.path.join(args.log_root, "last_run.txt"), "a") as f:
+      f.write(log_dir + "\n")
+    with open(os.path.join(log_dir, "motion_files.txt"), "w") as f:
+      f.write("\n".join(files))
+  trainer = Trainer(cfg, dist=dctx)
   if args.resume:
-    trainer.load(args.resume)
+    trainer.load(args.resume)  # every rank loads the same checkpoint (checked for equality at start)
   trainer.run()
+  # Clean exit only; on an exception the process just dies and torchrun tears the other ranks down
+  # (a destroy_process_group with peers still inside a collective could block).
+  dctx.close()
 
 
 if __name__ == "__main__":
