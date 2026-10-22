@@ -65,6 +65,22 @@ def main():
     assert len(acts) == 1, f"joint {n}: {len(acts)} actuators"
     pd_kp.append(float(mj.actuator_gainprm[acts[0], 0]))
     pd_kd.append(float(-mj.actuator_biasprm[acts[0], 2]))
+  # Passive joint properties of the compiled training model, per policy joint. An evaluator that applies
+  # explicit PD torques kp*(target-q) - kd*dq on another MJCF reproduces the training dynamics with
+  # joint_damping = actuator kd + passive joint damping (E2: the source MJCF carries damping = kd on every
+  # joint, so the E2 policies were trained with twice the actuator damping) and joint_armature.
+  passive_damping, armature, frictionloss, effort_limit = [], [], [], []
+  for n in robot.joint_names:
+    jid = mujoco.mj_name2id(mj, mujoco.mjtObj.mjOBJ_JOINT, f"robot/{n}")
+    dof = int(mj.jnt_dofadr[jid])
+    act = [a for a in range(mj.nu) if int(mj.actuator_trnid[a, 0]) == jid][0]
+    passive_damping.append(float(mj.dof_damping[dof]))
+    armature.append(float(mj.dof_armature[dof]))
+    frictionloss.append(float(mj.dof_frictionloss[dof]))
+    effort_limit.append(float(mj.actuator_forcerange[act, 1]) if mj.actuator_forcelimited[act] else None)
+  if max(passive_damping) > 0:
+    print(f"[export] note: passive joint damping in the training model (max {max(passive_damping):.3g}); "
+          "joint_damping metadata = actuator kd + passive damping")
   # Kinematic chain root -> anchor (for the deploy side: anchor orientation from IMU + joint encoders).
   bid_anchor = mujoco.mj_name2id(mj, mujoco.mjtObj.mjOBJ_BODY, f"robot/{cmd.cfg.anchor_body_name}")
   bid_root = mujoco.mj_name2id(mj, mujoco.mjtObj.mjOBJ_BODY, f"robot/{robot.body_names[0]}")
@@ -102,6 +118,11 @@ def main():
     "dims": ck["dims"],
     "pd_kp": pd_kp,
     "pd_kd": pd_kd,
+    "joint_passive_damping": passive_damping,
+    "joint_armature": armature,
+    "joint_frictionloss": frictionloss,
+    "effort_limit": effort_limit,
+    "sim_dt": float(mj.opt.timestep),
     "anchor_chain": chain,
   }
   with open(os.path.join(args.out, "meta.json"), "w") as f:
@@ -152,6 +173,10 @@ def export_onnx(ck: dict, meta: dict, path: str) -> None:
     "anchor_body_name": meta["anchor_body_name"],
     "layout": json.dumps(layout),
   }
+  if "pd_kp" in meta:  # robot constants for external MuJoCo evaluators (explicit PD, see main())
+    props["joint_stiffness"] = json.dumps(meta["pd_kp"])
+    props["joint_damping"] = json.dumps([a + b for a, b in zip(meta["pd_kd"], meta["joint_passive_damping"])])
+    props["joint_armature"] = json.dumps(meta["joint_armature"])
   for k, v in props.items():
     e = model.metadata_props.add()
     e.key, e.value = k, v
