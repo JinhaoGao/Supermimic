@@ -23,6 +23,7 @@ import math
 import os
 import random
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 
 import numpy as np
@@ -80,6 +81,18 @@ class TrainCfg:
   lr_decay_iters: int = 250_000
   lr_final_ratio: float = 0.03
   use_critic: bool = True
+  critic_huber_delta: float = 1.0  # 2*Huber(delta) == MSE for |err|<delta; linear beyond (outlier targets)
+  clip_value_targets: bool = True  # clip GAE targets to [-v_max, v_max], v_max = r_max/(1-gamma)
+  # Watchdog: roll back to the last healthy checkpoint when imagination collapses (see _watchdog).
+  wd_enabled: bool = True
+  wd_ema: float = 0.02  # EMA rate of the imagined reward (normalized)
+  wd_drop: float = 0.08  # trigger when EMA < best EMA of the last wd_window iterations - wd_drop
+  wd_window: int = 4000
+  wd_vloss_ratio: float = 50.0  # or when median critic loss of the last 50 its > ratio * median of the last 2000
+  wd_warmup: int = 500  # iterations after start / resume / rollback before the watchdog may trigger
+  wd_lr_factor: float = 0.5  # LR multiplier applied at every rollback
+  wd_max_rollbacks: int = 6
+  wd_force_at: int = -1  # debug: force one rollback at this iteration
   # Logging / eval / checkpoints.
   log_interval: int = 50
   eval_interval: int = 2000
@@ -168,6 +181,8 @@ class Trainer:
     self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic_lr)
     lam = cosine_lambda(cfg.lr_decay_iters, cfg.lr_final_ratio)
     self.sched = [torch.optim.lr_scheduler.LambdaLR(o, lam) for o in (self.opt_wm, self.opt_pi, self.opt_v)]
+    self._base_lrs0 = [list(sch.base_lrs) for sch in self.sched]
+    self.lr_scale = 1.0
     self.buffer = ReplayBuffer(self.E, cfg.replay_capacity, self.heads.state_dim, self.nj, self.xi_dim, self.device)
     self.evaluator: Evaluator | None = None
     self.it = 0
@@ -212,6 +227,14 @@ class Trainer:
     self._gamma_pow = cfg.gamma ** torch.arange(L, device=self.device, dtype=torch.float32)
     self._ar = torch.arange(E, device=self.device)
     self.stats = {"ep_return_norm": [], "ep_len": [], "ep_failed": [], "term_mismatch": []}
+    # ---- watchdog ----
+    self.wd_reward_ema: float | None = None
+    self.wd_hist: deque = deque()
+    self.wd_vloss: deque = deque(maxlen=2000)
+    self.wd_healthy_ckpt: str | None = None
+    self.wd_rollbacks = 0
+    self.wd_quiet_until = cfg.wd_warmup
+    self.wd_forced = False
 
   # ---------------------------------------------------------------------------
   # 1. Data collection
@@ -388,6 +411,9 @@ class Trainer:
       for t in reversed(range(H)):
         R[t] = rews[t] + g * (1.0 - dsoft[t]) * ((1.0 - lam) * V[t + 1] + lam * R[t + 1])
       targets = torch.stack(R[:H], dim=1)
+      if cfg.clip_value_targets:
+        v_max = self.cfg.heads.reward_max_per_step / (1.0 - g)
+        targets = targets.clamp(-v_max, v_max)
     F = torch.stack(feats_n, dim=1).reshape(N * H, -1)
     G = torch.stack(goals_n, dim=1).reshape(N * H, -1)
     X = xi[:, None, :].expand(N, H, -1).reshape(N * H, -1)
@@ -400,7 +426,7 @@ class Trainer:
       for i in range(cfg.critic_minibatches):
         idx = perm[i * mb : (i + 1) * mb]
         v = self.critic(F[idx], G[idx], X[idx])
-        loss = torch.nn.functional.mse_loss(v, T[idx])
+        loss = 2.0 * torch.nn.functional.huber_loss(v, T[idx], delta=cfg.critic_huber_delta)
         self.opt_v.zero_grad(set_to_none=True)
         loss.backward()
         params = list(self.critic.parameters())
@@ -414,9 +440,12 @@ class Trainer:
   # Checkpoints / evaluation
   # ---------------------------------------------------------------------------
 
+  def _ckpt_path(self, tag: str) -> str:
+    return os.path.join(self.cfg.log_dir, f"model_{tag}.pt")
+
   def save(self, tag: str) -> str:
     assert self.main, "only rank 0 writes checkpoints"
-    path = os.path.join(self.cfg.log_dir, f"model_{tag}.pt")
+    path = self._ckpt_path(tag)
     torch.save(
       {
         "it": self.it,
@@ -429,6 +458,7 @@ class Trainer:
         "opt_v": self.opt_v.state_dict(),
         "bin_G": self.cmd.bin_G,
         "bin_visits": self.cmd.bin_visits,
+        "lr_scale": self.lr_scale,
         "cfg": asdict(self.cfg),
         "dims": dict(proprio=self.heads.proprio_dim, hist=self.cfg.heads.hist, goal_frame=self.heads.goal_frame_dim, K=self.cfg.heads.K, nj=self.nj, xi=self.xi_dim),
       },
@@ -436,8 +466,8 @@ class Trainer:
     )
     return path
 
-  def load(self, path: str) -> None:
-    ck = torch.load(path, map_location=self.device)
+  def load(self, path: str, rollback: bool = False) -> None:
+    ck = torch.load(path, map_location=self.device, weights_only=False)
     self.policy.load_state_dict(ck["policy"])
     self.critic.load_state_dict(ck["critic"])
     self.wm.load_state_dict(ck["wm"])
@@ -451,7 +481,93 @@ class Trainer:
     self.env_steps = ck["env_steps"]
     for s in self.sched:
       s.last_epoch = self.it
+    if not rollback and float(ck.get("lr_scale", 1.0)) != 1.0:
+      self._set_lr_scale(float(ck["lr_scale"]))
+      self._print(f"[Trainer] lr_scale {self.lr_scale} restored from checkpoint")
+    self.wd_healthy_ckpt = path
+    self.wd_quiet_until = self.it + self.cfg.wd_warmup
     self._print(f"[Trainer] resumed from {path} at iteration {self.it}")
+
+  # ---------------------------------------------------------------------------
+  # Watchdog: G1 full-atlas run 2026-10-22 collapsed at ~41k iterations (imagined reward 0.91 -> 0.4 in
+  # ~400 iterations, critic loss x5000, then NaN in the reset sampler). Roll back instead of dying.
+  # ---------------------------------------------------------------------------
+
+  def _watchdog(self, m_pi: dict) -> bool:
+    """Update watchdog statistics; roll back if training collapsed. Returns True after a rollback."""
+    cfg = self.cfg
+    if not cfg.wd_enabled:
+      return False
+    r = float(m_pi.get("pi/imagined_reward_norm", float("nan")))
+    vl = float(m_pi.get("critic/loss", float("nan")))
+    if self.dist.enabled:  # data parallel: every rank decides on the same rank means -> rolls back together
+      g = self.dist.reduce_scalars({"r": r, "vl": vl}, "mean", check_keys=False)
+      r, vl = g["r"], g["vl"]
+    if math.isfinite(vl):
+      self.wd_vloss.append(vl)
+    if not math.isfinite(r):
+      return self._rollback("imagined reward is not finite")
+    a = cfg.wd_ema
+    self.wd_reward_ema = r if self.wd_reward_ema is None else (1 - a) * self.wd_reward_ema + a * r
+    self.wd_hist.append((self.it, self.wd_reward_ema))
+    while self.wd_hist and self.wd_hist[0][0] < self.it - cfg.wd_window:
+      self.wd_hist.popleft()
+    if cfg.wd_force_at >= 0 and self.it >= cfg.wd_force_at and not self.wd_forced:
+      self.wd_forced = True
+      return self._rollback(f"forced at {self.it} (debug)")
+    if self.it < self.wd_quiet_until:
+      return False
+    best = max(e for _, e in self.wd_hist)
+    if self.wd_reward_ema < best - cfg.wd_drop:
+      return self._rollback(f"imagined reward EMA {self.wd_reward_ema:.3f} < best {best:.3f} - {cfg.wd_drop}")
+    if len(self.wd_vloss) >= 500:
+      recent = float(np.median(list(self.wd_vloss)[-50:]))
+      base = float(np.median(self.wd_vloss))
+      if recent > cfg.wd_vloss_ratio * max(base, 1e-6):
+        return self._rollback(f"critic loss median {recent:.3g} > {cfg.wd_vloss_ratio} x {base:.3g}")
+    return False
+
+  def _healthy(self) -> bool:
+    if self.wd_reward_ema is None or not self.wd_hist:
+      return False
+    best = max(e for _, e in self.wd_hist)
+    return self.wd_reward_ema >= best - 0.5 * self.cfg.wd_drop
+
+  def _set_lr_scale(self, scale: float) -> None:
+    self.lr_scale = scale
+    for sch, b0 in zip(self.sched, self._base_lrs0):
+      sch.base_lrs = [b * scale for b in b0]
+      for grp, b in zip(sch.optimizer.param_groups, sch.base_lrs):
+        grp["lr"] = b * sch.lr_lambdas[0](self.it)
+
+  def _rollback(self, reason: str) -> bool:
+    cfg = self.cfg
+    path = self.wd_healthy_ckpt
+    self._print(f"[watchdog] it {self.it}: {reason}", flush=True)
+    if path is None or not os.path.exists(path):
+      self._print("[watchdog] no healthy checkpoint yet; continuing", flush=True)
+      self.wd_quiet_until = self.it + cfg.wd_warmup
+      return False
+    if self.wd_rollbacks >= cfg.wd_max_rollbacks:
+      raise RuntimeError(f"[watchdog] {self.wd_rollbacks} rollbacks already; giving up ({reason})")
+    it_before = self.it
+    self.load(path, rollback=True)  # models, normalizers, optimizers, sampler bins, iteration counter
+    self._set_lr_scale(self.lr_scale * cfg.wd_lr_factor)
+    self.wd_rollbacks += 1
+    self.wd_reward_ema = None
+    self.wd_hist.clear()
+    self.wd_vloss.clear()
+    self.wd_quiet_until = self.it + cfg.wd_warmup
+    msg = (f"[watchdog] rollback #{self.wd_rollbacks}: it {it_before} -> {self.it} from {path}; "
+           f"LR x{cfg.wd_lr_factor} (policy lr now {self.opt_pi.param_groups[0]['lr']:.2e})")
+    if self.dist.enabled:
+      self._dist_start(f"rollback to it {self.it}")  # every rank loaded the same file; re-sync sampler, check state
+    if self.main:
+      print(msg, flush=True)
+      with open(os.path.join(cfg.log_dir, "watchdog.log"), "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {reason} | {msg}\n")
+      self.writer.add_scalar("guard/rollbacks", self.wd_rollbacks, it_before)
+    return True
 
   def evaluate(self) -> dict:
     if self.evaluator is None:
@@ -481,12 +597,13 @@ class Trainer:
   # Data parallel bookkeeping (no-ops without torchrun)
   # ---------------------------------------------------------------------------
 
-  def _dist_start(self) -> None:
-    """Start of training / after resume: rank 0's sampler state everywhere, merge snapshot, state check."""
+  def _dist_start(self, tag: str = "start") -> None:
+    """Start of training / after resume or a watchdog rollback: rank 0's sampler state everywhere
+    (bin_weight_hist is not in the checkpoint), fresh merge snapshot, full state check."""
     c = self.cmd
     self.dist.broadcast_tensors_([c.bin_G, c.bin_visits, c.bin_weight_hist])
     self._bins0 = (c.bin_G.clone(), c.bin_visits.clone())
-    self._check_consistency("start")
+    self._check_consistency(tag)
 
   def _merge_sampler(self) -> None:
     c = self.cmd
@@ -596,6 +713,9 @@ class Trainer:
       for s in self.sched:
         s.step()
       self.it += 1
+      if self._watchdog(m_pi):
+        agg = {}
+        continue
       for k, v in {**m_wm, **m_pi, "time/collect": t1 - t0, "time/wm": t2 - t1, "time/policy": t3 - t2, "time/iter": t3 - t0}.items():
         agg.setdefault(k, []).append(v)
 
@@ -627,6 +747,9 @@ class Trainer:
           scal["sampler/entropy"] = self.cmd.metrics["sampling_entropy"][0].item()
           scal["sampler/top1_prob"] = self.cmd.metrics["sampling_top1_prob"][0].item()
           scal["sampler/bins_visited_frac"] = (self.cmd.bin_visits > 0).float().mean().item()
+        if self.wd_reward_ema is not None:
+          scal["guard/reward_ema"] = self.wd_reward_ema  # same on every rank (watchdog runs on rank means)
+        scal["guard/rollbacks_total"] = self.wd_rollbacks
         if self.main:
           for k, v in scal.items():
             self.writer.add_scalar(k, v, self.it)
@@ -645,8 +768,10 @@ class Trainer:
 
       if dctx.enabled and check_slot:
         self._check_consistency(f"it {self.it}")
-      if ckpt_slot and self.main:
-        self.save(str(self.it))
+      if ckpt_slot:
+        p_ck = self.save(str(self.it)) if self.main else self._ckpt_path(str(self.it))  # all ranks track the path
+        if self._healthy():
+          self.wd_healthy_ckpt = p_ck
       if cfg.eval_enabled and eval_slot and self.main:
         te = time.time()
         try:

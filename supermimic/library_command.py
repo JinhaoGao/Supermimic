@@ -152,6 +152,9 @@ class LibraryMotionCommand(MotionCommand):
 
   @torch.no_grad()
   def update_bin_returns(self, bin_ids: torch.Tensor, returns: torch.Tensor) -> None:
+    finite = torch.isfinite(returns)
+    if not bool(finite.all()):
+      bin_ids, returns = bin_ids[finite], returns[finite]
     if bin_ids.numel() == 0:
       return
     NB = self.library.num_bins
@@ -174,6 +177,7 @@ class LibraryMotionCommand(MotionCommand):
     soft = torch.softmax(-c.softmax_temp * G / c.g_max, dim=0)
     hist = self.bin_weight_hist / self.bin_weight_hist.sum()
     probs = c.mix_uniform * uniform + c.mix_softmax * soft + c.mix_history * hist
+    probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0) + 1e-12
     probs = probs / probs.sum()
     self.bin_weight_hist = (1 - c.weight_ema) * self.bin_weight_hist + c.weight_ema * soft
     return probs

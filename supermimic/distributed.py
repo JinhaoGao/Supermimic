@@ -220,15 +220,17 @@ class DistCtx:
   # ---- logging ---------------------------------------------------------------
 
   @torch.no_grad()
-  def reduce_scalars(self, scal: dict[str, float], op: str = "mean") -> dict[str, float]:
-    """Element-wise mean / sum / max over ranks of a dict of python floats (same keys on every rank)."""
+  def reduce_scalars(self, scal: dict[str, float], op: str = "mean", check_keys: bool = True) -> dict[str, float]:
+    """Element-wise mean / sum / max over ranks of a dict of python floats (same keys on every rank;
+    check_keys verifies that first with a small CPU all_gather, skip it for fixed per-iteration keys)."""
     if not self.enabled:
       return dict(scal)
     keys = sorted(scal)
-    crc = zlib.crc32("\n".join(keys).encode())
-    crcs = self.all_gather_object(crc)
-    if any(c != crcs[0] for c in crcs):
-      raise RuntimeError(f"[dist] rank {self.rank}: scalar keys differ between ranks ({keys})")
+    if check_keys:
+      crc = zlib.crc32("\n".join(keys).encode())
+      crcs = self.all_gather_object(crc)
+      if any(c != crcs[0] for c in crcs):
+        raise RuntimeError(f"[dist] rank {self.rank}: scalar keys differ between ranks ({keys})")
     t = torch.tensor([float(scal[k]) for k in keys], dtype=torch.float64, device=self.device)
     dist.all_reduce(t, op=dist.ReduceOp.MAX if op == "max" else dist.ReduceOp.SUM)
     if op == "mean":

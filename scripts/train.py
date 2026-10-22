@@ -55,6 +55,9 @@ def main():
   p.add_argument("--ckpt_interval", type=int, default=2000)
   p.add_argument("--no_eval", action="store_true")
   p.add_argument("--resume", type=str, default=None)
+  p.add_argument("--no_watchdog", action="store_true", help="disable the collapse watchdog (auto-rollback + LR halving)")
+  p.add_argument("--wd_drop", type=float, default=0.08)
+  p.add_argument("--wd_force_at", type=int, default=-1, help="debug: force one rollback at this iteration")
   p.add_argument("--no_compile", action="store_true")
   p.add_argument("--compile_mode", type=str, default=None, help="e.g. reduce-overhead or max-autotune")
   p.add_argument("--num_threads", type=int, default=0, help="CPU threads: OMP/MKL/OpenBLAS env + torch.set_num_threads (0 = leave defaults)")
@@ -125,6 +128,9 @@ def main():
     ckpt_interval=args.ckpt_interval,
     eval_enabled=not args.no_eval,
     compile=not args.no_compile,
+    wd_enabled=not args.no_watchdog,
+    wd_drop=args.wd_drop,
+    wd_force_at=args.wd_force_at,
     compile_mode=args.compile_mode,
     world_size=dctx.world,
     base_lr_scale=args.lr_scale,
