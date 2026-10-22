@@ -80,6 +80,29 @@ Isolated headless closed loop (original `scene_29dof.xml`, iteration 32000): gan
 online gangnam 29 s, no falls, joint mean abs error 0.12 / 0.10 / 0.11 rad; controller inputs/outputs match an
 independent Python recomputation to ≤ 5e-8.
 
+## Team MuJoCo benchmark (NOetix_GMT_eval on bj31, MotionAtlas v4 official)
+
+The eval site runs SuperMimic exports as `policy_type: supermimic` (profiles `supermimic_g1_v1`, `e2_supermimic_v1`;
+evaluator plugin and site patch in `eval_site/`). Export: `export_bundle.py` (now writes `joint_stiffness`,
+`joint_damping` = actuator kd + passive joint damping, `joint_armature`) then `export_eval_onnx.py` (metric `body_names`:
+the benchmark's usual 14 bodies). The evaluator inputs match an independent recomputation to 2e-7 (`eval_site/golden_check.py`).
+
+| policy | v4 success | progress | MPJPE rad | MPKPE mm | rank | failures by end-effector height |
+| --- | --- | --- | --- | --- | --- | --- |
+| G1 `g1_atlas_v1` model_32000 | 67.80% | 79.71% | 0.0847 | 15.27 | 144 / 168 | 913 of 1009 |
+| G1 leader (GMT v2 cluster 112500) | 91.42% | 94.88% | 0.0853 | 11.46 | 1 | |
+| E2 `e2_atlas_v1r` model_68000 | 64.31% | 77.50% | 0.0809 | 14.80 | 226 / 272 | 1094 of 1242 |
+| E2 leader (GMT e2hdc8 C5 185500) | 90.95% | 94.82% | 0.0802 | 13.34 | 1 | |
+
+Joint tracking is on par with the best GMT policies, but the official protocol terminates when an ankle / wrist (G1) or
+ankle / elbow (E2) is more than 0.25 m off in height, and SuperMimic's recipe (paper) has no end-effector termination,
+so large leg raises and arm swings are tracked loosely (reproduced in the training model too, `eval_site/trace_train_sim.py`).
+Turning that check off on a 96-clip subset: G1 69.8% -> 83.3%, E2 55.2% -> 78.1%. The gap concentrates on sources that are
+<1% of the training clips (noetix_kungfu 12% vs 64%, sportsmeeting 10% vs 61%, kungfu_dance_show 31% vs 99%, long lafan1
+clips 15% vs 63%; G1, ours vs leader). Contact settings (self-collision on, friction 0.5 in the eval models) cost E2 ~5
+points and G1 none. Model mismatches: E2 was trained with passive damping = kd on every joint (twice the actuator damping;
+the eval export reproduces it), G1 on mjlab's 33.3 kg model while the eval / deploy model is the original 35.1 kg (torso +1.8 kg).
+
 ## Training stability (watchdog)
 
 The first G1 full-atlas run collapsed at ~41k iterations (imagined reward 0.91 → 0.4 within ~400 iterations,
