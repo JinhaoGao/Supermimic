@@ -36,30 +36,41 @@ def _zero_joint_damping(spec_fn):
 
 
 def base_tracking_cfg(robot: str, variant: str = ""):
-  """variant -- g1: "" mjlab's G1 | "eval" the team's eval / deploy G1 (robots/g1_eval_model.py);
+  """variant ("+"-joined) -- g1: "" mjlab's G1 | "eval" the team's eval / deploy G1 (robots/g1_eval_model.py);
   e2: "" as trained in v1 | "nodamp" without the passive joint damping of the source MJCF (it carries
-  damping = kd on every joint, which doubled the actuator damping in v1; the real motor PD has kd only)."""
+  damping = kd on every joint, which doubled the actuator damping in v1; the real motor PD has kd only) |
+  "evalcontact" contacts as in the team's E2 eval model (self-collision, condim 3, friction 0.5; v1/v2 E2
+  collided with the terrain only and without friction off the feet); g1 "evalcontact": mjlab's G1 collision
+  set with condim 3 everywhere (mjlab: frictionless off the feet; eval model and robot: friction 1.0)."""
+  parts = {p for p in variant.split("+") if p}
+  allowed = {"g1": {"eval", "evalcontact"}, "e2": {"nodamp", "evalcontact"}}.get(robot, set())
+  if parts - allowed:
+    raise ValueError(f"unknown {robot} variant(s) {sorted(parts - allowed)}")
   if robot == "g1":
     from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
 
     cfg = unitree_g1_flat_tracking_env_cfg(has_state_estimation=True, play=False)
-    if variant == "eval":
+    ent = cfg.scene.entities["robot"]
+    if "eval" in parts:
       from .robots.g1_eval_model import patch_spec
 
-      ent = cfg.scene.entities["robot"]
       ent.spec_fn = patch_spec(ent.spec_fn)
-    elif variant:
-      raise ValueError(f"unknown g1 variant {variant!r}")
+    if "evalcontact" in parts:
+      from .robots.g1_eval_model import eval_contact_collision
+
+      ent.collisions = (eval_contact_collision(),)
     return cfg
   if robot == "e2":
     from .robots.e2_tracking_cfg import noetix_e2_flat_tracking_env_cfg
 
     cfg = noetix_e2_flat_tracking_env_cfg()
-    if variant == "nodamp":
-      ent = cfg.scene.entities["robot"]
+    ent = cfg.scene.entities["robot"]
+    if "nodamp" in parts:
       ent.spec_fn = _zero_joint_damping(ent.spec_fn)
-    elif variant:
-      raise ValueError(f"unknown e2 variant {variant!r}")
+    if "evalcontact" in parts:
+      from .robots.e2_constants import EVAL_CONTACT_COLLISION
+
+      ent.collisions = (EVAL_CONTACT_COLLISION,)
     return cfg
   raise ValueError(f"unknown robot {robot}")
 

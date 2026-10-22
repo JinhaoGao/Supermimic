@@ -242,6 +242,23 @@ EVAL_JOINTS = {
 }
 
 
+def eval_contact_collision():
+  """mjlab's G1 FULL_COLLISION (self-collision on, foot friction 0.6 / priority 1) with condim 3 on every collision
+  geom: mjlab makes everything but the feet frictionless (condim 1), the team's eval model (and the real robot) has
+  frictional contacts everywhere (condim 3, friction 1.0), which matters for crawling / get-up / kneeling motions."""
+  from mjlab.utils.spec_config import CollisionCfg
+
+  feet = r"^(left|right)_foot[1-7]_collision$"
+  return CollisionCfg(
+    geom_names_expr=(".*_collision",),
+    contype=1,
+    conaffinity=1,
+    condim=3,
+    priority={feet: 1, ".*": 0},
+    friction={feet: (0.6,)},
+  )
+
+
 def set_scalar(obj, attr: str, value: float) -> None:
   """Set a scalar MjSpec property; MuJoCo >= 3.16 stores some (joint damping) as arrays, XML scalar = element 0."""
   cur = getattr(obj, attr)
