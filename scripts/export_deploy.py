@@ -2,13 +2,13 @@
 
   python scripts/export_deploy.py --bundle ~/supermimic/bundle_g1_atlas_latest \
       --deploy_dir ~/Workspace/unitree_mujoco/deploy/robots/g1_29dof \
-      --motions ~/supermimic/data/lafan1/g1__lafan1_dance1_subject1.npz ...
+
 
 Writes under <deploy_dir>/config/policy/gmt/supermimic/:
   exported/supermimic_g1_<it>.onnx  (copied; metadata already inside; --onnx_name to override)
   params/deploy.yaml                (joint_ids_map, default pose, kp/kd in SDK order, action scale/offset,
-                                     obs groups obs_hist / goal, anchor chain, online joint permutation)
-  params/<clip>.npz                 (deploy reference: joint_pos/joint_vel in policy order, root/anchor quats, fps)
+                                     obs groups obs_hist / goal, root->torso chain, Isaac BFS joint permutation)
+Reference clips need no conversion: State_SuperMimic reads standard GMT / MotionAtlas npz directly.
 """
 
 from __future__ import annotations
@@ -47,7 +47,6 @@ def main():
   p.add_argument("--bundle", type=str, required=True)
   p.add_argument("--deploy_dir", type=str, required=True, help=".../deploy/robots/g1_29dof")
   p.add_argument("--name", type=str, default="supermimic", help="config/policy/gmt/<name>/")
-  p.add_argument("--motions", type=str, nargs="*", default=[], help="reference npz files to convert")
   p.add_argument("--onnx_name", type=str, default=None, help="file name under exported/ (default supermimic_<robot>_<iteration>.onnx; "
                  "the deploy repo's .gitignore keeps *.onnx out of git except exported/policy.onnx)")
   args = p.parse_args()
@@ -66,7 +65,7 @@ def main():
   for i, n in enumerate(jn):
     kp_sdk[sdk_index[n]] = meta["pd_kp"][i]
     kd_sdk[sdk_index[n]] = meta["pd_kd"][i]
-  online_perm = [G1_ISAAC_BFS_JOINTS.index(n) for n in jn]  # policy index -> online stream index
+  isaac_perm = [G1_ISAAC_BFS_JOINTS.index(n) for n in jn]  # policy index -> Isaac BFS index (online stream, npz without joint_names)
   chain = meta["anchor_chain"]
 
   root = os.path.join(os.path.expanduser(args.deploy_dir), "config", "policy", "gmt", args.name)
@@ -119,35 +118,13 @@ def main():
   y.append(f"  hist: {d['hist']}")
   y.append(f"  anchor_body_name: {meta['anchor_body_name']}")
   y.append(f"  root_body_name: {meta['root_body_name']}")
-  y.append(f"  online_joint_perm: {online_perm}      # policy index -> index in the Isaac-BFS online stream")
+  y.append(f"  isaac_bfs_joint_perm: {isaac_perm}   # policy index -> Isaac BFS index (online stream; npz without joint_names)")
   y.append("  anchor_chain:                    # root -> anchor: body_quat (wxyz) offsets and hinge joints")
   for link in chain:
     y.append(f"    - {{body: {link['body']}, body_quat: {fmt_list(link['body_quat'])}, joint: {link['joint'] if link['joint'] else 'null'}, axis: {fmt_list(link['axis'], 4)}, qpos0: {link['qpos0']:.6f}}}")
   with open(os.path.join(root, "params", "deploy.yaml"), "w") as f:
     f.write("\n".join(y) + "\n")
 
-  # Reference clips -> deploy format.
-  for mf in args.motions:
-    mf = os.path.expanduser(mf)
-    src = np.load(mf)
-    sj = [str(x) for x in src["joint_names"]]
-    sb = [str(x) for x in src["body_names"]]
-    jperm = [sj.index(n) for n in jn]
-    ia, ir = sb.index(meta["anchor_body_name"]), sb.index(meta["root_body_name"])
-    out = os.path.join(root, "params", os.path.basename(mf))
-    # C order on purpose: a[:, idx] (fancy index on axis 1) comes out Fortran-ordered, and cnpy on the deploy
-    # side reads the raw buffer as C order (State_SuperMimic refuses fortran_order arrays).
-    c32 = lambda x: np.ascontiguousarray(x, dtype=np.float32)  # noqa: E731
-    np.savez(
-      out,
-      fps=c32(np.asarray(src["fps"]).reshape(-1)[:1]),
-      joint_pos=c32(src["joint_pos"][:, jperm]),
-      joint_vel=c32(src["joint_vel"][:, jperm]),
-      root_pos_w=c32(src["body_pos_w"][:, ir]),
-      root_quat_w=c32(src["body_quat_w"][:, ir]),
-      anchor_quat_w=c32(src["body_quat_w"][:, ia]),
-    )
-    print(f"[export_deploy] {out}: {src['joint_pos'].shape[0]} frames")
   print(f"[export_deploy] wrote {root}/exported/{onnx_name} and params/deploy.yaml (joint_ids_map={joint_ids_map})")
   print(f"[export_deploy] set `policy_file: {onnx_name}` in the SuperMimic block of config.yaml")
 

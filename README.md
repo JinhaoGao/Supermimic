@@ -67,17 +67,27 @@ config (`assets/e2/e2.py`); 12 tracked bodies, anchor `waist_pitch_link`.
 ## Deploy on the G1 (unitree_mujoco `State_SuperMimic`)
 
 The deployable G1 policy (goal without anchor position) runs as FSM mode `SuperMimic` in
-`~/Workspace/unitree_mujoco/deploy/robots/g1_29dof` (Velocity → RB + left), offline npz or online Redis
-(GMR-CPP stream). Details, observation contract and test results: `SUPERMIMIC_DEPLOY_NOTES.md` there.
+`~/Workspace/unitree_mujoco/deploy/robots/g1_29dof` (Velocity → RB + left), offline from any standard GMT /
+MotionAtlas npz (no conversion; joints by `joint_names` or Isaac BFS order, torso orientation from `body_names`
+or pelvis ∘ waist FK) or online from the GMR-CPP Redis stream. Details and test results: `SUPERMIMIC_DEPLOY_NOTES.md` there.
 
 ```bash
-bash scripts/deploy_from_server.sh g1_atlas_v1 latest      # export on bj27 -> named ONNX + deploy.yaml in unitree_mujoco
+bash scripts/deploy_from_server.sh g1_atlas_v1r best   # best (default) | latest | <iteration>; latest is refused if it collapsed
 # then set SuperMimic.policy_file in config.yaml to the printed name; no rebuild needed
 ```
 
-Headless closed loop (original `scene_29dof.xml`, iteration 20000): dance 25 s and jumps 25 s offline, dance 31 s
-online, no falls, joint mean abs error 0.10 / 0.12 / 0.12 rad; controller observations / goal / action match an
-independent Python recomputation to ≤ 6e-8.
+Isolated headless closed loop (original `scene_29dof.xml`, iteration 32000): gangnam 32 s, MotionAtlas jumps 20 s,
+online gangnam 29 s, no falls, joint mean abs error 0.12 / 0.10 / 0.11 rad; controller inputs/outputs match an
+independent Python recomputation to ≤ 5e-8.
+
+## Training stability (watchdog)
+
+The first G1 full-atlas run collapsed at ~41k iterations (imagined reward 0.91 → 0.4 within ~400 iterations,
+critic loss ×5000, then NaN in the reset sampler and a CUDA assert). The trainer now uses a Huber critic loss with
+clipped value targets, drops non-finite returns in the sampler, and runs a watchdog: if the imagined-reward EMA
+falls 0.08 below its recent best (or the critic-loss median jumps 50×) it reloads the last healthy checkpoint and
+halves the learning rates (`--no_watchdog`, `--wd_drop`, `--wd_force_at` for tests). G1 was resumed from 40000
+with LR 1e-4 (`g1_atlas_v1r`), E2 from 86000 (`e2_atlas_v1w`).
 
 ## Layout
 
