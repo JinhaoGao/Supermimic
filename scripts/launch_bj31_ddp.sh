@@ -10,8 +10,11 @@
 # Uses the venv's own torch (cu130) and its bundled NCCL; LD_PRELOAD is cleared on purpose (the machine's
 # nccl_2277 is a cu12 build). NCCL_DEBUG=VERSION puts the NCCL version into the log.
 # Console log = rank 0 only (runs/<run>.log); every rank's full stdout/stderr: runs/<run>_ranks/.
-# Stop: the whole run is one process group (setsid); its numeric id is in runs/<run>.pgid:
-#   PG=$(cat /data2/supermimic/runs/<run>.pgid); kill -9 -- -"$PG"   (agent + all ranks + log filter)
+# Stop: bash scripts/stop_bj31_ddp.sh <run>   (kill -9 every rank + children, then the launcher's process group)
+#   The launcher (bash + torchrun agent + log filter) is one process group, numeric id in runs/<run>.pgid, but
+#   torchrun starts every rank in its OWN session/process group (torch elastic start_new_session=True), so
+#   `kill -9 -- -"$PG"` alone reaches only the agent. The ranks set PR_SET_PDEATHSIG=SIGKILL (scripts/train.py),
+#   so they still die with the agent; the stop script does not rely on that.
 set -euo pipefail
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY LD_PRELOAD PYTHONPATH || true
 RUN="${1:?run name}"

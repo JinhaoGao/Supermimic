@@ -22,7 +22,26 @@ import sys
 from datetime import datetime
 
 
+def _die_with_torchrun_agent() -> None:
+  """torchrun starts every rank in its own session (torch elastic start_new_session=True): a `kill -9` on the
+  launcher's process group (runs/<run>.pgid) reaches only the agent and would leave the ranks running as orphans
+  that keep training and hold the GPUs. Ask the kernel to SIGKILL this rank when its parent (the agent) dies."""
+  if not sys.platform.startswith("linux") or "TORCHELASTIC_RUN_ID" not in os.environ:
+    return
+  import ctypes
+  import signal
+
+  ppid = os.getppid()
+  libc = ctypes.CDLL(None, use_errno=True)
+  if libc.prctl(1, int(signal.SIGKILL), 0, 0, 0) != 0:  # 1 = PR_SET_PDEATHSIG
+    print(f"[train] prctl(PR_SET_PDEATHSIG) failed (errno {ctypes.get_errno()}); stop with scripts/stop_bj31_ddp.sh", flush=True)
+    return
+  if ppid == 1 or os.getppid() != ppid:  # the agent died before prctl took effect
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
 def main():
+  _die_with_torchrun_agent()
   p = argparse.ArgumentParser()
   p.add_argument("--motion_dirs", type=str, nargs="+", required=True, help="directories (recursive) or npz files")
   p.add_argument("--blacklist", type=str, default=None, help="json with a 'bad_motions' list of npz basenames")
