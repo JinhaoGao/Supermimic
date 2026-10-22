@@ -78,8 +78,9 @@ class LibraryMotionCommand(MotionCommand):
     # Source prior for the uniform share of the reset distribution (v2): clip "<robot>__<source>_..." gets the
     # weight of its longest matching source prefix (default 1). The team's own sources are <1% of the bins.
     self.bin_prior: torch.Tensor | None = None
-    if cfg.source_weights:
+    if cfg.source_weights or cfg.name_weights:
       kws = sorted(((str(k), float(v)) for k, v in cfg.source_weights), key=lambda kv: -len(kv[0]))
+      nws = [(str(k).lower(), float(v)) for k, v in cfg.name_weights]
       def src_weight(name: str) -> tuple[str, float]:
         src = name.split("__", 1)[-1]
         for k, v in kws:
@@ -87,7 +88,10 @@ class LibraryMotionCommand(MotionCommand):
             return k, v
         return "", 1.0
       tags = [src_weight(c.name) for c in lib.clips]
-      w_clip = torch.tensor([w for _, w in tags], dtype=torch.float32, device=self.device)
+      # Name keywords (case-insensitive substring, e.g. crawl / getup): a skill quota across sources (ground work is
+      # spread over sonic / motiondecode / hiphi / g1_all). A clip gets the larger of its source and keyword weights.
+      name_w = [max([v for k, v in nws if k in c.name.lower()], default=1.0) for c in lib.clips]
+      w_clip = torch.tensor([max(w, nw) for (_, w), nw in zip(tags, name_w)], dtype=torch.float32, device=self.device)
       prior = w_clip[lib.bin_clip]
       self.bin_prior = prior / prior.sum()
       tag_of_bin = [tags[i][0] for i in lib.bin_clip.tolist()]
@@ -95,6 +99,10 @@ class LibraryMotionCommand(MotionCommand):
         mask = torch.tensor([t == k for t in tag_of_bin], device=self.device)
         print(f"[LibraryMotionCommand] source {k!r} x{v:g}: {mask.float().mean().item() * 100:.2f}% of bins -> "
               f"{self.bin_prior[mask].sum().item() * 100:.2f}% of the uniform share")
+      if nws:
+        hit = torch.tensor([nw > 1.0 for nw in name_w], device=self.device)[lib.bin_clip]
+        print(f"[LibraryMotionCommand] name keywords {nws}: {int(sum(nw > 1.0 for nw in name_w))} clips, "
+              f"{hit.float().mean().item() * 100:.2f}% of bins -> {self.bin_prior[hit].sum().item() * 100:.2f}% of the uniform share")
     # Sequential clip assignment for "start" (evaluation) mode.
     ec = cfg.eval_clips if cfg.eval_clips else tuple(range(lib.num_clips))
     self.eval_clips = torch.tensor(ec, dtype=torch.long, device=self.device)
@@ -290,6 +298,7 @@ class LibraryMotionCommandCfg(MotionCommandCfg):
   return_ema: float = 0.05
   weight_ema: float = 0.01
   source_weights: tuple = ()  # ((source prefix, weight), ...): prior of the uniform share, see LibraryMotionCommand
+  name_weights: tuple = ()  # ((name keyword, weight), ...): max with the source weight (case-insensitive substring)
   sampling_mode: Literal["return", "uniform", "start"] = "return"  # type: ignore[assignment]
   cache_dir: str = ""
   num_workers: int = 32

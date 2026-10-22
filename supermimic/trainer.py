@@ -41,6 +41,7 @@ class TrainCfg:
   robot: str = "g1"
   robot_variant: str = ""  # see env_cfg.base_tracking_cfg (g1: eval; e2: nodamp)
   source_weights: tuple = ()  # ((source prefix, weight), ...) prior of the reset sampler's uniform share
+  name_weights: tuple = ()  # ((name keyword, weight), ...) max with it (skill quotas, e.g. crawl / getup)
   num_envs: int = 4096
   device: str = "cuda:0"
   seed: int = 0
@@ -134,6 +135,7 @@ class Trainer:
       cfg.motion_files, cfg.num_envs, mode="train", episode_length_s=cfg.episode_length_s, robot=cfg.robot,
       library_key=self.LIB_KEY, cache_dir=cfg.cache_dir, num_workers=cfg.num_workers,
       ee_term_z=cfg.heads.ee_term_z, robot_variant=cfg.robot_variant, source_weights=cfg.source_weights,
+      name_weights=cfg.name_weights,
     )
     env_cfg.seed = cfg.seed
     self.env = ManagerBasedRlEnv(cfg=env_cfg, device=self.device)
