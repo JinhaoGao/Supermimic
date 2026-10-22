@@ -7,6 +7,8 @@ Examples:
   python scripts/train.py --motion_dirs /DATA/disk0/gmt_data/ma50/data/in/motion50/g1/g1 \
       --blacklist ~/g1_resume/atlas_full_blacklist_motion50_1010.json \
       --cache_dir ~/supermimic/data/cache --eval_clips 1024 --run_name g1_atlas
+  # Same, but the eval subset fixed by npz basename (comparable across file lists) and 24 CPU threads
+  python scripts/train.py ... --eval_clip_names eval_1024.txt --num_threads 24
 """
 
 from __future__ import annotations
@@ -45,13 +47,27 @@ def main():
   p.add_argument("--log_interval", type=int, default=50)
   p.add_argument("--eval_interval", type=int, default=2000)
   p.add_argument("--eval_clips", type=int, default=0, help="0 = all clips, else a fixed random subset")
+  p.add_argument("--eval_clip_names", type=str, default="", help="txt with npz basenames (one per line): fixed eval subset by name; overrides --eval_clips")
   p.add_argument("--eval_envs", type=int, default=1024)
   p.add_argument("--ckpt_interval", type=int, default=2000)
   p.add_argument("--no_eval", action="store_true")
   p.add_argument("--resume", type=str, default=None)
   p.add_argument("--no_compile", action="store_true")
   p.add_argument("--compile_mode", type=str, default=None, help="e.g. reduce-overhead or max-autotune")
+  p.add_argument("--num_threads", type=int, default=0, help="CPU threads: OMP/MKL/OpenBLAS env + torch.set_num_threads (0 = leave defaults)")
   args = p.parse_args()
+
+  if args.num_threads > 0:
+    # Before torch / numpy spin up their pools (they are imported below). Pool workers inherit the env.
+    for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+      os.environ[k] = str(args.num_threads)
+    import torch
+
+    torch.set_num_threads(args.num_threads)
+    print(f"[train] num_threads={args.num_threads} (torch.get_num_threads()={torch.get_num_threads()})")
+  if args.eval_clip_names:
+    args.eval_clip_names = os.path.abspath(os.path.expanduser(args.eval_clip_names))
+    assert os.path.isfile(args.eval_clip_names), f"--eval_clip_names {args.eval_clip_names} not found"
 
   from supermimic.heads import HeadsCfg
   from supermimic.motions import collect_motion_files
@@ -83,6 +99,8 @@ def main():
     log_interval=args.log_interval,
     eval_interval=args.eval_interval,
     eval_clips=args.eval_clips,
+    eval_clip_names=args.eval_clip_names,
+    num_threads=args.num_threads,
     eval_envs=args.eval_envs,
     ckpt_interval=args.ckpt_interval,
     eval_enabled=not args.no_eval,

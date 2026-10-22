@@ -28,6 +28,7 @@ from .env_cfg import make_env_cfg
 from .evaluate import Evaluator
 from .fns import StepFns
 from .heads import HeadsCfg
+from .motions import read_name_list, resolve_clip_names
 from .policy import Critic, Policy
 from .replay import ReplayBuffer
 from .sim_interface import ObsHistory, SimInterface
@@ -51,6 +52,7 @@ class TrainCfg:
   episode_length_s: float = 10.0
   compile: bool = True
   compile_mode: str | None = None
+  num_threads: int = 0  # torch intra-op CPU threads (0 = torch default); scripts/train.py also sets OMP_NUM_THREADS
   # Imagination / policy.
   H: int = 32
   rollouts_per_update: int = 4096
@@ -72,6 +74,7 @@ class TrainCfg:
   ckpt_interval: int = 2000
   eval_enabled: bool = True
   eval_clips: int = 0  # 0 = all clips; otherwise a fixed random subset of this size
+  eval_clip_names: str = ""  # txt of npz basenames (one per line): fixed eval subset by name; overrides eval_clips
   eval_envs: int = 1024
   wm: WorldModelCfg = field(default_factory=WorldModelCfg)
   heads: HeadsCfg = field(default_factory=HeadsCfg)
@@ -100,6 +103,8 @@ class Trainer:
 
   def __init__(self, cfg: TrainCfg):
     self.cfg = cfg
+    if cfg.num_threads > 0:
+      torch.set_num_threads(cfg.num_threads)
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -144,7 +149,9 @@ class Trainer:
     self.env_steps = 0
     self._step_carry = 0.0
     self._t_start = time.time()
-    if cfg.eval_clips and cfg.eval_clips < self.lib.num_clips:
+    if cfg.eval_clip_names:
+      self.eval_clip_ids = self._eval_ids_from_names(cfg.eval_clip_names)
+    elif cfg.eval_clips and cfg.eval_clips < self.lib.num_clips:
       rng = random.Random(cfg.seed)
       self.eval_clip_ids = tuple(sorted(rng.sample(range(self.lib.num_clips), cfg.eval_clips)))
     else:
@@ -418,6 +425,19 @@ class Trainer:
         robot=self.cfg.robot,
       )
     return self.evaluator.run(self.policy)
+
+  def _eval_ids_from_names(self, path: str) -> tuple[int, ...]:
+    """Fixed eval subset by npz basename (independent of the library's clip order / size)."""
+    wanted = read_name_list(path)
+    ids, missing = resolve_clip_names([c.name for c in self.lib.clips], wanted, label="eval_clip_names")
+    if not ids:
+      raise ValueError(f"--eval_clip_names {path}: none of the {len(wanted)} names is in the library")
+    with open(os.path.join(self.cfg.log_dir, "eval_clip_names.txt"), "w", encoding="utf-8") as f:
+      f.write("\n".join(self.lib.clips[i].name for i in ids) + "\n")
+    with open(os.path.join(self.cfg.log_dir, "eval_clip_names_missing.txt"), "w", encoding="utf-8") as f:
+      f.write("".join(n + "\n" for n in missing))
+    print(f"[Trainer] eval subset from {path}: {len(ids)} found, {len(missing)} missing (requested {len(wanted)} lines)")
+    return tuple(ids)
 
   def train(self) -> None:
     cfg = self.cfg

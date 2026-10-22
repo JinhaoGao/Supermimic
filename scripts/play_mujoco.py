@@ -31,6 +31,7 @@ from supermimic.math_utils import (
   subtract_frame_transforms,
   yaw_quat,
 )
+from supermimic.motions import npz_body_names
 from supermimic.policy import Policy
 
 GRAVITY = torch.tensor([0.0, 0.0, -1.0])
@@ -51,7 +52,7 @@ class Reference:
     d = np.load(npz_path)
     self.fps = float(np.asarray(d["fps"]).reshape(-1)[0])
     src_j = [str(x) for x in d["joint_names"]]
-    src_b = [str(x) for x in d["body_names"]]
+    src_b, _ = npz_body_names(d)  # body_names key, or the fixed G1 order for older renders without it
     jperm = [src_j.index(n) for n in meta["joint_names"]]
     bperm = [src_b.index(n) for n in meta["body_names"]]
     self.q = torch.as_tensor(d["joint_pos"][:, jperm], dtype=torch.float32)

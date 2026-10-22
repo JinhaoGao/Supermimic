@@ -11,6 +11,8 @@ Input npz format (our GMT / BeyondMimic convention):
   body_pos_w[T,Bn,3], body_quat_w[T,Bn,4] (wxyz), body_lin_vel_w, body_ang_vel_w.
 Joints are remapped by name to the entity's joint order; bodies to the tracked
 body list. A cache (one .npy per field + json) is built once per file list.
+Older G1 renders have no body_names key; their 37-body arrays are in the fixed
+Isaac order G1_ISAAC_BODY_NAMES_37, which is used as the fallback.
 """
 
 from __future__ import annotations
@@ -43,6 +45,38 @@ NPZ_KEYS = {
   "body_lin_vel": "body_lin_vel_w",
   "body_ang_vel": "body_ang_vel_w",
 }
+
+# Body order of the body_*_w arrays in GMT / MotionAtlas G1 npz files (Isaac order, 37 bodies).
+# Older renders (e.g. bj31 ~/motion_dataset/g1_atlas_full, 09-23) were written without a body_names
+# key; they were checked against the MotionAtlas motion50 originals, which carry this exact list:
+# same index -> same body (numerically equal up to FK float noise).
+G1_ISAAC_BODY_NAMES_37 = (
+  "pelvis", "left_hip_pitch_link", "pelvis_contour_link", "right_hip_pitch_link", "waist_yaw_link",
+  "left_hip_roll_link", "right_hip_roll_link", "waist_roll_link", "left_hip_yaw_link", "right_hip_yaw_link",
+  "torso_link", "left_knee_link", "right_knee_link", "head_link", "left_shoulder_pitch_link", "logo_link",
+  "right_shoulder_pitch_link", "left_ankle_pitch_link", "right_ankle_pitch_link", "left_shoulder_roll_link",
+  "right_shoulder_roll_link", "left_ankle_roll_link", "right_ankle_roll_link", "left_shoulder_yaw_link",
+  "right_shoulder_yaw_link", "LL_FOOT", "LR_FOOT", "left_elbow_link", "right_elbow_link",
+  "left_wrist_roll_link", "right_wrist_roll_link", "left_wrist_pitch_link", "right_wrist_pitch_link",
+  "left_wrist_yaw_link", "right_wrist_yaw_link", "left_rubber_hand", "right_rubber_hand",
+)
+# Fallback source body order by body count, for npz files without a body_names key.
+FALLBACK_BODY_NAMES: dict[int, tuple[str, ...]] = {37: G1_ISAAC_BODY_NAMES_37}
+
+
+def npz_body_names(d, num_bodies: int | None = None) -> tuple[list[str], bool]:
+  """Source body order of a loaded motion npz -> (names, used_fallback).
+
+  Uses the file's body_names key when present; otherwise the fixed order for its
+  body count (FALLBACK_BODY_NAMES). ``num_bodies`` avoids re-reading body_pos_w
+  when the caller already has it. Raises KeyError when neither is available."""
+  if "body_names" in d.files:
+    return [str(x) for x in d["body_names"]], False
+  nb = int(num_bodies) if num_bodies is not None else int(d["body_pos_w"].shape[1])
+  fb = FALLBACK_BODY_NAMES.get(nb)
+  if fb is None:
+    raise KeyError(f"no body_names key and no fallback body order for {nb} bodies")
+  return list(fb), True
 
 
 @dataclass
@@ -84,28 +118,35 @@ def _worker_init(cache_dir, joint_names, body_names, fields_shape):
 
 
 def _worker_fill(job):
+  """Write one file's frames into the cache -> (path, error or None, used body-name fallback)."""
   path, start, T, expected_fps = job
   d = np.load(path)
   fps = float(np.asarray(d["fps"]).reshape(-1)[0])
   if not math.isclose(fps, expected_fps, rel_tol=1e-6):
-    return (path, f"fps {fps}")
+    return (path, f"fps {fps}", False)
+  # Every npz member is decompressed on each access: read each array once.
+  joint_pos = d["joint_pos"]
+  body_pos = d["body_pos_w"]
   src_j = [str(x) for x in d["joint_names"]]
-  src_b = [str(x) for x in d["body_names"]]
+  try:
+    src_b, fallback = npz_body_names(d, body_pos.shape[1])
+  except KeyError as e:
+    return (path, str(e), False)
   try:
     jperm = [src_j.index(n) for n in _W["joint_names"]]
     bperm = [src_b.index(n) for n in _W["body_names"]]
   except ValueError as e:
-    return (path, f"name mismatch: {e}")
-  if int(d["joint_pos"].shape[0]) != T:
-    return (path, "frame count changed")
+    return (path, f"name mismatch{' (fallback body order)' if fallback else ''}: {e}", fallback)
+  if int(joint_pos.shape[0]) != T:
+    return (path, "frame count changed", fallback)
   mm = _W["mm"]
-  mm["joint_pos"][start : start + T] = d["joint_pos"][:, jperm]
+  mm["joint_pos"][start : start + T] = joint_pos[:, jperm]
   mm["joint_vel"][start : start + T] = d["joint_vel"][:, jperm]
-  mm["body_pos"][start : start + T] = d["body_pos_w"][:, bperm]
+  mm["body_pos"][start : start + T] = body_pos[:, bperm]
   mm["body_quat"][start : start + T] = d["body_quat_w"][:, bperm]
   mm["body_lin_vel"][start : start + T] = d["body_lin_vel_w"][:, bperm]
   mm["body_ang_vel"][start : start + T] = d["body_ang_vel_w"][:, bperm]
-  return None
+  return (path, None, fallback)
 
 
 def build_cache(files, joint_names, body_names, cache_dir, expected_fps=50.0, num_workers=32, log=print):
@@ -125,18 +166,26 @@ def build_cache(files, joint_names, body_names, cache_dir, expected_fps=50.0, nu
     np.lib.format.open_memmap(os.path.join(cache_dir, f"{k}.npy"), mode="w+", dtype=FIELD_DTYPES[k], shape=shp).flush()
   jobs = [(f, s, n, expected_fps) for f, s, n in zip(files, starts, lengths)]
   bad = []
+  n_fallback = 0
   t1 = time.time()
   with Pool(num_workers, initializer=_worker_init, initargs=(cache_dir, joint_names, body_names, shapes)) as pool:
-    for i, res in enumerate(pool.imap_unordered(_worker_fill, jobs, chunksize=16)):
-      if res is not None:
-        bad.append(res)
+    for i, (path, err, fallback) in enumerate(pool.imap_unordered(_worker_fill, jobs, chunksize=16)):
+      if err is not None:
+        bad.append((path, err))
+      elif fallback:
+        n_fallback += 1
       if (i + 1) % 20000 == 0:
         log(f"[cache] {i + 1}/{len(files)} files written ({time.time() - t1:.0f}s)")
+  if n_fallback:
+    log(f"[cache] {n_fallback}/{len(files)} files have no body_names key -> fixed fallback body order used")
   if bad:
     log(f"[cache] WARNING: {len(bad)} files failed (first: {bad[:3]}); their frames stay zero -> excluded below")
   bad_set = {b[0] for b in bad}
   clips = [{"name": os.path.basename(f), "start": s, "end": s + n, "ok": f not in bad_set} for f, s, n in zip(files, starts, lengths)]
-  meta = {"joint_names": list(joint_names), "body_names": list(body_names), "fps": expected_fps, "frames": T, "files": len(files), "build_seconds": time.time() - t0}
+  meta = {
+    "joint_names": list(joint_names), "body_names": list(body_names), "fps": expected_fps, "frames": T, "files": len(files),
+    "failed_files": len(bad), "body_names_fallback_files": n_fallback, "build_seconds": time.time() - t0,
+  }
   with open(os.path.join(cache_dir, "clips.json"), "w") as f:
     json.dump(clips, f)
   with open(os.path.join(cache_dir, "meta.json"), "w") as f:
@@ -168,6 +217,8 @@ class MotionLibrary:
     self.fps = expected_fps
     self.dt = 1.0 / expected_fps
     files = list(files)
+    # Key = file paths + TARGET joint/body names (entity order, tracked bodies) + fps. The source body
+    # order (npz body_names or the fallback) is not part of it: both yield the same cache contents.
     key = hashlib.sha1(("\n".join(files) + "|" + ",".join(self.joint_names) + "|" + ",".join(self.body_names) + f"|{expected_fps}").encode()).hexdigest()[:10]
     cache_root = cache_dir or os.path.join(os.path.expanduser("~"), ".cache", "supermimic_motions")
     cdir = os.path.join(cache_root, f"lib_{len(files)}_{key}")
@@ -288,3 +339,43 @@ def collect_motion_files(dirs: list[str], blacklist_json: str | None = None, nam
   if max_motions:
     files = files[:max_motions]
   return files
+
+
+def read_name_list(path: str) -> list[str]:
+  """Clip names from a text file, one per line (UTF-8; names may contain spaces).
+  Full paths are reduced to their basename; blank lines are skipped."""
+  names = []
+  with open(os.path.expanduser(path), encoding="utf-8") as f:
+    for line in f:
+      s = line.rstrip("\r\n")
+      if s.strip():
+        names.append(os.path.basename(s))
+  return names
+
+
+def resolve_clip_names(clip_names: list[str], wanted: list[str], log=print, label: str = "clip names") -> tuple[list[int], list[str]]:
+  """Map basenames to clip indices -> (sorted unique indices, names not found).
+  Exact match first, then the whitespace-stripped name. Duplicates are counted once."""
+  index: dict[str, int] = {}
+  for i, n in enumerate(clip_names):
+    index.setdefault(n, i)
+  ids: set[int] = set()
+  missing: list[str] = []
+  seen: set[str] = set()
+  for n in wanted:
+    if n in seen:
+      continue
+    seen.add(n)
+    i = index.get(n)
+    if i is None:
+      i = index.get(n.strip())
+    if i is None:
+      missing.append(n)
+    else:
+      ids.add(i)
+  if len(seen) != len(wanted):
+    log(f"[{label}] {len(wanted) - len(seen)} duplicate names ignored")
+  if missing:
+    log(f"[{label}] WARNING: {len(missing)} of {len(seen)} names not found in the library (first: {missing[:5]})")
+  log(f"[{label}] {len(ids)} clips selected by name ({len(missing)} missing)")
+  return sorted(ids), missing
