@@ -29,6 +29,8 @@ def main():
   p.add_argument("--num_workers", type=int, default=32)
   p.add_argument("--robot", type=str, default="g1", choices=["g1", "e2"])
   p.add_argument("--robot_variant", type=str, default="", help="g1: eval (team eval / deploy model); e2: nodamp (no passive joint damping)")
+  p.add_argument("--source_weights", type=str, default="",
+                 help="reset-sampler prior per data source, e.g. noetix_kungfu=6,sportsmeeting=10 (clip '<robot>__<source>_...')")
   p.add_argument("--ee_term_z", type=float, default=0.0,
                  help="end-effector height termination in m (env + soft head); 0 = off as in the paper, 0.25 = BeyondMimic / team benchmark")
   p.add_argument("--run_name", type=str, default="run")
@@ -79,6 +81,7 @@ def main():
     motion_files=files,
     robot=args.robot,
     robot_variant=args.robot_variant,
+    source_weights=tuple((kv.split("=")[0], float(kv.split("=")[1])) for kv in args.source_weights.split(",") if kv),
     num_envs=args.num_envs,
     device=args.device,
     seed=args.seed,

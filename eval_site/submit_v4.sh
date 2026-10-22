@@ -2,6 +2,7 @@
 # Export a SuperMimic checkpoint on bj27, relay the eval ONNX to bj31 through this machine, upload it to the eval
 # site and start a MotionAtlas v4 official run (64 workers, videos of failed / hardest 5+5).
 #   bash eval_site/submit_v4.sh <run_name> <iteration> "<site policy name>" [training|actuator]
+#   SKIP_EXPORT=1: the ONNX is already on bj31 (only upload + run)
 # run_name = the bj27 run (logs/*_<run_name>), damping: actuator (kd only, default; G1 eval XML has its own passive
 # damping) or training (kd + passive damping of the training model, v1 E2).
 set -euo pipefail
@@ -11,7 +12,8 @@ E2B=base_link,waist_pitch_link,l_leg_hip_pitch_link,r_leg_hip_pitch_link,l_leg_h
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=20"
 retry() { for i in 1 2 3 4; do "$@" && return 0; sleep 5; done; return 1; }
 OUT=supermimic_${RUN}_${IT}.onnx
-EXP=$(retry $SSH tencent_bj27 bash -s -- "$RUN" "$IT" "$DAMP" "$G1B" "$E2B" "$OUT" <<'EOS'
+if [ -z "${SKIP_EXPORT:-}" ]; then
+EXP=$(retry $SSH tencent_bj27 "bash -s -- $(printf '%q ' "$RUN" "$IT" "$DAMP" "$G1B" "$E2B" "$OUT")" <<'EOS'
 set -euo pipefail
 RUN=$1; IT=$2; DAMP=$3; G1B=$4; E2B=$5; OUT=$6
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY || true
@@ -34,8 +36,11 @@ ROBOT=$(echo "$EXP" | sed -n "s/^ROBOT=//p" | tail -1)
 [ -n "$ROBOT" ] || { echo "[submit] export failed" >&2; exit 1; }
 echo "[submit] relaying $OUT (robot $ROBOT) bj27 -> bj31"
 retry bash -c "$SSH tencent_bj27 'cat ~/supermimic/eval_onnx/$OUT' < /dev/null | $SSH tencent_bj31 'mkdir -p ~/work/supermimic_eval_onnx && cat > ~/work/supermimic_eval_onnx/$OUT'"
+else
+ROBOT=${ROBOT:?set ROBOT=g1|e2 with SKIP_EXPORT}
+fi
 if [ "$ROBOT" = e2 ]; then OBS=e2_supermimic_v1; DS=e2_motionatlas_v4; BM=noetix_e2_motion_official_v1; else OBS=supermimic_g1_v1; DS=g1_motionatlas_v4; BM=kimodo_g1_motion_official_v3; fi
-retry $SSH tencent_bj31 bash -s -- "$OUT" "$NAME" "$OBS" "$DS" "$BM" <<'EOS' < /dev/null
+retry $SSH tencent_bj31 "bash -s -- $(printf '%q ' "$OUT" "$NAME" "$OBS" "$DS" "$BM")" <<'EOS'
 set -euo pipefail
 OUT=$1; NAME=$2; OBS=$3; DS=$4; BM=$5
 cd ~/work/supermimic_eval_onnx

@@ -77,6 +77,7 @@ def make_env_cfg(
   num_workers: int = 32,
   ee_term_z: float = 0.0,
   robot_variant: str = "",
+  source_weights: tuple = (),
 ) -> ManagerBasedRlEnvCfg:
   assert mode in ("train", "eval")
   cfg = base_tracking_cfg(robot, robot_variant)
@@ -101,6 +102,7 @@ def make_env_cfg(
     num_workers=num_workers,
     library_key=library_key,
     eval_clips=tuple(eval_clips),
+    source_weights=tuple(tuple(kv) for kv in source_weights) if mode == "train" else (),
   )
 
   # Minimal observation group (the trainer builds policy inputs itself).

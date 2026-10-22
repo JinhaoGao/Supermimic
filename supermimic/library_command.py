@@ -75,6 +75,26 @@ class LibraryMotionCommand(MotionCommand):
     self.bin_G = torch.zeros(NB, device=self.device)
     self.bin_visits = torch.zeros(NB, device=self.device)
     self.bin_weight_hist = torch.full((NB,), 1.0 / NB, device=self.device)
+    # Source prior for the uniform share of the reset distribution (v2): clip "<robot>__<source>_..." gets the
+    # weight of its longest matching source prefix (default 1). The team's own sources are <1% of the bins.
+    self.bin_prior: torch.Tensor | None = None
+    if cfg.source_weights:
+      kws = sorted(((str(k), float(v)) for k, v in cfg.source_weights), key=lambda kv: -len(kv[0]))
+      def src_weight(name: str) -> tuple[str, float]:
+        src = name.split("__", 1)[-1]
+        for k, v in kws:
+          if src == k or src.startswith(k + "_"):
+            return k, v
+        return "", 1.0
+      tags = [src_weight(c.name) for c in lib.clips]
+      w_clip = torch.tensor([w for _, w in tags], dtype=torch.float32, device=self.device)
+      prior = w_clip[lib.bin_clip]
+      self.bin_prior = prior / prior.sum()
+      tag_of_bin = [tags[i][0] for i in lib.bin_clip.tolist()]
+      for k, v in kws:
+        mask = torch.tensor([t == k for t in tag_of_bin], device=self.device)
+        print(f"[LibraryMotionCommand] source {k!r} x{v:g}: {mask.float().mean().item() * 100:.2f}% of bins -> "
+              f"{self.bin_prior[mask].sum().item() * 100:.2f}% of the uniform share")
     # Sequential clip assignment for "start" (evaluation) mode.
     ec = cfg.eval_clips if cfg.eval_clips else tuple(range(lib.num_clips))
     self.eval_clips = torch.tensor(ec, dtype=torch.long, device=self.device)
@@ -172,7 +192,7 @@ class LibraryMotionCommand(MotionCommand):
   def sampling_probabilities(self) -> torch.Tensor:
     c = self.cfg
     NB = self.library.num_bins
-    uniform = torch.full((NB,), 1.0 / NB, device=self.device)
+    uniform = self.bin_prior if self.bin_prior is not None else torch.full((NB,), 1.0 / NB, device=self.device)
     G = torch.where(self.bin_visits > 0, self.bin_G, torch.full_like(self.bin_G, c.g_max * 0.5))
     soft = torch.softmax(-c.softmax_temp * G / c.g_max, dim=0)
     hist = self.bin_weight_hist / self.bin_weight_hist.sum()
@@ -269,6 +289,7 @@ class LibraryMotionCommandCfg(MotionCommandCfg):
   g_max: float = 10.0
   return_ema: float = 0.05
   weight_ema: float = 0.01
+  source_weights: tuple = ()  # ((source prefix, weight), ...): prior of the uniform share, see LibraryMotionCommand
   sampling_mode: Literal["return", "uniform", "start"] = "return"  # type: ignore[assignment]
   cache_dir: str = ""
   num_workers: int = 32
