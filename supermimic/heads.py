@@ -15,8 +15,10 @@ indices) and imagined rollouts (per-rollout window packs).
 All heads are differentiable w.r.t. the state so that the policy gradient can
 flow through them during imagined rollouts (paper §3.2: heads may be analytic).
 Reward and termination mirror mjlab's BeyondMimic tracking task (Appendix A of
-the paper): self-collision penalty removed, joint-limit weight -2, no
-end-effector termination.
+the paper): self-collision penalty removed, joint-limit weight -2. The paper
+also drops BeyondMimic's end-effector termination; ``HeadsCfg.ee_termination``
+(default on) restores it on both sides: the simulator's ``ee_body_pos`` term
+(env_cfg) and a matching soft term in the imagined termination head below.
 """
 
 from __future__ import annotations
@@ -69,6 +71,13 @@ class HeadsCfg:
   term_tilt: float = 0.8
   term_z_temp: float = 0.02
   term_tilt_temp: float = 0.05
+  # End-effector termination (BeyondMimic ``ee_body_pos``, removed by the paper, restored 2026-10-22):
+  # fail when any end-effector body (G1: ankle_roll / wrist_yaw links, E2: ankle_roll / elbow links; names
+  # from the robot's tracking env cfg) is more than ee_term_z away from the reference in height (z only).
+  # Off = the paper's recipe, bitwise identical to the code before the switch existed.
+  ee_termination: bool = True
+  ee_term_z: float = 0.25
+  ee_term_z_temp: float = 0.02  # same sigmoid temperature as the anchor-height term
   extra: dict = field(default_factory=dict)
 
   @property
@@ -92,6 +101,7 @@ class AnalyticHeads:
     default_joint_pos: torch.Tensor,
     soft_joint_limits: torch.Tensor,
     cfg: HeadsCfg,
+    ee_indices: list[int] | None = None,
   ):
     self.fk = fk
     self.cfg = cfg
@@ -99,6 +109,10 @@ class AnalyticHeads:
     self.tracked = torch.as_tensor(tracked_local_ids, device=self.device)
     self.anchor = anchor_index  # index within the tracked-body list
     self.anchor_local = int(tracked_local_ids[anchor_index])
+    # End-effector bodies as indices into the tracked-body list (order of the tracked list, like mjlab).
+    self.ee = torch.as_tensor(list(ee_indices or ()), dtype=torch.long, device=self.device)
+    if cfg.ee_termination and self.ee.numel() == 0:
+      raise ValueError("HeadsCfg.ee_termination is on but no end-effector bodies were given")
     self.nj = default_joint_pos.shape[-1]
     self.q0 = default_joint_pos.to(self.device).reshape(-1)
     self.soft_lim = soft_joint_limits.to(self.device).reshape(self.nj, 2)
@@ -215,8 +229,17 @@ class AnalyticHeads:
 
   # ---- termination ---------------------------------------------------------
 
-  def termination(self, kin_next: dict, ref_ap: torch.Tensor, ref_aq: torch.Tensor):
-    """ref anchor pose [B,3]/[B,4] at the target frame. Returns (hard_bool [B], soft_prob [B])."""
+  def termination(self, kin_next: dict, ref_ap: torch.Tensor, ref_aq: torch.Tensor, ref_bp: torch.Tensor | None = None):
+    """Hard (simulator) and soft (imagination) termination at the target frame.
+
+    ref_ap [B,3] / ref_aq [B,4]: reference anchor pose; ref_bp [B,Bt,3]: reference positions of all tracked
+    bodies (needed only with ``ee_termination``). Returns (hard_bool [B], soft_prob [B]).
+
+    Each criterion i has a hard test x_i > thr_i and a soft probability p_i = sigmoid((x_i - thr_i) / temp_i);
+    the soft termination is the noisy-OR 1 - prod_i (1 - p_i) over anchor height, anchor tilt and (optional)
+    every end-effector height error, and the hard one is the OR of the tests (= the soft one as temp -> 0).
+    The end-effector height error |ref_z - z| equals mjlab's ``bad_motion_body_pos_z_only``: its re-anchored
+    reference (``body_pos_relative_w``) only shifts xy and rotates about z, so its z is the raw reference z."""
     c = self.cfg
     B = ref_ap.shape[0]
     g = self.gravity.expand(B, 3)
@@ -225,5 +248,12 @@ class AnalyticHeads:
     hard = (dz > c.term_z) | (tilt > c.term_tilt)
     pz = torch.sigmoid((dz - c.term_z) / c.term_z_temp)
     pt = torch.sigmoid((tilt - c.term_tilt) / c.term_tilt_temp)
-    soft = 1.0 - (1.0 - pz) * (1.0 - pt)
+    alive = (1.0 - pz) * (1.0 - pt)
+    if c.ee_termination:
+      assert ref_bp is not None, "ee_termination needs the reference body positions"
+      dz_ee = (ref_bp[:, self.ee, 2] - kin_next["body_pos"][:, self.ee, 2]).abs()  # [B, n_ee]
+      hard = hard | (dz_ee > c.ee_term_z).any(-1)
+      p_ee = torch.sigmoid((dz_ee - c.ee_term_z) / c.ee_term_z_temp)
+      alive = alive * torch.prod(1.0 - p_ee, dim=-1)
+    soft = 1.0 - alive
     return hard, soft

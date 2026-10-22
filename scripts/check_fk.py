@@ -23,6 +23,7 @@ def main():
   p.add_argument("--steps", type=int, default=30)
   p.add_argument("--device", type=str, default="cuda:0")
   p.add_argument("--cache_dir", type=str, default="")
+  p.add_argument("--no_ee_termination", action="store_true", help="check the paper recipe (no end-effector termination)")
   args = p.parse_args()
 
   from mjlab.envs import ManagerBasedRlEnv
@@ -34,12 +35,15 @@ def main():
   from supermimic.world_model import DynamicsModel, WorldModelCfg
 
   files = collect_motion_files(args.motion_dirs, max_motions=8)
-  env = ManagerBasedRlEnv(cfg=make_env_cfg(files, args.num_envs, mode="train", robot=args.robot, cache_dir=args.cache_dir), device=args.device)
-  sim = SimInterface(env, HeadsCfg())
+  hcfg = HeadsCfg(ee_termination=not args.no_ee_termination)
+  env_cfg = make_env_cfg(files, args.num_envs, mode="train", robot=args.robot, cache_dir=args.cache_dir, ee_termination=hcfg.ee_termination, ee_threshold=hcfg.ee_term_z)
+  env = ManagerBasedRlEnv(cfg=env_cfg, device=args.device)
+  sim = SimInterface(env, hcfg)
   heads, cmd, robot = sim.heads, sim.cmd, sim.robot
   print("entity bodies:", robot.body_names)
   print("entity joints:", robot.joint_names)
   print("tracked local ids:", cmd.body_indexes.tolist(), "anchor local:", heads.anchor_local)
+  print("end-effector termination bodies:", list(sim.ee_body_names), "(tracked idx", heads.ee.tolist(), ")")
   print("env_origins[:4]:", sim.env_origins[:4].tolist())
   print("xi[0]:", sim.xi()[0].tolist())
 
@@ -67,7 +71,7 @@ def main():
     next_state = sim.state()
     kin_next = heads.kin(next_state)
     r, terms = heads.reward(kin, kin_next, next_state, a, prev_a, ref, return_terms=True)
-    hard, soft = heads.termination(kin_next, ref["body_pos"][:, heads.anchor], ref["body_quat"][:, heads.anchor])
+    hard, soft = heads.termination(kin_next, ref["body_pos"][:, heads.anchor], ref["body_quat"][:, heads.anchor], ref["body_pos"])
     rm = env.reward_manager
     name_map = {
       "root_pos": "motion_global_root_pos", "root_ori": "motion_global_root_ori", "body_pos": "motion_body_pos",
@@ -84,6 +88,11 @@ def main():
     worst["rew_total"] = max(worst.get("rew_total", 0.0), (r - env.reward_buf).abs().max().item())
     term_sim = env.reset_terminated.bool()
     worst["term_mismatch"] = max(worst.get("term_mismatch", 0.0), (hard != term_sim).float().mean().item())
+    tot = worst.setdefault("_term_counts", [0, 0, 0])  # sim terminations, of which end-effector, steps x envs
+    tot[0] += int(term_sim.sum())
+    tot[2] += int(term_sim.numel())
+    if "ee_body_pos" in env.termination_manager.active_terms:
+      tot[1] += int((env.termination_manager.get_term("ee_body_pos") & term_sim).sum())
     tg = wm.targets(state, next_state)
     rt = wm.compose(state, tg)
     worst["wm_roundtrip"] = max(worst.get("wm_roundtrip", 0.0), (rt - next_state).abs().max().item())
@@ -103,8 +112,10 @@ def main():
   g = heads.goal(kin, ref_q, ref_qd, ref_ap, ref_aq)
   print("goal shape:", tuple(g.shape), "finite:", bool(torch.isfinite(g).all()))
   print("\nmax abs errors over rollout:")
+  counts = worst.pop("_term_counts", [0, 0, 0])
   for k, v in worst.items():
     print(f"  {k:16s} {v:.3e}")
+  print(f"sim terminations {counts[0]} / {counts[2]} env-steps, end-effector term set in {counts[1]}")
 
 
 if __name__ == "__main__":

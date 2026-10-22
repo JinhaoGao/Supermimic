@@ -140,26 +140,35 @@ class DistCtx:
       self.broadcast_tensors_(list(m.parameters()) + list(m.buffers()))
 
   @torch.no_grad()
-  def allreduce_grads_(self, params: Iterable[torch.nn.Parameter]) -> None:
+  def allreduce_grads_(self, params: Iterable[torch.nn.Parameter]) -> bool:
     """In-place gradient mean over ranks (flattened into one buffer -> one collective).
+    Returns True iff the (reduced) gradient is finite -- the same answer on every rank.
 
     Parameters without a gradient are skipped; every rank runs the same code path,
-    so the set is the same on all ranks (a mismatch would surface in check_consistent)."""
-    if not self.enabled:
-      return
+    so the set is the same on all ranks (a mismatch would surface in check_consistent).
+
+    NaN guard: the finite check runs on the reduced buffer, which is bitwise identical on all ranks (the
+    property the one-model design rests on). A NaN / inf on any rank makes the matching reduced element
+    non-finite on every rank (NaN + x = NaN, inf + finite = inf, inf - inf = NaN), and so does a finite sum
+    that overflows, so all ranks reach the same verdict without an extra collective. The caller drops the
+    gradient and skips the optimizer step when it is False. Disabled context: the local gradient is checked."""
     grads = [p.grad for p in params if p.grad is not None]
     if not grads:
-      return
+      return True
+    if not self.enabled:
+      return bool(torch.stack([torch.isfinite(g).all() for g in grads]).all())
     dt = grads[0].dtype
     assert all(g.dtype == dt for g in grads), "mixed gradient dtypes"
     flat = torch.cat([g.reshape(-1) for g in grads])
     dist.all_reduce(flat)
     flat.div_(self.world)
+    ok = bool(torch.isfinite(flat).all())
     off = 0
     for g in grads:
       n = g.numel()
       g.copy_(flat[off : off + n].view_as(g))
       off += n
+    return ok
 
   @torch.no_grad()
   def rms_update(self, pairs) -> None:

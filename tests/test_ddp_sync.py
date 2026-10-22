@@ -8,7 +8,10 @@ Spawns 2 and 3 processes and checks, on every rank:
     bitwise equal across ranks; disabled context == the original rms.update);
   * reset-sampler merge with the real LibraryMotionCommand.update_bin_returns (needs mjlab; skipped otherwise);
   * learned-state hash check passes when equal and stops every rank on a 1-ulp difference;
-  * parameter broadcast, scalar reduction (and the key-mismatch guard).
+  * parameter broadcast, scalar reduction (and the key-mismatch guard);
+  * NaN guard: a NaN / inf gradient on any one rank (or an overflowing sum) gives the same "not finite"
+    verdict on every rank; with the trainer's update helper every rank then skips the step identically
+    (parameters and Adam state untouched, still bitwise equal) and the next finite step applies everywhere.
 """
 
 from __future__ import annotations
@@ -162,6 +165,76 @@ def _t_sampler(ctx: DistCtx):
     G0, V0 = G, V
 
 
+def _grads_with(ctx: DistCtx, m: torch.nn.Module, poison: dict[int, float] | None = None, scale: float = 1.0):
+  """Fresh per-rank gradients of m; poison {rank: value} writes value into one gradient element on that rank."""
+  m.zero_grad(set_to_none=True)
+  (m(_rank_data(20 + ctx.rank, 6, 5)).pow(2).mean() * scale).backward()
+  if poison and ctx.rank in poison:
+    next(iter(m.parameters())).grad.view(-1)[3] = poison[ctx.rank]
+
+
+def _t_nan_guard(ctx: DistCtx):
+  W = ctx.world
+  torch.manual_seed(0)
+  m = mlp(5, (8,), 2)
+  cases = {
+    "finite": (None, 1.0, True),
+    "nan_on_last_rank": ({W - 1: float("nan")}, 1.0, False),
+    "inf_on_rank0": ({0: float("inf")}, 1.0, False),
+    "inf_minus_inf": ({0: float("inf"), 1: float("-inf")}, 1.0, False),
+    "overflowing_sum": ({r: 3.0e38 for r in range(W)}, 1.0, False),  # every rank finite, the sum is not
+  }
+  for name, (poison, scale, want) in cases.items():
+    _grads_with(ctx, m, poison, scale)
+    ok = ctx.allreduce_grads_(list(m.parameters()))
+    verdicts = ctx.all_gather_object(ok)
+    assert all(v == want for v in verdicts), f"{name}: verdicts {verdicts}, expected {want} on every rank"
+  # single-process (disabled) context checks the local gradient
+  off = DistCtx(device="cpu")
+  m.zero_grad(set_to_none=True)
+  m(torch.ones(2, 5)).sum().backward()
+  assert off.allreduce_grads_(list(m.parameters())) is True
+  next(iter(m.parameters())).grad.view(-1)[0] = float("nan")
+  assert off.allreduce_grads_(list(m.parameters())) is False
+  m.zero_grad(set_to_none=True)
+  assert off.allreduce_grads_(list(m.parameters())) is True  # no gradients at all
+
+
+def _t_trainer_skip(ctx: DistCtx):
+  """Trainer._apply_grads on a stand-in trainer: rank-local NaN -> every rank skips, state stays identical."""
+  try:
+    from supermimic.trainer import Trainer
+  except Exception as e:  # noqa: BLE001
+    if ctx.is_main:
+      print(f"  (trainer skip test skipped: {e!r})")
+    return
+  torch.manual_seed(0)
+  m = mlp(5, (8,), 2)
+  opt = torch.optim.Adam(m.parameters(), lr=1e-2)
+  fake = types.SimpleNamespace(dist=ctx, guard_skips={"pi": 0})
+  step = lambda: Trainer._apply_grads(fake, "pi", opt, list(m.parameters()), 1.0, 0.1)  # noqa: E731
+  _grads_with(ctx, m)
+  gn = step()  # finite: applied
+  assert gn == gn and len(opt.state) > 0
+  before = [p.detach().clone() for p in m.parameters()]
+  adam_before = {k: {kk: (vv.clone() if torch.is_tensor(vv) else vv) for kk, vv in v.items()} for k, v in opt.state.items()}
+  for bad_rank in range(W := ctx.world):
+    _grads_with(ctx, m, {bad_rank: float("nan")})
+    gn = step()
+    assert gn != gn, "skipped update returns nan"
+    assert all(p.grad is None for p in m.parameters()), "skipped update drops the gradients"
+    assert all(torch.equal(a, p) for a, p in zip(before, m.parameters())), "skipped update changed the weights"
+    for k, v in opt.state.items():
+      for kk, vv in v.items():
+        assert torch.equal(torch.as_tensor(vv), torch.as_tensor(adam_before[k][kk])), f"Adam state {kk} changed"
+  assert fake.guard_skips["pi"] == W
+  _check_same_everywhere(ctx, "after_skips", list(m.parameters()) + [t for v in opt.state.values() for t in v.values()])
+  _grads_with(ctx, m)
+  step()  # finite again: applied on every rank, still one model
+  assert not all(torch.equal(a, p) for a, p in zip(before, m.parameters()))
+  _check_same_everywhere(ctx, "after_resume", list(m.parameters()) + [t for v in opt.state.values() for t in v.values()])
+
+
 def _t_check(ctx: DistCtx):
   t = torch.linspace(-1, 1, 101)
   ctx.check_consistent({"a": [t, 3, "x"], "b": [t.double()]}, tag="equal")
@@ -197,7 +270,7 @@ def _worker(rank: int, world: int, port: int, outdir: str):
   ctx = DistCtx.from_env("cpu", timeout_min=2.0)
   assert ctx.enabled and ctx.world == world and ctx.device == "cpu"
   done = []
-  for fn in (_t_broadcast, _t_grads, _t_rms, _t_sampler, _t_check, _t_scalars):
+  for fn in (_t_broadcast, _t_grads, _t_rms, _t_sampler, _t_check, _t_scalars, _t_nan_guard, _t_trainer_skip):
     fn(ctx)
     ctx.barrier()
     done.append(fn.__name__)

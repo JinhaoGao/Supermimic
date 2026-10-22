@@ -2,7 +2,8 @@
 
 Starts from mjlab's BeyondMimic G1 tracking task and applies the paper's
 changes (Appendix A): no push events, no self-collision penalty, joint-limit
-weight -2, no end-effector termination, DR context re-sampled per episode,
+weight -2, no end-effector termination (restored by default since 2026-10-22,
+``ee_termination``; see heads.HeadsCfg), DR context re-sampled per episode,
 multi-clip library command with return-based reset sampling and a clip-end
 time-out. The env never auto-resets: the trainer reads terminal states and
 calls ``reset(env_ids)`` itself.
@@ -41,7 +42,12 @@ def make_env_cfg(
   eval_clips: tuple[int, ...] = (),
   cache_dir: str = "",
   num_workers: int = 32,
+  ee_termination: bool = True,
+  ee_threshold: float = 0.25,
 ) -> ManagerBasedRlEnvCfg:
+  """ee_termination: keep BeyondMimic's end-effector height termination (``ee_body_pos``: any end-effector body
+  z error > ee_threshold; bodies per robot cfg). Must match ``HeadsCfg.ee_termination`` / ``ee_term_z`` of the
+  learner (SimInterface checks). Off = the paper's recipe (term removed)."""
   assert mode in ("train", "eval")
   cfg = base_tracking_cfg(robot)
   cfg.scene.num_envs = num_envs
@@ -91,7 +97,12 @@ def make_env_cfg(
   cfg.rewards["joint_limit"].weight = -2.0
 
   # Terminations.
-  cfg.terminations.pop("ee_body_pos", None)
+  if ee_termination:
+    ee = cfg.terminations["ee_body_pos"]
+    assert ee.params["body_names"], f"{robot}: ee_body_pos has no end-effector bodies"
+    ee.params["threshold"] = float(ee_threshold)
+  else:
+    cfg.terminations.pop("ee_body_pos", None)
   cfg.terminations["clip_end"] = TerminationTermCfg(
     func=motion_clip_end, params={"command_name": "motion"}, time_out=True
   )

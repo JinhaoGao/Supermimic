@@ -14,6 +14,15 @@ Data parallel (torchrun, see distributed.py): every rank runs this loop on its
 own envs / replay (seed + rank) and the ranks stay one model (gradient mean,
 synced normalizers and reset sampler); rank 0 logs, saves and evaluates.
 Without torchrun the code path is exactly the single-GPU one.
+
+NaN guard (every mode): after the gradient all-reduce of each module update the
+reduced gradient is checked; if it is non-finite (any rank) every rank drops it
+and skips that optimizer step (optimizer state untouched). The watchdog treats
+an iteration with a skipped update or a non-finite imagined reward as a
+transient and only acts (rollback) after wd_nf_patience consecutive ones;
+checkpoints written while non-finite (or with non-finite weights) are never
+rollback targets. Simulator states that come back non-finite end their episode
+as a failure (the replay keeps the finite pre-step state).
 """
 
 from __future__ import annotations
@@ -93,6 +102,8 @@ class TrainCfg:
   wd_lr_factor: float = 0.5  # LR multiplier applied at every rollback
   wd_max_rollbacks: int = 6
   wd_force_at: int = -1  # debug: force one rollback at this iteration
+  wd_nf_patience: int = 100  # consecutive non-finite iterations (skipped update / NaN imagined reward) before a rollback
+  wd_early_ckpt: int = 500  # one early checkpoint (rollback point) at this iteration when none exists yet (0 = off)
   # Logging / eval / checkpoints.
   log_interval: int = 50
   eval_interval: int = 2000
@@ -112,6 +123,15 @@ def cosine_lambda(decay_iters: int, final_ratio: float):
     return final_ratio + 0.5 * (1.0 - final_ratio) * (1.0 + math.cos(math.pi * it / decay_iters))
 
   return f
+
+
+def finite_mean(v) -> float:
+  """Mean of the finite entries (= np.mean when all are finite; nan when none is). Logging only."""
+  a = np.asarray(v, dtype=np.float64)
+  f = np.isfinite(a)
+  if f.all():
+    return float(np.mean(v))
+  return float(a[f].mean()) if f.any() else float("nan")
 
 
 def clip_grads(params, norm: float, elem: float | None) -> float:
@@ -151,6 +171,7 @@ class Trainer:
     env_cfg = make_env_cfg(
       cfg.motion_files, cfg.num_envs, mode="train", episode_length_s=cfg.episode_length_s, robot=cfg.robot,
       library_key=self.LIB_KEY, cache_dir=cfg.cache_dir, num_workers=cfg.num_workers,
+      ee_termination=cfg.heads.ee_termination, ee_threshold=cfg.heads.ee_term_z,
     )
     env_cfg.seed = seed
     # Rank 0 builds the env first (and the packed motion cache if it is missing); the others wait so that
@@ -201,6 +222,10 @@ class Trainer:
     self._print(f"[Trainer] policy {n_params(self.policy)/1e6:.1f}M  critic {n_params(self.critic)/1e6:.2f}M  wm {n_params(self.wm)/1e6:.1f}M")
     self._print(f"[Trainer] {self.lib.summary()}")
     self._print(f"[Trainer] goal_frame_dim={self.heads.goal_frame_dim} (anchor_pos={hc.goal_anchor_pos}), eval clips {len(self.eval_clip_ids)}")
+    self._print(
+      "[Trainer] end-effector termination: "
+      +(f"on, z error > {hc.ee_term_z} on {list(self.sim.ee_body_names)} (soft temp {hc.ee_term_z_temp})" if hc.ee_termination else "off (paper recipe)")
+    )
     if dctx.enabled:
       self._print(
         f"[Trainer] data parallel: {dctx.world} ranks x {self.E} envs / {cfg.rollouts_per_update} rollouts "
@@ -226,7 +251,11 @@ class Trainer:
     self.ep_ret = torch.zeros(E, device=self.device)
     self._gamma_pow = cfg.gamma ** torch.arange(L, device=self.device, dtype=torch.float32)
     self._ar = torch.arange(E, device=self.device)
-    self.stats = {"ep_return_norm": [], "ep_len": [], "ep_failed": [], "term_mismatch": []}
+    self.stats = {"ep_return_norm": [], "ep_len": [], "ep_failed": [], "ep_failed_ee": [], "term_mismatch": [], "sim_nonfinite": []}
+    self._ee_on = hc.ee_termination
+    # ---- NaN guard ----
+    self.guard_skips = {"wm": 0, "pi": 0, "critic": 0}  # skipped (non-finite) updates since start, same on every rank
+    self.guard_nf_iters = 0  # iterations with a skipped update or a non-finite imagined reward
     # ---- watchdog ----
     self.wd_reward_ema: float | None = None
     self.wd_hist: deque = deque()
@@ -235,6 +264,7 @@ class Trainer:
     self.wd_rollbacks = 0
     self.wd_quiet_until = cfg.wd_warmup
     self.wd_forced = False
+    self.wd_nf_streak = 0  # consecutive non-finite iterations
 
   # ---------------------------------------------------------------------------
   # 1. Data collection
@@ -254,8 +284,19 @@ class Trainer:
     r, term_hard = self.fns.post(next_state, self.kin, a_exec, self.prev_action, *ref_cur)
     terminated = self.env.reset_terminated.bool()
     timeouts = self.env.reset_time_outs.bool()
+    # A non-finite simulator state never trips the (NaN-blind) termination tests: end it as a failure and keep the
+    # finite pre-step state in the replay instead (no-op, bitwise, when everything is finite).
+    bad = ~torch.isfinite(next_state).all(-1)
+    tm_frac, n_bad = torch.stack([(term_hard != terminated).float().mean(), bad.float().sum()]).tolist()  # one sync
+    self.stats["term_mismatch"].append(tm_frac)
+    self.stats["sim_nonfinite"].append(n_bad)
+    terminated = terminated | bad
+    r = torch.where(bad, torch.zeros_like(r), r)
+    next_state = torch.where(bad[:, None], self.state, next_state)
     done = terminated | timeouts
-    self.stats["term_mismatch"].append((term_hard != terminated).float().mean().item())
+    if self._ee_on:  # end-effector-only failures (the eval site's "body_pos" reason): logging only
+      tm = self.env.termination_manager
+      ee_fail = tm.get_term("ee_body_pos") & ~(tm.get_term("anchor_pos") | tm.get_term("anchor_ori")) & ~bad
 
     self.buffer.add(
       state=self.state, next_state=next_state, action=a_exec, prev_action=self.prev_action, xi=self.xi, reward=r,
@@ -269,7 +310,7 @@ class Trainer:
 
     if done.any():
       ids = done.nonzero(as_tuple=False).squeeze(-1)
-      self._finish_episodes(ids, terminated[ids])
+      self._finish_episodes(ids, terminated[ids], ee_fail[ids] if self._ee_on else None)
       self.env.reset(env_ids=ids)
       xi_new = self.sim.xi()
       self.xi[ids] = xi_new[ids]
@@ -288,7 +329,7 @@ class Trainer:
       self.hist.reset(ids, obs)
 
   @torch.no_grad()
-  def _finish_episodes(self, ids: torch.Tensor, failed: torch.Tensor) -> None:
+  def _finish_episodes(self, ids: torch.Tensor, failed: torch.Tensor, failed_ee: torch.Tensor | None = None) -> None:
     g = self.cfg.gamma
     L = self.ep_step[ids]
     Lmax = int(L.max().item())
@@ -307,6 +348,8 @@ class Trainer:
     self.stats["ep_return_norm"].extend(norm_ret.tolist())
     self.stats["ep_len"].extend(L.tolist())
     self.stats["ep_failed"].extend(failed.float().tolist())
+    if failed_ee is not None:
+      self.stats["ep_failed_ee"].extend((failed_ee & failed).float().tolist())
 
   # ---------------------------------------------------------------------------
   # 2. World model
@@ -322,10 +365,7 @@ class Trainer:
       loss, e1, ek = self.fns.wm_loss(batch["s0"], batch["actions"], batch["next_states"], batch["xi"], batch["mask"])
       self.opt_wm.zero_grad(set_to_none=True)
       loss.backward()
-      params = list(self.wm.parameters())
-      self.dist.allreduce_grads_(params)
-      gn = clip_grads(params, cfg.grad_clip, None)
-      self.opt_wm.step()
+      gn = self._apply_grads("wm", self.opt_wm, list(self.wm.parameters()), cfg.grad_clip, None)
       m = {"wm/loss": loss.item(), "wm/err_step1": e1.item(), f"wm/err_step{cfg.k}": ek.item(), "wm/grad_norm": gn, "wm/valid_frac": batch["mask"].float().mean().item()}
       for k, v in m.items():
         agg[k] = agg.get(k, 0.0) + v / cfg.batches_per_update
@@ -381,10 +421,7 @@ class Trainer:
     loss_pi = -J.mean() / H
     self.opt_pi.zero_grad(set_to_none=True)
     loss_pi.backward()
-    params = list(self.policy.parameters())
-    self.dist.allreduce_grads_(params)
-    gn_pi = clip_grads(params, cfg.grad_clip_norm, cfg.grad_clip_elem)
-    self.opt_pi.step()
+    gn_pi = self._apply_grads("pi", self.opt_pi, list(self.policy.parameters()), cfg.grad_clip_norm, cfg.grad_clip_elem)
     for p_ in self.wm.parameters():
       p_.requires_grad_(True)
 
@@ -429,12 +466,27 @@ class Trainer:
         loss = 2.0 * torch.nn.functional.huber_loss(v, T[idx], delta=cfg.critic_huber_delta)
         self.opt_v.zero_grad(set_to_none=True)
         loss.backward()
-        params = list(self.critic.parameters())
-        self.dist.allreduce_grads_(params)
-        clip_grads(params, cfg.grad_clip_norm, None)
-        self.opt_v.step()
+        self._apply_grads("critic", self.opt_v, list(self.critic.parameters()), cfg.grad_clip_norm, None)
         losses.append(loss.item())
     return {"critic/loss": float(np.mean(losses)), "critic/target_mean": T.mean().item(), "critic/value_H_mean": V[H].mean().item()}
+
+  def _apply_grads(self, name: str, opt: torch.optim.Optimizer, params: list, norm: float, elem: float | None) -> float:
+    """Gradient all-reduce (data parallel) -> finite check -> clip -> optimizer step; returns the grad norm.
+
+    A non-finite reduced gradient (NaN / inf on any rank, or an overflowing sum) is the same on every rank, so
+    every rank skips this update identically: gradients dropped, no optimizer step (Adam moments / step count
+    untouched), counted in guard_skips[name]; returns nan."""
+    if self.dist.allreduce_grads_(params):
+      gn = clip_grads(params, norm, elem)
+      opt.step()
+      return gn
+    opt.zero_grad(set_to_none=True)
+    self.guard_skips[name] += 1
+    return float("nan")
+
+  def _learned_state_finite(self) -> bool:
+    ts = [t for m in (self.policy, self.critic, self.wm) for t in list(m.parameters()) + list(m.buffers()) if t.is_floating_point()]
+    return bool(torch.stack([torch.isfinite(t).all() for t in ts]).all())
 
   # ---------------------------------------------------------------------------
   # Checkpoints / evaluation
@@ -493,20 +545,33 @@ class Trainer:
   # ~400 iterations, critic loss x5000, then NaN in the reset sampler). Roll back instead of dying.
   # ---------------------------------------------------------------------------
 
-  def _watchdog(self, m_pi: dict) -> bool:
-    """Update watchdog statistics; roll back if training collapsed. Returns True after a rollback."""
+  def _watchdog(self, m_pi: dict, skipped: int = 0) -> bool:
+    """Update watchdog statistics; roll back if training collapsed. Returns True after a rollback.
+
+    skipped: module updates the NaN guard skipped this iteration (identical on every rank)."""
     cfg = self.cfg
-    if not cfg.wd_enabled:
-      return False
     r = float(m_pi.get("pi/imagined_reward_norm", float("nan")))
     vl = float(m_pi.get("critic/loss", float("nan")))
     if self.dist.enabled:  # data parallel: every rank decides on the same rank means -> rolls back together
       g = self.dist.reduce_scalars({"r": r, "vl": vl}, "mean", check_keys=False)
       r, vl = g["r"], g["vl"]
+    if skipped or not math.isfinite(r):
+      # Transient: the non-finite updates were skipped, the weights are intact. Only a long streak means the
+      # weights / normalizers themselves are broken -> roll back (no checkpoint yet: keep skipping, never give up).
+      self.guard_nf_iters += 1
+      self.wd_nf_streak += 1
+      if self.wd_nf_streak <= 3 or self.wd_nf_streak % 100 == 0:
+        sk = ", ".join(f"{k} {v}" for k, v in self.guard_skips.items())
+        self._print(f"[guard] it {self.it}: non-finite (imagined reward {r:.4g}, {skipped} updates skipped; streak {self.wd_nf_streak}, total skips {sk})", flush=True)
+      if not cfg.wd_enabled or self.wd_nf_streak < cfg.wd_nf_patience:
+        return False
+      self.wd_nf_streak = 0
+      return self._rollback(f"non-finite for {cfg.wd_nf_patience} consecutive iterations")
+    self.wd_nf_streak = 0
+    if not cfg.wd_enabled:
+      return False
     if math.isfinite(vl):
       self.wd_vloss.append(vl)
-    if not math.isfinite(r):
-      return self._rollback("imagined reward is not finite")
     a = cfg.wd_ema
     self.wd_reward_ema = r if self.wd_reward_ema is None else (1 - a) * self.wd_reward_ema + a * r
     self.wd_hist.append((self.it, self.wd_reward_ema))
@@ -528,7 +593,12 @@ class Trainer:
     return False
 
   def _healthy(self) -> bool:
-    if self.wd_reward_ema is None or not self.wd_hist:
+    """May the checkpoint written at this iteration become the rollback target? Never while non-finite: the EMA is
+    frozen during a non-finite streak (smoke 10-22: a checkpoint with NaN weights was taken as healthy and
+    restored six times in a row)."""
+    if self.wd_reward_ema is None or not self.wd_hist or self.wd_nf_streak > 0:
+      return False
+    if not self._learned_state_finite():
       return False
     best = max(e for _, e in self.wd_hist)
     return self.wd_reward_ema >= best - 0.5 * self.cfg.wd_drop
@@ -557,6 +627,7 @@ class Trainer:
     self.wd_reward_ema = None
     self.wd_hist.clear()
     self.wd_vloss.clear()
+    self.wd_nf_streak = 0
     self.wd_quiet_until = self.it + cfg.wd_warmup
     msg = (f"[watchdog] rollback #{self.wd_rollbacks}: it {it_before} -> {self.it} from {path}; "
            f"LR x{cfg.wd_lr_factor} (policy lr now {self.opt_pi.param_groups[0]['lr']:.2e})")
@@ -650,7 +721,7 @@ class Trainer:
   def _dist_log_scalars(self, agg: dict, dt: float, dsteps: int) -> dict:
     """Log scalars of all ranks: means of the per-rank metrics, episode stats pooled over ranks."""
     cfg, dctx, st = self.cfg, self.dist, self.stats
-    local = {k: float(np.mean(v)) for k, v in agg.items()}
+    local = {k: finite_mean(v) for k, v in agg.items()}
     local["sampler/entropy"] = self.cmd.metrics["sampling_entropy"][0].item()
     local["sampler/top1_prob"] = self.cmd.metrics["sampling_top1_prob"][0].item()
     scal = dctx.reduce_scalars(local, "mean")
@@ -658,7 +729,7 @@ class Trainer:
       {
         "ret": float(np.sum(st["ep_return_norm"])), "len": float(np.sum(st["ep_len"])), "fail": float(np.sum(st["ep_failed"])),
         "n": float(len(st["ep_return_norm"])), "tm": float(np.sum(st["term_mismatch"])), "tm_n": float(len(st["term_mismatch"])),
-        "steps": float(dsteps * self.E),
+        "steps": float(dsteps * self.E), "fail_ee": float(np.sum(st["ep_failed_ee"])), "nonfin": float(np.sum(st["sim_nonfinite"])),
       },
       "sum",
     )
@@ -673,6 +744,9 @@ class Trainer:
       scal["train/ep_return_norm"] = sums["ret"] / sums["n"]
       scal["train/ep_len"] = sums["len"] / sums["n"]
       scal["train/ep_failed_frac"] = sums["fail"] / sums["n"]
+      if self._ee_on:
+        scal["train/ep_failed_ee_frac"] = sums["fail_ee"] / sums["n"]
+    scal["guard/sim_nonfinite"] = sums["nonfin"]
     scal["train/term_mismatch"] = sums["tm"] / sums["tm_n"] if sums["tm_n"] else 0.0
     scal["sampler/bins_visited_frac"] = (self.cmd.bin_visits > 0).float().mean().item()  # merged state
     for k, v in mx.items():
@@ -706,6 +780,7 @@ class Trainer:
           self.collect_step()
         continue
       t1 = time.time()
+      skips0 = sum(self.guard_skips.values())
       m_wm = self.update_world_model()
       t2 = time.time()
       m_pi = self.update_policy()
@@ -713,7 +788,7 @@ class Trainer:
       for s in self.sched:
         s.step()
       self.it += 1
-      if self._watchdog(m_pi):
+      if self._watchdog(m_pi, sum(self.guard_skips.values()) - skips0):
         agg = {}
         continue
       for k, v in {**m_wm, **m_pi, "time/collect": t1 - t0, "time/wm": t2 - t1, "time/policy": t3 - t2, "time/iter": t3 - t0}.items():
@@ -721,6 +796,8 @@ class Trainer:
 
       # Same schedule on every rank (depends only on cfg and the iteration counter).
       ckpt_slot = bool(cfg.ckpt_interval) and self.it % cfg.ckpt_interval == 0
+      # One early rollback point (the first regular checkpoint comes only at ckpt_interval).
+      ckpt_slot |= cfg.wd_enabled and cfg.wd_early_ckpt > 0 and self.it == cfg.wd_early_ckpt and self.wd_healthy_ckpt is None
       eval_slot = bool(cfg.eval_interval) and self.it % cfg.eval_interval == 0
       check_slot = bool(cfg.param_check_interval) and self.it % cfg.param_check_interval == 0
       if dctx.enabled and (self.it % sync_every == 0 or ckpt_slot or check_slot):
@@ -733,7 +810,7 @@ class Trainer:
           fps = scal["time/env_fps"]
         else:
           fps = (self.env_steps - steps_at_log) * self.E / max(now - t_log, 1e-6)
-          scal = {k: float(np.mean(v)) for k, v in agg.items()}
+          scal = {k: finite_mean(v) for k, v in agg.items()}
           scal["time/env_fps"] = fps
           scal["time/iter_per_s"] = cfg.log_interval / max(now - t_log, 1e-6)
           scal["train/env_steps_per_env"] = self.env_steps
@@ -743,6 +820,9 @@ class Trainer:
             scal["train/ep_return_norm"] = float(np.mean(self.stats["ep_return_norm"]))
             scal["train/ep_len"] = float(np.mean(self.stats["ep_len"]))
             scal["train/ep_failed_frac"] = float(np.mean(self.stats["ep_failed"]))
+          if self.stats["ep_failed_ee"]:
+            scal["train/ep_failed_ee_frac"] = float(np.mean(self.stats["ep_failed_ee"]))
+          scal["guard/sim_nonfinite"] = float(np.sum(self.stats["sim_nonfinite"]))
           scal["train/term_mismatch"] = float(np.mean(self.stats["term_mismatch"])) if self.stats["term_mismatch"] else 0.0
           scal["sampler/entropy"] = self.cmd.metrics["sampling_entropy"][0].item()
           scal["sampler/top1_prob"] = self.cmd.metrics["sampling_top1_prob"][0].item()
@@ -750,15 +830,20 @@ class Trainer:
         if self.wd_reward_ema is not None:
           scal["guard/reward_ema"] = self.wd_reward_ema  # same on every rank (watchdog runs on rank means)
         scal["guard/rollbacks_total"] = self.wd_rollbacks
+        for k, v in self.guard_skips.items():
+          scal[f"guard/skips_{k}"] = v  # cumulative, same on every rank
+        scal["guard/nonfinite_iters"] = self.guard_nf_iters
         if self.main:
           for k, v in scal.items():
             self.writer.add_scalar(k, v, self.it)
           print(
             f"[it {self.it:7d} | {scal['train/wall_h']:5.2f} h] wm {scal.get('wm/loss', 0):.4f} (e1 {scal.get('wm/err_step1', 0):.3f}, e{cfg.wm.k} {scal.get(f'wm/err_step{cfg.wm.k}', 0):.3f}) "
             f"| imag_ret {scal.get('pi/imagined_return', 0):.4f} rew {scal.get('pi/imagined_reward_norm', 0):.3f} surv {scal.get('pi/survival_H', 0):.3f} | "
-            f"ep_ret {scal.get('train/ep_return_norm', 0):.3f} len {scal.get('train/ep_len', 0):.0f} fail {scal.get('train/ep_failed_frac', 0):.2f} | "
+            f"ep_ret {scal.get('train/ep_return_norm', 0):.3f} len {scal.get('train/ep_len', 0):.0f} fail {scal.get('train/ep_failed_frac', 0):.2f}"
+            + (f" (ee {scal.get('train/ep_failed_ee_frac', 0):.2f})" if self._ee_on else "") + " | "
             f"{scal['time/iter']*1000:.0f} ms/it (c {scal['time/collect']*1000:.0f} wm {scal['time/wm']*1000:.0f} pi {scal['time/policy']*1000:.0f} ref {scal.get('time/ref_gather', 0)*1000:.0f}) fps {fps:.0f}"
-            + (f" | max/rank {scal['dist/iter_max']*1000:.0f} ms" if dctx.enabled else ""),
+            + (f" | max/rank {scal['dist/iter_max']*1000:.0f} ms" if dctx.enabled else "")
+            + (f" | guard skips {sum(self.guard_skips.values())} nonfinite its {self.guard_nf_iters}" if self.guard_nf_iters else ""),
             flush=True,
           )
         agg = {}

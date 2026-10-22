@@ -42,6 +42,12 @@ def main():
   p.add_argument("--rollouts", type=int, default=4096)
   p.add_argument("--no_critic", action="store_true")
   p.add_argument("--goal_anchor_pos", action="store_true", help="include ref anchor position in the goal (needs odometry on hardware)")
+  # End-effector termination (BeyondMimic ee_body_pos; the paper removed it). On by default since 2026-10-22: without
+  # it the policy swings feet / hands far off the reference and fails the eval site's end-effector test.
+  p.add_argument("--ee_termination", dest="ee_termination", action="store_true", default=True,
+                 help="end-effector height termination in the simulator + matching soft term in imagination (default on)")
+  p.add_argument("--no_ee_termination", dest="ee_termination", action="store_false", help="paper recipe: no end-effector termination")
+  p.add_argument("--ee_threshold", type=float, default=0.25, help="end-effector z error threshold [m] (eval site: 0.25)")
   p.add_argument("--wm_batches", type=int, default=10)
   p.add_argument("--wm_windows", type=int, default=2048)
   p.add_argument("--wm_k", type=int, default=8)
@@ -58,6 +64,8 @@ def main():
   p.add_argument("--no_watchdog", action="store_true", help="disable the collapse watchdog (auto-rollback + LR halving)")
   p.add_argument("--wd_drop", type=float, default=0.08)
   p.add_argument("--wd_force_at", type=int, default=-1, help="debug: force one rollback at this iteration")
+  p.add_argument("--wd_nf_patience", type=int, default=100, help="consecutive non-finite iterations (skipped updates) before a rollback")
+  p.add_argument("--wd_early_ckpt", type=int, default=500, help="early checkpoint / rollback point at this iteration if none exists (0 = off)")
   p.add_argument("--no_compile", action="store_true")
   p.add_argument("--compile_mode", type=str, default=None, help="e.g. reduce-overhead or max-autotune")
   p.add_argument("--num_threads", type=int, default=0, help="CPU threads: OMP/MKL/OpenBLAS env + torch.set_num_threads (0 = leave defaults)")
@@ -131,6 +139,8 @@ def main():
     wd_enabled=not args.no_watchdog,
     wd_drop=args.wd_drop,
     wd_force_at=args.wd_force_at,
+    wd_nf_patience=args.wd_nf_patience,
+    wd_early_ckpt=args.wd_early_ckpt,
     compile_mode=args.compile_mode,
     world_size=dctx.world,
     base_lr_scale=args.lr_scale,
@@ -138,7 +148,7 @@ def main():
     param_check_interval=args.param_check_interval,
     dist_timeout_min=args.dist_timeout_min,
     wm=WorldModelCfg(k=args.wm_k, lr=lr, batches_per_update=args.wm_batches, windows_per_batch=args.wm_windows),
-    heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos),
+    heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos, ee_termination=args.ee_termination, ee_term_z=args.ee_threshold),
   )
   os.makedirs(log_dir, exist_ok=True)
   if dctx.is_main:

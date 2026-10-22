@@ -25,6 +25,9 @@ def main():
   p.add_argument("--eval_clip_names", type=str, default=None, help="txt of npz basenames; default: the run's setting (if any)")
   p.add_argument("--eval_envs", type=int, default=1024)
   p.add_argument("--out", type=str, default=None, help="write per-clip json here")
+  p.add_argument("--ee_termination", choices=["ckpt", "on", "off"], default="ckpt",
+                 help="count end-effector height failures (eval-site protocol); ckpt = as trained (off for checkpoints older than the switch)")
+  p.add_argument("--ee_threshold", type=float, default=None, help="end-effector z threshold (default: the checkpoint's, else 0.25)")
   args = p.parse_args()
 
   from supermimic.evaluate import Evaluator
@@ -38,6 +41,11 @@ def main():
   d = ck["dims"]
   hk = {k: v for k, v in cfg["heads"].items() if k != "extra"}
   hk["goal_anchor_pos"] = d["goal_frame"] == 2 * d["nj"] + 9
+  hk.setdefault("ee_termination", False)  # checkpoints from before the switch were trained without it
+  if args.ee_termination != "ckpt":
+    hk["ee_termination"] = args.ee_termination == "on"
+  if args.ee_threshold is not None:
+    hk["ee_term_z"] = args.ee_threshold
   heads_cfg = HeadsCfg(**hk)
   policy = Policy(d["proprio"], d["hist"], d["goal_frame"], d["K"], d["nj"]).to(args.device)
   policy.load_state_dict(ck["policy"])

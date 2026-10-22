@@ -122,11 +122,30 @@ falls 0.08 below its recent best (or the critic-loss median jumps 50×) it reloa
 halves the learning rates (`--no_watchdog`, `--wd_drop`, `--wd_force_at` for tests). G1 was resumed from 40000
 with LR 1e-4 (`g1_atlas_v1r`), E2 from 86000 (`e2_atlas_v1w`).
 
+NaN guard (2026-10-22, after the 8-GPU smoke went non-finite at iteration 118 and then rolled back six times to a
+checkpoint that already held NaN weights): every module update checks the gradient after the all-reduce; a
+non-finite one (any rank) is dropped on every rank and the optimizer step skipped (Adam state untouched,
+`guard/skips_*`). An iteration with a skipped update or a non-finite imagined reward is a transient for the watchdog;
+only `--wd_nf_patience` (100) consecutive ones trigger a rollback, and without a checkpoint the run keeps skipping
+instead of giving up. Checkpoints written during a non-finite streak or with non-finite weights never become the
+rollback target; one early rollback point is written at `--wd_early_ckpt` (500). Simulator states that come back
+non-finite end their episode as a failure (`guard/sim_nonfinite`).
+
+## End-effector termination
+
+The paper drops BeyondMimic's end-effector termination; without it the G1 / E2 full-atlas policies swing feet and
+hands far off the reference and fail the eval site's end-effector test (913 of 1009 G1 v4 failures). It is back on
+by default (`--no_ee_termination` = paper recipe, bitwise identical to the code before the switch;
+`--ee_threshold`, default 0.25 m like the eval site): the simulator terminates when any end-effector body (G1:
+ankle_roll + wrist_yaw links, E2: ankle_roll + elbow links) is more than the threshold off the reference in height,
+the imagined termination head gets the matching soft term (sigmoid, temperature 0.02, noisy-OR with the anchor
+terms), and the in-training benchmark counts it as a failure (`failed_ee` = end-effector-only failures).
+
 ## Layout
 
 | file | role |
 | --- | --- |
-| `supermimic/env_cfg.py` | mjlab env: G1 tracking task + paper's changes (no push, no self-collision, joint-limit −2, no EE termination, per-episode DR, no auto-reset) |
+| `supermimic/env_cfg.py` | mjlab env: G1 tracking task + paper's changes (no push, no self-collision, joint-limit −2, EE termination switchable (default on), per-episode DR, no auto-reset) |
 | `supermimic/library_command.py` | multi-clip motion command, return-based reset sampling (App. D.1), clip-end time-out |
 | `supermimic/motions.py` | loads our GMT npz clips (joint/body remap by name) onto one GPU timeline |
 | `supermimic/fk.py` | batched differentiable level-wise FK (MuJoCo semantics) with link velocities |
@@ -174,7 +193,8 @@ mirror. TensorBoard for the runs: `ssh -N -L 6107:127.0.0.1:6107 tencent_bj27`.
   reward, observation and termination heads are analytic through torch FK.
 * Goal per future frame = ref joint pos/vel + ref anchor (torso) pose relative to
   the robot anchor (BeyondMimic's `motion_anchor_pos_b/ori_b`), K=10 frames.
-* Termination in imagination is a soft sigmoid version of the hard thresholds.
+* Termination in imagination is a soft sigmoid version of the hard thresholds
+  (noisy-OR over anchor height, anchor tilt and, by default, end-effector heights).
 * "Update-to-data ratio 0.4" is ambiguous; `--env_steps_per_iter` controls how
   many simulator steps are collected per (WM + policy) update, default 1.
 * Returns-to-go of time-outs are bootstrapped with r_last/(1−γ) for the sampler.

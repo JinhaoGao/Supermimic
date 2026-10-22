@@ -1,7 +1,12 @@
 """Benchmark evaluation (Appendix F.1): clips played once from their first
 frame, friction 1.0, no DR / noise, deterministic policy. Reports the
 normalized return (undiscounted reward sum / max attainable) and the number
-of failed clips (training termination triggered before the clip end).
+of failed clips (training termination triggered before the clip end). With
+``HeadsCfg.ee_termination`` the end-effector height test counts as a failure
+too (the bj31 eval site's G1 / E2 official protocol: termination bodies
+ankle_roll + wrist_yaw / elbow links, z error > 0.25); ``failed_ee`` counts
+clips whose first failure was end-effector only (the site's "body_pos"
+reason, checked after the root tests), ``failed_fall`` the rest.
 
 Envs cycle through the evaluation clip list (all clips, or a fixed random
 subset for large libraries); the in-RAM library is shared with the training
@@ -39,7 +44,8 @@ class Evaluator:
     self.num_clips = len(self.eval_clips)
     self.num_envs = min(self.num_clips, max_envs)
     env_cfg = make_env_cfg(
-      motion_files, self.num_envs, mode="eval", robot=robot, library_key=library_key, eval_clips=self.eval_clips, cache_dir=cache_dir
+      motion_files, self.num_envs, mode="eval", robot=robot, library_key=library_key, eval_clips=self.eval_clips, cache_dir=cache_dir,
+      ee_termination=heads_cfg.ee_termination, ee_threshold=heads_cfg.ee_term_z,
     )
     self.env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
     self.sim = SimInterface(self.env, heads_cfg)
@@ -80,6 +86,9 @@ class Evaluator:
     sum_r = torch.zeros(n, device=self.device)
     done_clip = torch.zeros(n, dtype=torch.bool, device=self.device)
     failed = torch.zeros(n, dtype=torch.bool, device=self.device)
+    failed_ee = torch.zeros(n, dtype=torch.bool, device=self.device)  # first failure was end-effector only
+    tm = env.termination_manager
+    ee_on = "ee_body_pos" in tm.active_terms
     # Map clip index -> position in eval list.
     pos_of_clip = torch.full((lib.num_clips,), -1, dtype=torch.long, device=self.device)
     pos_of_clip[self.clip_ids] = torch.arange(n, device=self.device)
@@ -101,6 +110,9 @@ class Evaluator:
       act = env_active
       sum_r.index_add_(0, env_pos[act], r[act])
       fail_now = terminated & act
+      if ee_on:
+        ee_only = tm.get_term("ee_body_pos") & ~(tm.get_term("anchor_pos") | tm.get_term("anchor_ori"))
+        failed_ee[env_pos[fail_now & ee_only]] = True
       failed[env_pos[fail_now]] = True
       done = terminated | timeouts
       fin = done & act
@@ -139,6 +151,8 @@ class Evaluator:
         "return_min": float(norm_ret.min()),
         "failed": float(failed.sum()),
         "failed_frac": float(failed.float().mean()),
+        "failed_ee": float(failed_ee.sum()),
+        "failed_fall": float((failed & ~failed_ee).sum()),
         "clips_done": float(done_clip.sum()),
       },
       "per_clip": per_clip,

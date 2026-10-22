@@ -39,6 +39,7 @@ class SimInterface:
     self.lib = self.cmd.library
     tracked_local = [int(i) for i in self.cmd.body_indexes.tolist()]
     self.fk = TorchFK(env.sim.mj_model, self.robot, self.device, needed_bodies=tracked_local)
+    self.ee_body_names, ee_idx = self.ee_bodies(env, heads_cfg)
     self.heads = AnalyticHeads(
       self.fk,
       tracked_local,
@@ -46,6 +47,7 @@ class SimInterface:
       self.robot.data.default_joint_pos[0],
       self.robot.data.soft_joint_pos_limits[0],
       heads_cfg,
+      ee_indices=ee_idx,
     )
     self.nj = self.heads.nj
     self.xi_dim = 4 + self.nj
@@ -64,6 +66,32 @@ class SimInterface:
       env.sim.wp_model.opt.warn_overflow = 0
     except Exception:  # noqa: BLE001
       pass
+
+  @staticmethod
+  def ee_bodies(env, heads_cfg: HeadsCfg) -> tuple[tuple[str, ...], list[int]]:
+    """End-effector bodies of the simulator's ``ee_body_pos`` termination as indices into the tracked-body list
+    (mjlab ``_get_body_indexes`` order). The env and the heads must agree: the imagined termination has to see
+    the same failures as the simulator, so a mismatch in switch or threshold is an error."""
+    terms = env.cfg.terminations
+    has = "ee_body_pos" in terms
+    if bool(heads_cfg.ee_termination) != has:
+      raise ValueError(
+        f"end-effector termination mismatch: HeadsCfg.ee_termination={heads_cfg.ee_termination} but the env "
+        f"{'has' if has else 'has no'} 'ee_body_pos' term (make_env_cfg(ee_termination=...))"
+      )
+    if not has:
+      return (), []
+    params = terms["ee_body_pos"].params
+    thr = float(params["threshold"])
+    if abs(thr - float(heads_cfg.ee_term_z)) > 1e-9:
+      raise ValueError(f"end-effector threshold mismatch: env {thr} vs HeadsCfg.ee_term_z {heads_cfg.ee_term_z}")
+    names = tuple(params["body_names"])
+    tracked = tuple(env.command_manager.get_term("motion").cfg.body_names)
+    missing = [n for n in names if n not in tracked]
+    if missing:
+      raise ValueError(f"end-effector bodies {missing} are not tracked bodies {tracked}")
+    idx = [i for i, n in enumerate(tracked) if n in names]
+    return tuple(tracked[i] for i in idx), idx
 
   # ---- state -----------------------------------------------------------------
 
