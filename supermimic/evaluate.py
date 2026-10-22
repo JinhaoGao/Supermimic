@@ -31,6 +31,7 @@ class Evaluator:
     compile_: bool = True,
     cache_dir: str = "",
     robot: str = "g1",
+    robot_variant: str = "",
   ):
     from mjlab.envs import ManagerBasedRlEnv
 
@@ -39,7 +40,8 @@ class Evaluator:
     self.num_clips = len(self.eval_clips)
     self.num_envs = min(self.num_clips, max_envs)
     env_cfg = make_env_cfg(
-      motion_files, self.num_envs, mode="eval", robot=robot, library_key=library_key, eval_clips=self.eval_clips, cache_dir=cache_dir
+      motion_files, self.num_envs, mode="eval", robot=robot, library_key=library_key, eval_clips=self.eval_clips, cache_dir=cache_dir,
+      ee_term_z=heads_cfg.ee_term_z, robot_variant=robot_variant,
     )
     self.env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
     self.sim = SimInterface(self.env, heads_cfg)

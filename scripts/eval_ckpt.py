@@ -22,6 +22,8 @@ def main():
   p.add_argument("--eval_clips", type=int, default=None, help="random subset size (seeded like the trainer); default: the run's setting")
   p.add_argument("--eval_envs", type=int, default=1024)
   p.add_argument("--out", type=str, default=None, help="write per-clip json here")
+  p.add_argument("--ee_term_z", type=float, default=None, help="override the end-effector height termination (m); default: the run's")
+  p.add_argument("--robot_variant", type=str, default=None, help="override the robot model variant; default: the run's")
   args = p.parse_args()
 
   from supermimic.evaluate import Evaluator
@@ -34,6 +36,8 @@ def main():
   d = ck["dims"]
   hk = {k: v for k, v in cfg["heads"].items() if k != "extra"}
   hk["goal_anchor_pos"] = d["goal_frame"] == 2 * d["nj"] + 9
+  if args.ee_term_z is not None:  # e.g. score a v1 checkpoint under the v2 (end-effector) termination
+    hk["ee_term_z"] = args.ee_term_z
   heads_cfg = HeadsCfg(**hk)
   policy = Policy(d["proprio"], d["hist"], d["goal_frame"], d["K"], d["nj"]).to(args.device)
   policy.load_state_dict(ck["policy"])
@@ -44,6 +48,7 @@ def main():
   ev = Evaluator(
     files, heads_cfg, args.device, eval_clips=eval_clips, num_clips_total=len(files), max_envs=args.eval_envs,
     compile_=not args.no_compile, cache_dir=cfg.get("cache_dir", ""), robot=cfg.get("robot", "g1"),
+    robot_variant=args.robot_variant if args.robot_variant is not None else cfg.get("robot_variant", ""),
   )
   res = ev.run(policy)
   print(json.dumps({"it": ck["it"], **res["scalars"]}, indent=2))

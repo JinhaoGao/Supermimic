@@ -67,7 +67,7 @@ def main():
     next_state = sim.state()
     kin_next = heads.kin(next_state)
     r, terms = heads.reward(kin, kin_next, next_state, a, prev_a, ref, return_terms=True)
-    hard, soft = heads.termination(kin_next, ref["body_pos"][:, heads.anchor], ref["body_quat"][:, heads.anchor])
+    hard, soft = heads.termination(kin_next, ref["body_pos"], ref["body_quat"])
     rm = env.reward_manager
     name_map = {
       "root_pos": "motion_global_root_pos", "root_ori": "motion_global_root_ori", "body_pos": "motion_body_pos",

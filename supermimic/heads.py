@@ -16,7 +16,8 @@ All heads are differentiable w.r.t. the state so that the policy gradient can
 flow through them during imagined rollouts (paper §3.2: heads may be analytic).
 Reward and termination mirror mjlab's BeyondMimic tracking task (Appendix A of
 the paper): self-collision penalty removed, joint-limit weight -2, no
-end-effector termination.
+end-effector termination (optional again via ``HeadsCfg.ee_term_z``: the team's
+MuJoCo benchmark terminates on end-effector height, see README).
 """
 
 from __future__ import annotations
@@ -69,6 +70,11 @@ class HeadsCfg:
   term_tilt: float = 0.8
   term_z_temp: float = 0.02
   term_tilt_temp: float = 0.05
+  # End-effector height termination (BeyondMimic's ee_body_pos: |z_ref - z_robot| > ee_term_z on the robot's
+  # ee bodies, G1 ankles + wrists, E2 ankles + elbows). The paper drops it (0 = off, the default); the team's
+  # MotionAtlas v4 benchmark terminates on it at 0.25 m, so v2 runs train with it (env + soft head).
+  ee_term_z: float = 0.0
+  ee_term_temp: float = 0.02
   extra: dict = field(default_factory=dict)
 
   @property
@@ -92,11 +98,15 @@ class AnalyticHeads:
     default_joint_pos: torch.Tensor,
     soft_joint_limits: torch.Tensor,
     cfg: HeadsCfg,
+    ee_indices: list[int] | None = None,
   ):
     self.fk = fk
     self.cfg = cfg
     self.device = fk.device
     self.tracked = torch.as_tensor(tracked_local_ids, device=self.device)
+    self.ee = torch.as_tensor(list(ee_indices or []), dtype=torch.long, device=self.device)  # within the tracked list
+    if cfg.ee_term_z > 0 and self.ee.numel() == 0:
+      raise ValueError("ee_term_z > 0 needs the end-effector bodies (env termination 'ee_body_pos')")
     self.anchor = anchor_index  # index within the tracked-body list
     self.anchor_local = int(tracked_local_ids[anchor_index])
     self.nj = default_joint_pos.shape[-1]
@@ -215,9 +225,13 @@ class AnalyticHeads:
 
   # ---- termination ---------------------------------------------------------
 
-  def termination(self, kin_next: dict, ref_ap: torch.Tensor, ref_aq: torch.Tensor):
-    """ref anchor pose [B,3]/[B,4] at the target frame. Returns (hard_bool [B], soft_prob [B])."""
+  def termination(self, kin_next: dict, ref_bp: torch.Tensor, ref_bq: torch.Tensor):
+    """Reference tracked-body poses [B,Bt,3]/[B,Bt,4] at the target frame. Returns (hard_bool [B], soft_prob [B]).
+
+    Anchor height / tilt as in BeyondMimic; with ee_term_z > 0 also the end-effector height error. The
+    re-anchored reference used by mjlab's ee_body_pos keeps the reference z, so world z is compared."""
     c = self.cfg
+    ref_ap, ref_aq = ref_bp[:, self.anchor], ref_bq[:, self.anchor]
     B = ref_ap.shape[0]
     g = self.gravity.expand(B, 3)
     dz = (ref_ap[:, 2] - kin_next["anchor_pos"][:, 2]).abs()
@@ -225,5 +239,9 @@ class AnalyticHeads:
     hard = (dz > c.term_z) | (tilt > c.term_tilt)
     pz = torch.sigmoid((dz - c.term_z) / c.term_z_temp)
     pt = torch.sigmoid((tilt - c.term_tilt) / c.term_tilt_temp)
-    soft = 1.0 - (1.0 - pz) * (1.0 - pt)
-    return hard, soft
+    alive = (1.0 - pz) * (1.0 - pt)
+    if c.ee_term_z > 0:
+      ez = (ref_bp[:, self.ee, 2] - kin_next["body_pos"][:, self.ee, 2]).abs()  # [B, n_ee]
+      hard = hard | (ez > c.ee_term_z).any(-1)
+      alive = alive * (1.0 - torch.sigmoid((ez - c.ee_term_z) / c.ee_term_temp)).prod(-1)
+    return hard, 1.0 - alive

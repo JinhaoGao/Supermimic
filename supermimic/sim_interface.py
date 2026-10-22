@@ -39,6 +39,13 @@ class SimInterface:
     self.lib = self.cmd.library
     tracked_local = [int(i) for i in self.cmd.body_indexes.tolist()]
     self.fk = TorchFK(env.sim.mj_model, self.robot, self.device, needed_bodies=tracked_local)
+    # End-effector height termination: same bodies / threshold in the env (mjlab ee_body_pos) and the soft head.
+    ee_term = env.cfg.terminations.get("ee_body_pos")
+    tracked_names = list(self.cmd.cfg.body_names)
+    ee_idx = [tracked_names.index(n) for n in ee_term.params["body_names"]] if ee_term is not None else []
+    env_thr = float(ee_term.params["threshold"]) if ee_term is not None else 0.0
+    if abs(env_thr - heads_cfg.ee_term_z) > 1e-9:
+      raise ValueError(f"env ee_body_pos threshold {env_thr} != heads ee_term_z {heads_cfg.ee_term_z}")
     self.heads = AnalyticHeads(
       self.fk,
       tracked_local,
@@ -46,6 +53,7 @@ class SimInterface:
       self.robot.data.default_joint_pos[0],
       self.robot.data.soft_joint_pos_limits[0],
       heads_cfg,
+      ee_indices=ee_idx,
     )
     self.nj = self.heads.nj
     self.xi_dim = 4 + self.nj

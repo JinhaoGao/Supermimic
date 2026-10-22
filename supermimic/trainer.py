@@ -39,6 +39,7 @@ from .world_model import DynamicsModel, WorldModelCfg
 class TrainCfg:
   motion_files: list[str] = field(default_factory=list)
   robot: str = "g1"
+  robot_variant: str = ""  # see env_cfg.base_tracking_cfg (g1: eval; e2: nodamp)
   num_envs: int = 4096
   device: str = "cuda:0"
   seed: int = 0
@@ -72,7 +73,10 @@ class TrainCfg:
   # Watchdog: roll back to the last healthy checkpoint when imagination collapses (see _watchdog).
   wd_enabled: bool = True
   wd_ema: float = 0.02  # EMA rate of the imagined reward (normalized)
-  wd_drop: float = 0.08  # trigger when EMA < best EMA of the last wd_window iterations - wd_drop
+  # Trigger when EMA < best EMA of the last wd_window iterations - wd_drop. 0.08 (v1) misfired on the G1 full-atlas
+  # resume: the return-based sampler drifts to harder bins and the imagined reward slides by ~0.08 without any
+  # collapse (evals stayed 0.855-0.874); the real collapse at 41k dropped it by 0.5.
+  wd_drop: float = 0.2
   wd_window: int = 4000
   wd_vloss_ratio: float = 50.0  # or when median critic loss of the last 50 its > ratio * median of the last 2000
   wd_warmup: int = 500  # iterations after start / resume / rollback before the watchdog may trigger
@@ -128,6 +132,7 @@ class Trainer:
     env_cfg = make_env_cfg(
       cfg.motion_files, cfg.num_envs, mode="train", episode_length_s=cfg.episode_length_s, robot=cfg.robot,
       library_key=self.LIB_KEY, cache_dir=cfg.cache_dir, num_workers=cfg.num_workers,
+      ee_term_z=cfg.heads.ee_term_z, robot_variant=cfg.robot_variant,
     )
     env_cfg.seed = cfg.seed
     self.env = ManagerBasedRlEnv(cfg=env_cfg, device=self.device)
@@ -503,6 +508,10 @@ class Trainer:
       raise RuntimeError(f"[watchdog] {self.wd_rollbacks} rollbacks already; giving up ({reason})")
     it_before = self.it
     self.load(path, rollback=True)  # models, normalizers, optimizers, sampler bins, iteration counter
+    # Forget the replay written since the checkpoint (collapsed policy): windows / imagination starts are drawn
+    # by age < size, so size 0 restricts them to fresh data; the train loop refills the warm-up first. v1 kept it,
+    # and every reload re-measured the imagined reward on the collapsed states.
+    self.buffer.size = 0
     self._set_lr_scale(self.lr_scale * cfg.wd_lr_factor)
     self.wd_rollbacks += 1
     self.wd_reward_ema = None
@@ -522,7 +531,7 @@ class Trainer:
       self.evaluator = Evaluator(
         self.cfg.motion_files, self.cfg.heads, self.device, library_key=self.LIB_KEY, eval_clips=self.eval_clip_ids,
         num_clips_total=self.lib.num_clips, max_envs=self.cfg.eval_envs, compile_=self.cfg.compile, cache_dir=self.cfg.cache_dir,
-        robot=self.cfg.robot,
+        robot=self.cfg.robot, robot_variant=self.cfg.robot_variant,
       )
     return self.evaluator.run(self.policy)
 

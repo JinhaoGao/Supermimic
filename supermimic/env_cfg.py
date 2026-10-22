@@ -6,10 +6,14 @@ weight -2, no end-effector termination, DR context re-sampled per episode,
 multi-clip library command with return-based reset sampling and a clip-end
 time-out. The env never auto-resets: the trainer reads terminal states and
 calls ``reset(env_ids)`` itself.
+
+v2 options: ``ee_term_z`` keeps BeyondMimic's end-effector height termination (the team's
+benchmark terminates on it), ``robot_variant`` swaps the robot model (see base_tracking_cfg).
 """
 
 from __future__ import annotations
 
+import mujoco
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
@@ -18,15 +22,45 @@ from mjlab.tasks.tracking import mdp
 from .library_command import LibraryMotionCommandCfg, motion_clip_end
 
 
-def base_tracking_cfg(robot: str):
+def _zero_joint_damping(spec_fn):
+  def build():
+    spec = spec_fn()
+    from .robots.g1_eval_model import set_scalar
+
+    for j in spec.joints:
+      if j.type == mujoco.mjtJoint.mjJNT_HINGE:
+        set_scalar(j, "damping", 0.0)
+    return spec
+
+  return build
+
+
+def base_tracking_cfg(robot: str, variant: str = ""):
+  """variant -- g1: "" mjlab's G1 | "eval" the team's eval / deploy G1 (robots/g1_eval_model.py);
+  e2: "" as trained in v1 | "nodamp" without the passive joint damping of the source MJCF (it carries
+  damping = kd on every joint, which doubled the actuator damping in v1; the real motor PD has kd only)."""
   if robot == "g1":
     from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
 
-    return unitree_g1_flat_tracking_env_cfg(has_state_estimation=True, play=False)
+    cfg = unitree_g1_flat_tracking_env_cfg(has_state_estimation=True, play=False)
+    if variant == "eval":
+      from .robots.g1_eval_model import patch_spec
+
+      ent = cfg.scene.entities["robot"]
+      ent.spec_fn = patch_spec(ent.spec_fn)
+    elif variant:
+      raise ValueError(f"unknown g1 variant {variant!r}")
+    return cfg
   if robot == "e2":
     from .robots.e2_tracking_cfg import noetix_e2_flat_tracking_env_cfg
 
-    return noetix_e2_flat_tracking_env_cfg()
+    cfg = noetix_e2_flat_tracking_env_cfg()
+    if variant == "nodamp":
+      ent = cfg.scene.entities["robot"]
+      ent.spec_fn = _zero_joint_damping(ent.spec_fn)
+    elif variant:
+      raise ValueError(f"unknown e2 variant {variant!r}")
+    return cfg
   raise ValueError(f"unknown robot {robot}")
 
 
@@ -41,9 +75,11 @@ def make_env_cfg(
   eval_clips: tuple[int, ...] = (),
   cache_dir: str = "",
   num_workers: int = 32,
+  ee_term_z: float = 0.0,
+  robot_variant: str = "",
 ) -> ManagerBasedRlEnvCfg:
   assert mode in ("train", "eval")
-  cfg = base_tracking_cfg(robot)
+  cfg = base_tracking_cfg(robot, robot_variant)
   cfg.scene.num_envs = num_envs
   cfg.scene.sensors = ()  # self-collision sensor not needed
   cfg.auto_reset = False
@@ -90,8 +126,11 @@ def make_env_cfg(
   cfg.rewards.pop("self_collisions", None)
   cfg.rewards["joint_limit"].weight = -2.0
 
-  # Terminations.
-  cfg.terminations.pop("ee_body_pos", None)
+  # Terminations. ee_body_pos (end-effector height) only when asked for (v2); the paper drops it.
+  if ee_term_z > 0:
+    cfg.terminations["ee_body_pos"].params["threshold"] = float(ee_term_z)
+  else:
+    cfg.terminations.pop("ee_body_pos", None)
   cfg.terminations["clip_end"] = TerminationTermCfg(
     func=motion_clip_end, params={"command_name": "motion"}, time_out=True
   )

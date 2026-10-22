@@ -36,7 +36,8 @@ def main():
 
   ck = torch.load(args.ckpt, map_location="cpu")
   robot_name = ck["cfg"].get("robot", "g1")
-  env = ManagerBasedRlEnv(cfg=make_env_cfg([args.motion], 1, mode="eval", robot=robot_name), device=args.device)
+  robot_variant = ck["cfg"].get("robot_variant", "")
+  env = ManagerBasedRlEnv(cfg=make_env_cfg([args.motion], 1, mode="eval", robot=robot_name, robot_variant=robot_variant), device=args.device)
   robot = env.scene["robot"]
   cmd = env.command_manager.get_term("motion")
   term = env.action_manager.get_term("joint_pos")
@@ -102,6 +103,7 @@ def main():
     "ckpt": os.path.abspath(args.ckpt),
     "iteration": ck["it"],
     "robot": robot_name,
+    "robot_variant": robot_variant,
     "mjlab_commit": mjlab_commit,
     "control_dt": env.step_dt,
     "decimation": env.cfg.decimation,

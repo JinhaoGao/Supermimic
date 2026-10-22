@@ -19,13 +19,18 @@ from datetime import datetime
 
 def main():
   p = argparse.ArgumentParser()
-  p.add_argument("--motion_dirs", type=str, nargs="+", required=True, help="directories (recursive) or npz files")
+  p.add_argument("--motion_dirs", type=str, nargs="*", default=None, help="directories (recursive) or npz files")
+  p.add_argument("--motion_list", type=str, default=None,
+                 help="text file, one npz path per line (e.g. a run's motion_files.txt); replaces --motion_dirs / --blacklist")
   p.add_argument("--blacklist", type=str, default=None, help="json with a 'bad_motions' list of npz basenames")
   p.add_argument("--name_exclude", type=str, nargs="*", default=None, help="drop clips whose name contains any keyword")
   p.add_argument("--max_motions", type=int, default=None)
   p.add_argument("--cache_dir", type=str, default="", help="where the packed motion cache lives (default ~/.cache/supermimic_motions)")
   p.add_argument("--num_workers", type=int, default=32)
   p.add_argument("--robot", type=str, default="g1", choices=["g1", "e2"])
+  p.add_argument("--robot_variant", type=str, default="", help="g1: eval (team eval / deploy model); e2: nodamp (no passive joint damping)")
+  p.add_argument("--ee_term_z", type=float, default=0.0,
+                 help="end-effector height termination in m (env + soft head); 0 = off as in the paper, 0.25 = BeyondMimic / team benchmark")
   p.add_argument("--run_name", type=str, default="run")
   p.add_argument("--log_root", type=str, default="logs/supermimic")
   p.add_argument("--device", type=str, default="cuda:0")
@@ -50,7 +55,7 @@ def main():
   p.add_argument("--no_eval", action="store_true")
   p.add_argument("--resume", type=str, default=None)
   p.add_argument("--no_watchdog", action="store_true", help="disable the collapse watchdog (auto-rollback + LR halving)")
-  p.add_argument("--wd_drop", type=float, default=0.08)
+  p.add_argument("--wd_drop", type=float, default=0.2)
   p.add_argument("--wd_force_at", type=int, default=-1, help="debug: force one rollback at this iteration")
   p.add_argument("--no_compile", action="store_true")
   p.add_argument("--compile_mode", type=str, default=None, help="e.g. reduce-overhead or max-autotune")
@@ -61,7 +66,11 @@ def main():
   from supermimic.trainer import TrainCfg, Trainer
   from supermimic.world_model import WorldModelCfg
 
-  files = collect_motion_files(args.motion_dirs, args.blacklist, args.name_exclude, args.max_motions)
+  if args.motion_list:
+    files = [l.strip() for l in open(os.path.expanduser(args.motion_list)) if l.strip()]
+  else:
+    assert args.motion_dirs, "--motion_dirs or --motion_list is required"
+    files = collect_motion_files(args.motion_dirs, args.blacklist, args.name_exclude, args.max_motions)
   assert files, "no motion files found"
   print(f"[train] {len(files)} motion files")
 
@@ -69,6 +78,7 @@ def main():
   cfg = TrainCfg(
     motion_files=files,
     robot=args.robot,
+    robot_variant=args.robot_variant,
     num_envs=args.num_envs,
     device=args.device,
     seed=args.seed,
@@ -95,7 +105,7 @@ def main():
     wd_force_at=args.wd_force_at,
     compile_mode=args.compile_mode,
     wm=WorldModelCfg(k=args.wm_k, lr=args.lr, batches_per_update=args.wm_batches, windows_per_batch=args.wm_windows),
-    heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos),
+    heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos, ee_term_z=args.ee_term_z),
   )
   print(f"[train] log_dir = {log_dir}")
   os.makedirs(log_dir, exist_ok=True)
