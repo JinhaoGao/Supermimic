@@ -447,9 +447,16 @@ class Trainer:
     self.opt_wm.load_state_dict(ck["opt_wm"])
     self.opt_pi.load_state_dict(ck["opt_pi"])
     self.opt_v.load_state_dict(ck["opt_v"])
+    nb = ck["bin_G"].shape[0]
+    old_files = list(ck.get("cfg", {}).get("motion_files", []))
     if ck["bin_G"].shape == self.cmd.bin_G.shape:
       self.cmd.bin_G.copy_(ck["bin_G"])
       self.cmd.bin_visits.copy_(ck["bin_visits"])
+    elif nb < self.cmd.bin_G.shape[0] and old_files and old_files == list(self.cfg.motion_files[: len(old_files)]):
+      # Library extended by appending clips (scripts/extend_cache.py): the old bins keep their indices.
+      self.cmd.bin_G[:nb].copy_(ck["bin_G"])
+      self.cmd.bin_visits[:nb].copy_(ck["bin_visits"])
+      print(f"[Trainer] sampler statistics of {nb} bins restored into the extended library ({self.cmd.bin_G.shape[0]} bins)")
     self.it = ck["it"]
     self.env_steps = ck["env_steps"]
     for s in self.sched:
