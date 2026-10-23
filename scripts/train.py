@@ -12,6 +12,10 @@ Examples:
   # One model on 8 GPUs of one machine (data parallel; every rank keeps the per-GPU config above,
   # so the global batch is 8x: 32768 envs / 32768 imagined rollouts). See scripts/launch_bj31_ddp.sh.
   torchrun --standalone --nproc_per_node 8 scripts/train.py ... --num_threads 24
+  # master's v2 recipe (bj27 g1v2_scratch): team eval G1 model + contacts, source prior, EE 0.25 (see
+  # scripts/launch_bj31_v2.example.sh for the 8-GPU version)
+  python scripts/train.py --motion_list <motion_files.txt> --robot g1 --robot_variant eval+evalcontact --ee_term_z 0.25 \
+      --source_weights noetix_kungfu=10,noetix_kungfu_dance_show=15,sportsmeeting=10,lafan1=15,g1_all=10,mixamo_cn=2,virtual_point=3
 """
 
 from __future__ import annotations
@@ -40,16 +44,45 @@ def _die_with_torchrun_agent() -> None:
     os.kill(os.getpid(), signal.SIGKILL)
 
 
+def motion_files_from_args(args) -> list[str]:
+  """--motion_list (one npz path per line, e.g. a run's motion_files.txt, used verbatim) or --motion_dirs filtered by
+  --blacklist / --name_exclude / --max_motions."""
+  if args.motion_list:
+    files = [l.strip() for l in open(os.path.expanduser(args.motion_list)) if l.strip()]
+    missing = [f for f in files if not os.path.exists(f)]
+    if missing:
+      msg = f"--motion_list {args.motion_list}: {len(missing)} of {len(files)} files do not exist here (first: {missing[0]})"
+      if len(missing) == len(files):
+        raise FileNotFoundError(msg + " -- a list written on another machine?")
+      print(f"[train] WARNING {msg}; they fail the cache build and are dropped", flush=True)
+  else:
+    from supermimic.motions import collect_motion_files
+
+    files = collect_motion_files(args.motion_dirs, args.blacklist, args.name_exclude, args.max_motions)
+  assert files, "no motion files found"
+  return files
+
+
 def main():
   _die_with_torchrun_agent()
   p = argparse.ArgumentParser()
-  p.add_argument("--motion_dirs", type=str, nargs="+", required=True, help="directories (recursive) or npz files")
+  p.add_argument("--motion_dirs", type=str, nargs="*", default=None, help="directories (recursive) or npz files")
+  p.add_argument("--motion_list", type=str, default=None,
+                 help="text file, one npz path per line (e.g. a run's motion_files.txt); replaces --motion_dirs / --blacklist")
   p.add_argument("--blacklist", type=str, default=None, help="json with a 'bad_motions' list of npz basenames")
   p.add_argument("--name_exclude", type=str, nargs="*", default=None, help="drop clips whose name contains any keyword")
   p.add_argument("--max_motions", type=int, default=None)
   p.add_argument("--cache_dir", type=str, default="", help="where the packed motion cache lives (default ~/.cache/supermimic_motions)")
   p.add_argument("--num_workers", type=int, default=32)
   p.add_argument("--robot", type=str, default="g1", choices=["g1", "e2"])
+  p.add_argument("--robot_variant", type=str, default="", help="g1: eval (team eval / deploy model); e2: nodamp (no passive joint damping)")
+  p.add_argument("--source_weights", type=str, default="",
+                 help="reset-sampler prior per data source, e.g. noetix_kungfu=6,sportsmeeting=10 (clip '<robot>__<source>_...')")
+  p.add_argument("--name_weights", type=str, default="",
+                 help="reset-sampler weight per clip-name keyword (case-insensitive substring), e.g. crawl=4,getup=4")
+  p.add_argument("--ee_term_z", type=float, default=None,
+                 help="master's v2 spelling of the end-effector height termination [m] (env + soft head): 0 = off as in "
+                      "the paper, 0.25 = BeyondMimic / team benchmark; same as --ee_termination --ee_threshold Z / --no_ee_termination")
   p.add_argument("--run_name", type=str, default="run")
   p.add_argument("--log_root", type=str, default="logs/supermimic")
   p.add_argument("--device", type=str, default="cuda:0")
@@ -63,10 +96,12 @@ def main():
   p.add_argument("--goal_anchor_pos", action="store_true", help="include ref anchor position in the goal (needs odometry on hardware)")
   # End-effector termination (BeyondMimic ee_body_pos; the paper removed it). On by default since 2026-10-22: without
   # it the policy swings feet / hands far off the reference and fails the eval site's end-effector test.
-  p.add_argument("--ee_termination", dest="ee_termination", action="store_true", default=True,
+  # NOTE master's default is OFF (--ee_term_z 0.0); here no flag = ON at 0.25 m. --ee_term_z (master) and these two
+  # spellings may be mixed only when they agree (heads.ee_flags).
+  p.add_argument("--ee_termination", dest="ee_termination", action="store_true", default=None,
                  help="end-effector height termination in the simulator + matching soft term in imagination (default on)")
   p.add_argument("--no_ee_termination", dest="ee_termination", action="store_false", help="paper recipe: no end-effector termination")
-  p.add_argument("--ee_threshold", type=float, default=0.25, help="end-effector z error threshold [m] (eval site: 0.25)")
+  p.add_argument("--ee_threshold", type=float, default=None, help="end-effector z error threshold [m] (default 0.25 = eval site)")
   p.add_argument("--wm_batches", type=int, default=10)
   p.add_argument("--wm_windows", type=int, default=2048)
   p.add_argument("--wm_k", type=int, default=8)
@@ -81,7 +116,7 @@ def main():
   p.add_argument("--no_eval", action="store_true")
   p.add_argument("--resume", type=str, default=None)
   p.add_argument("--no_watchdog", action="store_true", help="disable the collapse watchdog (auto-rollback + LR halving)")
-  p.add_argument("--wd_drop", type=float, default=0.08)
+  p.add_argument("--wd_drop", type=float, default=0.2)
   p.add_argument("--wd_force_at", type=int, default=-1, help="debug: force one rollback at this iteration")
   p.add_argument("--wd_nf_patience", type=int, default=100, help="consecutive non-finite iterations (skipped updates) before a rollback")
   p.add_argument("--wd_early_ckpt", type=int, default=500, help="early checkpoint / rollback point at this iteration if none exists (0 = off)")
@@ -98,6 +133,10 @@ def main():
   p.add_argument("--sampler_clamp_returns", action="store_true",
                  help="clamp reset-sampler bin returns to [0, g_max] (EMA input, sampled G, bin_G loaded on resume / rollback)")
   args = p.parse_args()
+  if args.motion_list and (args.motion_dirs or args.blacklist or args.name_exclude or args.max_motions):
+    p.error("--motion_list replaces --motion_dirs / --blacklist / --name_exclude / --max_motions (give one or the other)")
+  if not args.motion_list and not args.motion_dirs:
+    p.error("--motion_dirs or --motion_list is required")
 
   if args.num_threads > 0:
     # Before torch / numpy spin up their pools (they are imported below). Pool workers inherit the env.
@@ -107,6 +146,12 @@ def main():
 
     torch.set_num_threads(args.num_threads)
     print(f"[train] num_threads={args.num_threads} (torch.get_num_threads()={torch.get_num_threads()})")
+  from supermimic.heads import ee_flags  # imports torch: after the thread env above
+
+  try:
+    ee_on, ee_thr = ee_flags(args.ee_term_z, args.ee_termination, args.ee_threshold)
+  except ValueError as e:
+    p.error(str(e))
   if args.eval_clip_names:
     args.eval_clip_names = os.path.abspath(os.path.expanduser(args.eval_clip_names))
     assert os.path.isfile(args.eval_clip_names), f"--eval_clip_names {args.eval_clip_names} not found"
@@ -118,15 +163,14 @@ def main():
   args.device = dctx.device
 
   from supermimic.heads import HeadsCfg
-  from supermimic.motions import collect_motion_files
   from supermimic.trainer import TrainCfg, Trainer
   from supermimic.world_model import WorldModelCfg
 
   # Rank 0 resolves the file list and the run directory; the others take them verbatim (the cache key
-  # is the exact ordered path list, and every rank must log into the same directory).
+  # is the exact ordered path list, and every rank must log into the same directory). The reset sampler's
+  # source / name prior is built per rank from this same list (checked equal across ranks at start).
   if dctx.is_main:
-    files = collect_motion_files(args.motion_dirs, args.blacklist, args.name_exclude, args.max_motions)
-    assert files, "no motion files found"
+    files = motion_files_from_args(args)
     print(f"[train] {len(files)} motion files")
     log_dir = os.path.join(args.log_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_" + args.run_name)
   else:
@@ -136,6 +180,9 @@ def main():
   cfg = TrainCfg(
     motion_files=files,
     robot=args.robot,
+    robot_variant=args.robot_variant,
+    source_weights=tuple((kv.split("=")[0], float(kv.split("=")[1])) for kv in args.source_weights.split(",") if kv),
+    name_weights=tuple((kv.split("=")[0], float(kv.split("=")[1])) for kv in args.name_weights.split(",") if kv),
     num_envs=args.num_envs,
     device=args.device,
     seed=args.seed,
@@ -172,7 +219,7 @@ def main():
     param_check_interval=args.param_check_interval,
     dist_timeout_min=args.dist_timeout_min,
     wm=WorldModelCfg(k=args.wm_k, lr=lr, batches_per_update=args.wm_batches, windows_per_batch=args.wm_windows),
-    heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos, ee_termination=args.ee_termination, ee_term_z=args.ee_threshold),
+    heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos, ee_termination=ee_on, ee_term_z=ee_thr),
   )
   os.makedirs(log_dir, exist_ok=True)
   if dctx.is_main:

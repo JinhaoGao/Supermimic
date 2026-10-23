@@ -51,6 +51,7 @@ def stand_in(patience: int = 5, healthy_ckpt: str | None = None) -> Trainer:
   t._set_lr_scale = lambda s: None
   t.lr_scale = 1.0
   t.writer = types.SimpleNamespace(add_scalar=lambda *a, **k: None)
+  t.buffer = types.SimpleNamespace(size=77)  # replay stand-in (a rollback empties it, master e57be5b)
   t.opt_pi = torch.optim.Adam(t.policy.parameters(), lr=1e-3)
   return t
 
@@ -105,6 +106,7 @@ def test_patience_then_rollback(tmp_path=None):
     assert not any(rb) and not t.loads
     rb = run(t, [float("nan")])
     assert rb == [True] and t.loads == [(f.name, True)] and t.wd_rollbacks == 1 and t.wd_nf_streak == 0
+    assert t.buffer.size == 0
     # after the rollback a new streak needs the full patience again
     assert not any(run(t, [float("nan")] * 4)) and t.wd_rollbacks == 1
 

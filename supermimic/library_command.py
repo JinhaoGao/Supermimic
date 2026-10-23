@@ -30,6 +30,44 @@ if TYPE_CHECKING:
 LIBRARY_REGISTRY: dict[str, MotionLibrary] = {}
 
 
+@torch.no_grad()
+def reset_prior(clip_names, bin_clip: torch.Tensor, source_weights=(), name_weights=(), device=None, log=print):
+  """Prior of the uniform share of the reset distribution over bins (master 276c942 / b131dc0), or None (uniform).
+
+  Source prior: clip "<robot>__<source>_..." gets the weight of its longest matching source prefix (default 1); the
+  team's own sources are <1% of the bins. Name keywords (case-insensitive substring, e.g. crawl / getup): a skill
+  quota across sources (ground work is spread over sonic / motiondecode / hiphi / g1_all). A clip gets the larger of
+  its source and keyword weights; a bin the weight of its clip, normalized over all bins."""
+  if not source_weights and not name_weights:
+    return None
+  device = bin_clip.device if device is None else device
+  kws = sorted(((str(k), float(v)) for k, v in source_weights), key=lambda kv: -len(kv[0]))
+  nws = [(str(k).lower(), float(v)) for k, v in name_weights]
+
+  def src_weight(name: str) -> tuple[str, float]:
+    src = name.split("__", 1)[-1]
+    for k, v in kws:
+      if src == k or src.startswith(k + "_"):
+        return k, v
+    return "", 1.0
+
+  tags = [src_weight(n) for n in clip_names]
+  name_w = [max([v for k, v in nws if k in n.lower()], default=1.0) for n in clip_names]
+  w_clip = torch.tensor([max(w, nw) for (_, w), nw in zip(tags, name_w)], dtype=torch.float32, device=device)
+  prior = w_clip[bin_clip]
+  bin_prior = prior / prior.sum()
+  tag_of_bin = [tags[i][0] for i in bin_clip.tolist()]
+  for k, v in kws:
+    mask = torch.tensor([t == k for t in tag_of_bin], device=device)
+    log(f"[LibraryMotionCommand] source {k!r} x{v:g}: {mask.float().mean().item() * 100:.2f}% of bins -> "
+        f"{bin_prior[mask].sum().item() * 100:.2f}% of the uniform share")
+  if nws:
+    hit = torch.tensor([nw > 1.0 for nw in name_w], device=device)[bin_clip]
+    log(f"[LibraryMotionCommand] name keywords {nws}: {int(sum(nw > 1.0 for nw in name_w))} clips, "
+        f"{hit.float().mean().item() * 100:.2f}% of bins -> {bin_prior[hit].sum().item() * 100:.2f}% of the uniform share")
+  return bin_prior
+
+
 class LibraryMotionCommand(MotionCommand):
   cfg: "LibraryMotionCommandCfg"
 
@@ -75,6 +113,11 @@ class LibraryMotionCommand(MotionCommand):
     self.bin_G = torch.zeros(NB, device=self.device)
     self.bin_visits = torch.zeros(NB, device=self.device)
     self.bin_weight_hist = torch.full((NB,), 1.0 / NB, device=self.device)
+    # Source / name prior for the uniform share of the reset distribution (v2, see reset_prior); None = uniform.
+    # A pure function of the clip list and the cfg: every DDP rank builds the same one (Trainer checks it).
+    self.bin_prior: torch.Tensor | None = reset_prior(
+      [c.name for c in lib.clips], lib.bin_clip, cfg.source_weights, cfg.name_weights, self.device
+    )
     # Sequential clip assignment for "start" (evaluation) mode.
     ec = cfg.eval_clips if cfg.eval_clips else tuple(range(lib.num_clips))
     self.eval_clips = torch.tensor(ec, dtype=torch.long, device=self.device)
@@ -184,7 +227,8 @@ class LibraryMotionCommand(MotionCommand):
   def sampling_probabilities(self) -> torch.Tensor:
     c = self.cfg
     NB = self.library.num_bins
-    uniform = torch.full((NB,), 1.0 / NB, device=self.device)
+    # The source / name prior reshapes only the uniform share; clamp_returns acts only on the softmax's G.
+    uniform = self.bin_prior if self.bin_prior is not None else torch.full((NB,), 1.0 / NB, device=self.device)
     bin_G = self.bin_G.clamp(0.0, c.g_max) if c.clamp_returns else self.bin_G
     G = torch.where(self.bin_visits > 0, bin_G, torch.full_like(self.bin_G, c.g_max * 0.5))
     soft = torch.softmax(-c.softmax_temp * G / c.g_max, dim=0)
@@ -283,6 +327,8 @@ class LibraryMotionCommandCfg(MotionCommandCfg):
   return_ema: float = 0.05
   clamp_returns: bool = False  # bin returns (EMA input, sampled G, loaded bin_G) clamped to [0, g_max]; off = paper
   weight_ema: float = 0.01
+  source_weights: tuple = ()  # ((source prefix, weight), ...): prior of the uniform share, see LibraryMotionCommand
+  name_weights: tuple = ()  # ((name keyword, weight), ...): max with the source weight (case-insensitive substring)
   sampling_mode: Literal["return", "uniform", "start"] = "return"  # type: ignore[assignment]
   cache_dir: str = ""
   num_workers: int = 32

@@ -19,6 +19,9 @@ the paper): self-collision penalty removed, joint-limit weight -2. The paper
 also drops BeyondMimic's end-effector termination; ``HeadsCfg.ee_termination``
 (default on) restores it on both sides: the simulator's ``ee_body_pos`` term
 (env_cfg) and a matching soft term in the imagined termination head below.
+master's v2 spelling of the same switch (``ee_term_z``, 0 = off, temperature
+``ee_term_temp``) is accepted by ``ee_flags`` (CLI) and ``HeadsCfg.from_dict``
+(checkpoint cfgs); it is the same criterion, see ``HeadsCfg``.
 """
 
 from __future__ import annotations
@@ -75,16 +78,66 @@ class HeadsCfg:
   # fail when any end-effector body (G1: ankle_roll / wrist_yaw links, E2: ankle_roll / elbow links; names
   # from the robot's tracking env cfg) is more than ee_term_z away from the reference in height (z only).
   # Off = the paper's recipe, bitwise identical to the code before the switch existed.
+  # master (v2, e57be5b) spells the same criterion ee_term_z alone (0 = off, the default there) with the
+  # temperature ee_term_temp; same bodies, threshold, temperature and noisy-OR soft term. Its checkpoint cfgs
+  # load through from_dict, its CLI flag through ee_flags. Default here: ON at 0.25 m (the eval site's test).
   ee_termination: bool = True
   ee_term_z: float = 0.25
   ee_term_z_temp: float = 0.02  # same sigmoid temperature as the anchor-height term
   extra: dict = field(default_factory=dict)
+
+  def __post_init__(self):
+    if self.ee_termination and not self.ee_term_z > 0:
+      raise ValueError(f"ee_termination needs a threshold ee_term_z > 0 (got {self.ee_term_z}); off: ee_termination=False")
+
+  @classmethod
+  def from_dict(cls, d: dict) -> "HeadsCfg":
+    """HeadsCfg from a checkpoint's cfg["heads"] written by any branch:
+
+    * ddp-bj31 (01c4d58 on): ee_termination / ee_term_z / ee_term_z_temp, taken as they are;
+    * master v2 (e57be5b on, e.g. bj27 g1v2_scratch): ee_term_z (> 0 = on, 0 = off) / ee_term_temp;
+    * before either (v1, paper recipe): no end-effector key -> off.
+    When off, a non-positive ee_term_z is replaced by the default threshold (only used if switched on later)."""
+    d = dict(d)
+    if "ee_term_temp" in d:  # master v2 name of the soft-term temperature
+      t = d.pop("ee_term_temp")
+      d.setdefault("ee_term_z_temp", t)
+    if "ee_termination" not in d:  # master v2 (switch = threshold > 0) or v1 (no key: off)
+      d["ee_termination"] = float(d.get("ee_term_z", 0.0)) > 0
+    if not d["ee_termination"] and not float(d.get("ee_term_z", 0.0)) > 0:
+      d["ee_term_z"] = cls.ee_term_z
+    return cls(**d)
 
   @property
   def reward_max_per_step(self) -> float:
     return (
       self.w_body_pos + self.w_body_ori + self.w_body_lin_vel + self.w_body_ang_vel + self.w_root_pos + self.w_root_ori
     ) * self.dt
+
+
+def ee_flags(ee_term_z: float | None = None, ee_termination: bool | None = None, ee_threshold: float | None = None,
+             default: tuple[bool, float] = (True, 0.25)) -> tuple[bool, float]:
+  """(ee_termination, ee_term_z) from the two CLI spellings of the end-effector termination.
+
+  ee_term_z: master's v2 flag (--ee_term_z Z: Z > 0 = on with threshold Z, 0 = off = paper recipe);
+  ee_termination / ee_threshold: this branch's --ee_termination | --no_ee_termination and --ee_threshold.
+  None = not given; nothing given -> default. Both spellings together must agree, else ValueError."""
+  if ee_term_z is not None:
+    z = float(ee_term_z)
+    if not z >= 0:
+      raise ValueError(f"--ee_term_z must be >= 0 (0 = off), got {ee_term_z}")
+    on = z > 0
+    if ee_termination is not None and bool(ee_termination) != on:
+      raise ValueError(f"--ee_term_z {z:g} ({'on' if on else 'off'}) contradicts --{'' if ee_termination else 'no_'}ee_termination")
+    if on and ee_threshold is not None and abs(float(ee_threshold) - z) > 1e-12:
+      raise ValueError(f"--ee_term_z {z:g} contradicts --ee_threshold {ee_threshold:g}")
+    thr = z if on else (float(ee_threshold) if ee_threshold is not None else default[1])
+    return on, thr
+  on = default[0] if ee_termination is None else bool(ee_termination)
+  thr = default[1] if ee_threshold is None else float(ee_threshold)
+  if on and not thr > 0:
+    raise ValueError(f"--ee_threshold must be > 0, got {thr}")
+  return on, thr
 
 
 def window_frames(frame: torch.Tensor, clip_end: torch.Tensor, K: int) -> torch.Tensor:
@@ -239,7 +292,9 @@ class AnalyticHeads:
     the soft termination is the noisy-OR 1 - prod_i (1 - p_i) over anchor height, anchor tilt and (optional)
     every end-effector height error, and the hard one is the OR of the tests (= the soft one as temp -> 0).
     The end-effector height error |ref_z - z| equals mjlab's ``bad_motion_body_pos_z_only``: its re-anchored
-    reference (``body_pos_relative_w``) only shifts xy and rotates about z, so its z is the raw reference z."""
+    reference (``body_pos_relative_w``) only shifts xy and rotates about z, so its z is the raw reference z.
+    (master's v2 version of this function takes (kin_next, ref_bp, ref_bq) and slices the anchor itself; the
+    numbers are the same.)"""
     c = self.cfg
     B = ref_ap.shape[0]
     g = self.gravity.expand(B, 3)

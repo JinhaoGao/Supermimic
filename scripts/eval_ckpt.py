@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import random
@@ -28,10 +29,13 @@ def main():
   p.add_argument("--ee_termination", choices=["ckpt", "on", "off"], default="ckpt",
                  help="count end-effector height failures (eval-site protocol); ckpt = as trained (off for checkpoints older than the switch)")
   p.add_argument("--ee_threshold", type=float, default=None, help="end-effector z threshold (default: the checkpoint's, else 0.25)")
+  p.add_argument("--ee_term_z", type=float, default=None,
+                 help="master's v2 spelling: override the end-effector height termination (m, 0 = off); default: the run's")
+  p.add_argument("--robot_variant", type=str, default=None, help="override the robot model variant; default: the run's")
   args = p.parse_args()
 
   from supermimic.evaluate import Evaluator
-  from supermimic.heads import HeadsCfg
+  from supermimic.heads import HeadsCfg, ee_flags
   from supermimic.motions import read_name_list, resolve_clip_names
   from supermimic.policy import Policy
 
@@ -41,12 +45,18 @@ def main():
   d = ck["dims"]
   hk = {k: v for k, v in cfg["heads"].items() if k != "extra"}
   hk["goal_anchor_pos"] = d["goal_frame"] == 2 * d["nj"] + 9
-  hk.setdefault("ee_termination", False)  # checkpoints from before the switch were trained without it
-  if args.ee_termination != "ckpt":
-    hk["ee_termination"] = args.ee_termination == "on"
-  if args.ee_threshold is not None:
-    hk["ee_term_z"] = args.ee_threshold
-  heads_cfg = HeadsCfg(**hk)
+  # Any branch's checkpoint (ddp-bj31 ee_termination / master v2 ee_term_z / v1 without: off); then the overrides,
+  # e.g. score a v1 checkpoint under the eval site's end-effector termination (--ee_termination on / --ee_term_z 0.25).
+  heads_cfg = HeadsCfg.from_dict(hk)
+  try:
+    ee_on, ee_thr = ee_flags(
+      args.ee_term_z, None if args.ee_termination == "ckpt" else args.ee_termination == "on", args.ee_threshold,
+      default=(heads_cfg.ee_termination, heads_cfg.ee_term_z),
+    )
+  except ValueError as e:
+    p.error(str(e))
+  heads_cfg = dataclasses.replace(heads_cfg, ee_termination=ee_on, ee_term_z=ee_thr)
+  print(f"[eval_ckpt] end-effector termination: " + (f"on, z error > {ee_thr:g}" if ee_on else "off"))
   policy = Policy(d["proprio"], d["hist"], d["goal_frame"], d["K"], d["nj"]).to(args.device)
   policy.load_state_dict(ck["policy"])
   names_txt = args.eval_clip_names
@@ -64,6 +74,7 @@ def main():
   ev = Evaluator(
     files, heads_cfg, args.device, eval_clips=eval_clips, num_clips_total=len(files), max_envs=args.eval_envs,
     compile_=not args.no_compile, cache_dir=cfg.get("cache_dir", ""), robot=cfg.get("robot", "g1"),
+    robot_variant=args.robot_variant if args.robot_variant is not None else cfg.get("robot_variant", ""),
   )
   if names_txt:
     got = [ev.lib.clips[i].name for i in ev.eval_clips]

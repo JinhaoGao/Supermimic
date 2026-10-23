@@ -24,6 +24,7 @@ def main():
   p.add_argument("--device", type=str, default="cuda:0")
   p.add_argument("--cache_dir", type=str, default="")
   p.add_argument("--no_ee_termination", action="store_true", help="check the paper recipe (no end-effector termination)")
+  p.add_argument("--robot_variant", type=str, default="", help="robot model variant, e.g. g1 eval+evalcontact (env_cfg.base_tracking_cfg)")
   args = p.parse_args()
 
   from mjlab.envs import ManagerBasedRlEnv
@@ -36,7 +37,7 @@ def main():
 
   files = collect_motion_files(args.motion_dirs, max_motions=8)
   hcfg = HeadsCfg(ee_termination=not args.no_ee_termination)
-  env_cfg = make_env_cfg(files, args.num_envs, mode="train", robot=args.robot, cache_dir=args.cache_dir, ee_termination=hcfg.ee_termination, ee_threshold=hcfg.ee_term_z)
+  env_cfg = make_env_cfg(files, args.num_envs, mode="train", robot=args.robot, cache_dir=args.cache_dir, ee_termination=hcfg.ee_termination, ee_threshold=hcfg.ee_term_z, robot_variant=args.robot_variant)
   env = ManagerBasedRlEnv(cfg=env_cfg, device=args.device)
   sim = SimInterface(env, hcfg)
   heads, cmd, robot = sim.heads, sim.cmd, sim.robot

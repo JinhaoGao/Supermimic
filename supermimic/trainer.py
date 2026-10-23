@@ -55,6 +55,9 @@ from .world_model import DynamicsModel, WorldModelCfg
 class TrainCfg:
   motion_files: list[str] = field(default_factory=list)
   robot: str = "g1"
+  robot_variant: str = ""  # see env_cfg.base_tracking_cfg (g1: eval; e2: nodamp)
+  source_weights: tuple = ()  # ((source prefix, weight), ...) prior of the reset sampler's uniform share
+  name_weights: tuple = ()  # ((name keyword, weight), ...) max with it (skill quotas, e.g. crawl / getup)
   num_envs: int = 4096
   device: str = "cuda:0"
   seed: int = 0
@@ -96,7 +99,10 @@ class TrainCfg:
   # Watchdog: roll back to the last healthy checkpoint when imagination collapses (see _watchdog).
   wd_enabled: bool = True
   wd_ema: float = 0.02  # EMA rate of the imagined reward (normalized)
-  wd_drop: float = 0.08  # trigger when EMA < best EMA of the last wd_window iterations - wd_drop
+  # Trigger when EMA < best EMA of the last wd_window iterations - wd_drop. 0.08 (v1) misfired on the G1 full-atlas
+  # resume: the return-based sampler drifts to harder bins and the imagined reward slides by ~0.08 without any
+  # collapse (evals stayed 0.855-0.874); the real collapse at 41k dropped it by 0.5.
+  wd_drop: float = 0.2
   wd_window: int = 4000
   wd_vloss_ratio: float = 50.0  # or when median critic loss of the last 50 its > ratio * median of the last 2000
   wd_warmup: int = 500  # iterations after start / resume / rollback before the watchdog may trigger
@@ -173,6 +179,7 @@ class Trainer:
       cfg.motion_files, cfg.num_envs, mode="train", episode_length_s=cfg.episode_length_s, robot=cfg.robot,
       library_key=self.LIB_KEY, cache_dir=cfg.cache_dir, num_workers=cfg.num_workers,
       ee_termination=cfg.heads.ee_termination, ee_threshold=cfg.heads.ee_term_z, clamp_returns=cfg.sampler_clamp_returns,
+      robot_variant=cfg.robot_variant, source_weights=cfg.source_weights, name_weights=cfg.name_weights,
     )
     env_cfg.seed = seed
     # Rank 0 builds the env first (and the packed motion cache if it is missing); the others wait so that
@@ -227,7 +234,14 @@ class Trainer:
       "[Trainer] end-effector termination: "
       +(f"on, z error > {hc.ee_term_z} on {list(self.sim.ee_body_names)} (soft temp {hc.ee_term_z_temp})" if hc.ee_termination else "off (paper recipe)")
     )
+    try:  # the robot variant actually built (G1 eval: 35.11 kg, mjlab's G1: 33.34 kg)
+      mass = f"{float(self.env.sim.mj_model.body_mass.sum()):.2f} kg"
+    except Exception:  # noqa: BLE001
+      mass = "?"
+    self._print(f"[Trainer] robot {cfg.robot} variant {cfg.robot_variant or '(default)'}: model mass {mass}")
     mc = self.cmd.cfg
+    if mc.source_weights or mc.name_weights:
+      self._print(f"[Trainer] reset sampler prior: source_weights {list(mc.source_weights)} name_weights {list(mc.name_weights)}")
     self._print("[Trainer] reset sampler: bin returns " + (f"clamped to [0, {mc.g_max:g}]" if mc.clamp_returns else "unclamped (paper recipe)"))
     if dctx.enabled:
       self._print(
@@ -628,6 +642,10 @@ class Trainer:
       raise RuntimeError(f"[watchdog] {self.wd_rollbacks} rollbacks already; giving up ({reason})")
     it_before = self.it
     self.load(path, rollback=True)  # models, normalizers, optimizers, sampler bins, iteration counter
+    # Forget the replay written since the checkpoint (collapsed policy): windows / imagination starts are drawn
+    # by age < size, so size 0 restricts them to fresh data; the train loop refills the warm-up first. v1 kept it,
+    # and every reload re-measured the imagined reward on the collapsed states.
+    self.buffer.size = 0
     self._set_lr_scale(self.lr_scale * cfg.wd_lr_factor)
     self.wd_rollbacks += 1
     self.wd_reward_ema = None
@@ -651,7 +669,7 @@ class Trainer:
       self.evaluator = Evaluator(
         self.cfg.motion_files, self.cfg.heads, self.device, library_key=self.LIB_KEY, eval_clips=self.eval_clip_ids,
         num_clips_total=self.lib.num_clips, max_envs=self.cfg.eval_envs, compile_=self.cfg.compile, cache_dir=self.cfg.cache_dir,
-        robot=self.cfg.robot,
+        robot=self.cfg.robot, robot_variant=self.cfg.robot_variant,
       )
     return self.evaluator.run(self.policy)
 
@@ -716,6 +734,8 @@ class Trainer:
       "opt_pi": opt(self.opt_pi),
       "opt_v": opt(self.opt_v),
       "sampler": [c.bin_G, c.bin_visits, c.bin_weight_hist],  # only checked right after a merge
+      # Reset-sampler prior (--source_weights / --name_weights; constant): built per rank from the broadcast file list.
+      "sampler_prior": [c.bin_prior if c.bin_prior is not None else "uniform"],
       "counters": [self.it, self.env_steps],
     }
 

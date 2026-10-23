@@ -113,14 +113,39 @@ Isolated headless closed loop (original `scene_29dof.xml`, iteration 32000): gan
 online gangnam 29 s, no falls, joint mean abs error 0.12 / 0.10 / 0.11 rad; controller inputs/outputs match an
 independent Python recomputation to ≤ 5e-8.
 
+## Team MuJoCo benchmark (NOetix_GMT_eval on bj31, MotionAtlas v4 official)
+
+The eval site runs SuperMimic exports as `policy_type: supermimic` (profiles `supermimic_g1_v1`, `e2_supermimic_v1`;
+evaluator plugin and site patch in `eval_site/`). Export: `export_bundle.py` (now writes `joint_stiffness`,
+`joint_damping` = actuator kd + passive joint damping, `joint_armature`) then `export_eval_onnx.py` (metric `body_names`:
+the benchmark's usual 14 bodies). The evaluator inputs match an independent recomputation to 2e-7 (`eval_site/golden_check.py`).
+
+| policy | v4 success | progress | MPJPE rad | MPKPE mm | rank | failures by end-effector height |
+| --- | --- | --- | --- | --- | --- | --- |
+| G1 `g1_atlas_v1` model_32000 | 67.80% | 79.71% | 0.0847 | 15.27 | 144 / 168 | 913 of 1009 |
+| G1 leader (GMT v2 cluster 112500) | 91.42% | 94.88% | 0.0853 | 11.46 | 1 | |
+| E2 `e2_atlas_v1r` model_68000 | 64.31% | 77.50% | 0.0809 | 14.80 | 226 / 272 | 1094 of 1242 |
+| E2 leader (GMT e2hdc8 C5 185500) | 90.95% | 94.82% | 0.0802 | 13.34 | 1 | |
+
+Joint tracking is on par with the best GMT policies, but the official protocol terminates when an ankle / wrist (G1) or
+ankle / elbow (E2) is more than 0.25 m off in height, and SuperMimic's recipe (paper) has no end-effector termination,
+so large leg raises and arm swings are tracked loosely (reproduced in the training model too, `eval_site/trace_train_sim.py`).
+Turning that check off on a 96-clip subset: G1 69.8% -> 83.3%, E2 55.2% -> 78.1%. The gap concentrates on sources that are
+<1% of the training clips (noetix_kungfu 12% vs 64%, sportsmeeting 10% vs 61%, kungfu_dance_show 31% vs 99%, long lafan1
+clips 15% vs 63%; G1, ours vs leader). Contact settings (self-collision on, friction 0.5 in the eval models) cost E2 ~5
+points and G1 none. Model mismatches: E2 was trained with passive damping = kd on every joint (twice the actuator damping;
+the eval export reproduces it), G1 on mjlab's 33.3 kg model while the eval / deploy model is the original 35.1 kg (torso +1.8 kg).
+
 ## Training stability (watchdog)
 
 The first G1 full-atlas run collapsed at ~41k iterations (imagined reward 0.91 → 0.4 within ~400 iterations,
 critic loss ×5000, then NaN in the reset sampler and a CUDA assert). The trainer now uses a Huber critic loss with
 clipped value targets, drops non-finite returns in the sampler, and runs a watchdog: if the imagined-reward EMA
-falls 0.08 below its recent best (or the critic-loss median jumps 50×) it reloads the last healthy checkpoint and
-halves the learning rates (`--no_watchdog`, `--wd_drop`, `--wd_force_at` for tests). G1 was resumed from 40000
-with LR 1e-4 (`g1_atlas_v1r`), E2 from 86000 (`e2_atlas_v1w`).
+falls `--wd_drop` below its recent best (or the critic-loss median jumps 50×) it reloads the last healthy checkpoint,
+empties the replay buffer (the collapsed policy's data; refilled by the warm-up) and halves the learning rates
+(`--no_watchdog`, `--wd_force_at` for tests). `--wd_drop` is 0.2 since master e57be5b (0.08 misfired when the
+return-based sampler drifted to harder bins). G1 was resumed from 40000 with LR 1e-4 (`g1_atlas_v1r`), E2 from 86000
+(`e2_atlas_v1w`).
 
 NaN guard (2026-10-22, after the 8-GPU smoke went non-finite at iteration 118 and then rolled back six times to a
 checkpoint that already held NaN weights): every module update checks the gradient after the all-reduce; a
@@ -140,6 +165,31 @@ by default (`--no_ee_termination` = paper recipe, bitwise identical to the code 
 ankle_roll + wrist_yaw links, E2: ankle_roll + elbow links) is more than the threshold off the reference in height,
 the imagined termination head gets the matching soft term (sigmoid, temperature 0.02, noisy-OR with the anchor
 terms), and the in-training benchmark counts it as a failure (`failed_ee` = end-effector-only failures).
+
+master (v2, e57be5b) added the same criterion independently as `--ee_term_z Z` (0 = off, the default there). The
+merge (branch `ddp-bj31-v2`) keeps one implementation (this one) and accepts both spellings: `--ee_term_z Z` =
+`--ee_termination --ee_threshold Z` for Z > 0 and `--no_ee_termination` for Z = 0; mixing them is an error unless they
+agree. Bodies (the env term's), threshold, temperature (0.02) and soft term are identical in both versions (bitwise,
+`tests/test_v2_merge.py`) and match the eval site (`--termination-bodies` ankle_roll + wrist_yaw / elbow,
+`--body-pos-threshold 0.25 --body-pos-mode z`). Only the default differs: no flag = **on** here, off on master.
+Checkpoint cfgs of every branch load through `HeadsCfg.from_dict` (`eval_ckpt.py`: as trained, or `--ee_termination
+on|off` / `--ee_term_z`).
+
+## v2 options from master (robot variants, reset-sampler prior) under data parallel
+
+* `--robot_variant` (`+`-joined): G1 `eval` = the team's eval / deploy model (35.11 kg, waist / torso inertials,
+  passive damping 0.05, friction 0.1 / 0.2; `supermimic/robots/g1_eval_model.py`), G1 / E2 `evalcontact` (condim 3 on
+  every collision geom; E2 also self-collision, friction 0.5), E2 `nodamp`. Pure functions of the cfg: every rank builds
+  the same model (the FK of the heads reads it from the compiled model).
+* `--source_weights src=w,...` / `--name_weights keyword=w,...`: prior of the uniform share of the reset sampler
+  (`library_command.reset_prior`; clip `<robot>__<source>_...`, longest prefix wins; a clip gets max(source, keyword)
+  weight). Built per rank from the broadcast file list; the start-up / periodic state check hashes it with the rest of
+  the learned state (`sampler_prior`), so a rank with another prior stops the run. The merge of the per-rank samplers is
+  unchanged (the prior is constant and shared; it never enters bin_G / bin_visits); with `--sampler_clamp_returns` the
+  clamp acts on the softmax's returns only, the prior on the uniform share only.
+* `--motion_list` (a run's `motion_files.txt`) replaces `--motion_dirs` / `--blacklist`; rank 0 reads it and
+  broadcasts it like the directory scan. A list of paths from another machine fails fast (all files missing).
+* `scripts/launch_bj31_v2.example.sh`: the bj27 `g1v2_scratch` recipe (87.01% v4 at 86000) per rank on bj31's 8 GPUs.
 
 ## Layout
 
@@ -165,6 +215,10 @@ terms), and the in-training benchmark counts it as a failure (`failed_ee` = end-
 | `supermimic/distributed.py` | torchrun data parallel: gradient / normalizer / sampler sync, cross-rank state check |
 | `scripts/launch_bj31_ddp.sh`, `scripts/stop_bj31_ddp.sh` | detached 8-GPU torchrun launcher / stopper (bj31) |
 | `tests/test_ddp_sync.py` | multi-process (CPU / gloo) checks of the sync helpers |
+| `tests/test_v2_merge.py` | master's v2 options on this branch: one EE termination (== master's, bitwise), flag / checkpoint mapping, prior (== master's) under DDP, CLI wiring |
+| `supermimic/robots/g1_eval_model.py` | G1 `eval` / `evalcontact` robot variants (team eval / deploy model) |
+| `scripts/export_eval_onnx.py`, `eval_site/` | export for and analysis of the team's MuJoCo benchmark |
+| `scripts/launch_bj31_v2.example.sh` | example (not run): v2 recipe on bj31, 8 GPUs + `--sampler_clamp_returns` |
 
 ## Setup and run
 

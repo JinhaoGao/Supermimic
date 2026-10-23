@@ -93,6 +93,18 @@ COLLISION_WITHOUT_SELF = CollisionCfg(
   friction={r"^(l|r)_foot_collision$": (0.6,)},
 )
 
+# The team's E2 eval model (E2_V1.0_0805_02_eval.xml): every collision mesh collides with everything, incl. the
+# robot itself (MuJoCo drops parent-child pairs), condim 3, friction 0.5 (floor 0.5 too). Priority 1 makes the
+# robot's 0.5 win against the 1.0 training terrain; the per-episode foot-friction DR still applies on top.
+EVAL_CONTACT_COLLISION = CollisionCfg(
+  geom_names_expr=(".*_collision",),
+  contype=1,
+  conaffinity=1,
+  condim=3,
+  priority=1,
+  friction=(0.5,),
+)
+
 E2_ARTICULATION = EntityArticulationInfoCfg(actuators=E2_ACTUATORS, soft_joint_pos_limit_factor=1.0)
 
 

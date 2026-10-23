@@ -152,11 +152,12 @@ def sampling_probabilities_before(self) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def make_cmd(NB: int, clamp: bool, G: torch.Tensor | None = None, V: torch.Tensor | None = None, **cfg_kw):
+def make_cmd(NB: int, clamp: bool, G: torch.Tensor | None = None, V: torch.Tensor | None = None, prior: torch.Tensor | None = None, **cfg_kw):
   cmd = types.SimpleNamespace(
     library=types.SimpleNamespace(num_bins=NB), cfg=types.SimpleNamespace(**{**DEFAULTS, "clamp_returns": clamp, **cfg_kw}),
     device="cpu", bin_G=torch.zeros(NB) if G is None else G.clone(), bin_visits=torch.zeros(NB) if V is None else V.clone(),
     bin_weight_hist=torch.full((NB,), 1.0 / NB),
+    bin_prior=prior,  # --source_weights / --name_weights prior of the uniform share (None = uniform, as before)
   )
   for name in ("update_bin_returns", "sampling_probabilities", "clamp_bin_returns_"):
     setattr(cmd, name, types.MethodType(getattr(LibraryMotionCommand, name), cmd))
@@ -184,6 +185,7 @@ def make_trainer(log_dir: str, NB: int, clamp: bool, dist: DistCtx | None = None
   t.it, t.env_steps = 0, 0
   t.cmd = make_cmd(NB, clamp)
   t.writer = types.SimpleNamespace(add_scalar=lambda *a, **k: None)
+  t.buffer = types.SimpleNamespace(size=123)  # replay stand-in (the watchdog rollback empties it)
   t.wd_healthy_ckpt, t.wd_quiet_until, t.wd_rollbacks, t.wd_reward_ema, t.wd_nf_streak = None, 0, 0, None, 0
   t.wd_hist, t.wd_vloss = deque(), deque(maxlen=2000)
   return t
@@ -353,6 +355,7 @@ def test_load_clamps_checkpoint_state():
     on.it, on.wd_healthy_ckpt = 61000, path
     assert Trainer._rollback(on, "test") is True
     assert on.it == 60000 and on.wd_rollbacks == 1 and torch.equal(on.cmd.bin_G, G.clamp(0.0, G_MAX))
+    assert on.buffer.size == 0, "rollback forgets the replay of the collapsed policy (master e57be5b)"
     msgs = clamp_msgs(on)
     print(f"  rollback: {msgs[-1]}")
     assert len(msgs) == 2 and msgs[1] == msgs[0]
@@ -467,7 +470,7 @@ class _Probe(Exception):
   pass
 
 
-def _fake_base_cfg(robot: str):
+def _fake_base_cfg(robot: str, variant: str = ""):
   ns = types.SimpleNamespace
   return ns(
     scene=ns(num_envs=0, sensors=("self_collision",)), auto_reset=True,

@@ -1,0 +1,39 @@
+schema_version: 1
+id: e2_supermimic_v1
+name: SuperMimic E2 (obs_hist 10x75 + goal 10x52, 无参考锚点位置)
+policy_family: e2_supermimic
+robot_id: e2_23dof_v1
+expected_input_dim: 1270
+expected_action_dim: 23
+packing_order: [obs_hist, goal]
+# SuperMimic(Liao 等 arXiv 2610.28480,可微世界模型 + BPTT)复现,仓库 ~/Workspace/supermimic(mjlab)。
+# 两个 ONNX 输入,名字同 group,喂原始值(归一化在图里);导出见该仓库 scripts/export_eval_onnx.py,
+# 评测器构造见 vendor/Noetix_GMT/scripts/eval_supermimic.py。goal 第 k 行 = 帧 t+k(t = 本拍评分帧,夹到片尾);
+# 朝向项 = rot6d(R_机器人锚点^T · R_参考锚点),锚点取 ONNX metadata anchor_body_name(E2 = waist_pitch_link)。
+# 动作 = default_joint_pos + action_scale · action(绝对 PD 目标);PD 增益 / armature 取 ONNX metadata。
+groups:
+  - name: obs_hist
+    frames: 10
+    frame_dim: 75
+    initialization: repeat_first
+    terms:
+      - {name: joint_pos_rel, dim: 23, unit: rad, frame: policy_joint_order}
+      - {name: joint_vel, dim: 23, unit: rad_s, frame: policy_joint_order}
+      - {name: base_ang_vel, dim: 3, unit: rad_s, frame: body}
+      - {name: projected_gravity, dim: 3, unit: unit_vector, frame: body}
+      - {name: previous_action, dim: 23, unit: normalized_action, frame: policy_joint_order}
+  - name: goal
+    frames: 10
+    frame_dim: 52
+    offsets: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    boundary: clamp
+    terms:
+      - {name: target_joint_pos, dim: 23, unit: rad, frame: policy_joint_order}
+      - {name: target_joint_vel, dim: 23, unit: rad_s, frame: policy_joint_order}
+      - {name: target_anchor_ori_b_rot6d, dim: 6, unit: rotation_6d, frame: robot_anchor}
+runner:
+  policy_type: supermimic
+  history_steps: 10
+  history_layout: frame_major
+  history_init: repeat_first
+  rotation_6d_layout: matrix_3x2_row_major
