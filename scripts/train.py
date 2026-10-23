@@ -93,6 +93,10 @@ def main():
   p.add_argument("--dist_timeout_min", type=float, default=120.0, help="process-group timeout; must exceed one evaluation on rank 0 (and a cache build)")
   p.add_argument("--sampler_sync_interval", type=int, default=0, help="iterations between reset-sampler merges across ranks (0 = --log_interval)")
   p.add_argument("--param_check_interval", type=int, default=1000, help="iterations between cross-rank learned-state hash checks (0 = start/end only)")
+  # Reset sampler: penalty-dominated clip-end bins reach G << 0 (r_last / (1 - gamma) bootstrap) and one of them takes
+  # the whole softmax share (g1_full_ee_ddp8, 2026-10-23). Off by default = paper / runs before the switch.
+  p.add_argument("--sampler_clamp_returns", action="store_true",
+                 help="clamp reset-sampler bin returns to [0, g_max] (EMA input, sampled G, bin_G loaded on resume / rollback)")
   args = p.parse_args()
 
   if args.num_threads > 0:
@@ -164,6 +168,7 @@ def main():
     world_size=dctx.world,
     base_lr_scale=args.lr_scale,
     sampler_sync_interval=args.sampler_sync_interval,
+    sampler_clamp_returns=args.sampler_clamp_returns,
     param_check_interval=args.param_check_interval,
     dist_timeout_min=args.dist_timeout_min,
     wm=WorldModelCfg(k=args.wm_k, lr=lr, batches_per_update=args.wm_batches, windows_per_batch=args.wm_windows),

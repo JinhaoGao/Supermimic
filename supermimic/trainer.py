@@ -66,6 +66,7 @@ class TrainCfg:
   action_noise_std: float = 0.1
   replay_capacity: int = 1000
   episode_length_s: float = 10.0
+  sampler_clamp_returns: bool = False  # reset sampler: bin returns clamped to [0, g_max] (LibraryMotionCommandCfg.clamp_returns)
   compile: bool = True
   compile_mode: str | None = None
   num_threads: int = 0  # torch intra-op CPU threads (0 = torch default); scripts/train.py also sets OMP_NUM_THREADS
@@ -171,7 +172,7 @@ class Trainer:
     env_cfg = make_env_cfg(
       cfg.motion_files, cfg.num_envs, mode="train", episode_length_s=cfg.episode_length_s, robot=cfg.robot,
       library_key=self.LIB_KEY, cache_dir=cfg.cache_dir, num_workers=cfg.num_workers,
-      ee_termination=cfg.heads.ee_termination, ee_threshold=cfg.heads.ee_term_z,
+      ee_termination=cfg.heads.ee_termination, ee_threshold=cfg.heads.ee_term_z, clamp_returns=cfg.sampler_clamp_returns,
     )
     env_cfg.seed = seed
     # Rank 0 builds the env first (and the packed motion cache if it is missing); the others wait so that
@@ -226,6 +227,8 @@ class Trainer:
       "[Trainer] end-effector termination: "
       +(f"on, z error > {hc.ee_term_z} on {list(self.sim.ee_body_names)} (soft temp {hc.ee_term_z_temp})" if hc.ee_termination else "off (paper recipe)")
     )
+    mc = self.cmd.cfg
+    self._print("[Trainer] reset sampler: bin returns " + (f"clamped to [0, {mc.g_max:g}]" if mc.clamp_returns else "unclamped (paper recipe)"))
     if dctx.enabled:
       self._print(
         f"[Trainer] data parallel: {dctx.world} ranks x {self.E} envs / {cfg.rollouts_per_update} rollouts "
@@ -529,6 +532,9 @@ class Trainer:
     if ck["bin_G"].shape == self.cmd.bin_G.shape:
       self.cmd.bin_G.copy_(ck["bin_G"])
       self.cmd.bin_visits.copy_(ck["bin_visits"])
+      if self.cmd.cfg.clamp_returns:  # resume / rollback: the EMA restarts from bounded values (same on every rank)
+        n, g_min = self.cmd.clamp_bin_returns_()
+        self._print(f"[Trainer] clamp_returns: {n} of {self.cmd.bin_G.numel()} loaded bin returns clamped to [0, {self.cmd.cfg.g_max:g}] (min before {g_min:.3f})")
     self.it = ck["it"]
     self.env_steps = ck["env_steps"]
     for s in self.sched:

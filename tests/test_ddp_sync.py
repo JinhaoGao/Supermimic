@@ -132,7 +132,7 @@ def _t_sampler(ctx: DistCtx):
     return
   NB = 40
   cmd = types.SimpleNamespace(
-    library=types.SimpleNamespace(num_bins=NB), cfg=types.SimpleNamespace(return_ema=0.05), device="cpu",
+    library=types.SimpleNamespace(num_bins=NB), cfg=types.SimpleNamespace(return_ema=0.05, clamp_returns=False), device="cpu",
     bin_G=torch.zeros(NB), bin_visits=torch.zeros(NB), bin_weight_hist=torch.full((NB,), 1.0 / NB),
   )
   upd = LibraryMotionCommand.update_bin_returns

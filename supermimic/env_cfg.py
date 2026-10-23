@@ -44,10 +44,12 @@ def make_env_cfg(
   num_workers: int = 32,
   ee_termination: bool = True,
   ee_threshold: float = 0.25,
+  clamp_returns: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """ee_termination: keep BeyondMimic's end-effector height termination (``ee_body_pos``: any end-effector body
   z error > ee_threshold; bodies per robot cfg). Must match ``HeadsCfg.ee_termination`` / ``ee_term_z`` of the
-  learner (SimInterface checks). Off = the paper's recipe (term removed)."""
+  learner (SimInterface checks). Off = the paper's recipe (term removed).
+  clamp_returns: reset sampler bin returns clamped to [0, g_max] (LibraryMotionCommandCfg.clamp_returns)."""
   assert mode in ("train", "eval")
   cfg = base_tracking_cfg(robot)
   cfg.scene.num_envs = num_envs
@@ -71,6 +73,7 @@ def make_env_cfg(
     num_workers=num_workers,
     library_key=library_key,
     eval_clips=tuple(eval_clips),
+    clamp_returns=clamp_returns,
   )
 
   # Minimal observation group (the trainer builds policy inputs itself).

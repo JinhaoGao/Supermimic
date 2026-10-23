@@ -155,6 +155,8 @@ class LibraryMotionCommand(MotionCommand):
     finite = torch.isfinite(returns)
     if not bool(finite.all()):
       bin_ids, returns = bin_ids[finite], returns[finite]
+    if self.cfg.clamp_returns:
+      returns = returns.clamp(0.0, self.cfg.g_max)
     if bin_ids.numel() == 0:
       return
     NB = self.library.num_bins
@@ -169,11 +171,22 @@ class LibraryMotionCommand(MotionCommand):
     self.bin_visits[visited] += c[visited]
 
   @torch.no_grad()
+  def clamp_bin_returns_(self) -> tuple[int, float]:
+    """Clamp bin_G to [0, g_max] in place (clamp_returns: a resumed / rolled-back EMA restarts bounded; without the
+    clamp a penalty-dominated clip-end bin, G << 0 via the r_last / (1 - gamma) bootstrap, takes all softmax mass).
+    Returns (bins clamped, min before)."""
+    g_min = float(self.bin_G.min()) if self.bin_G.numel() else 0.0
+    n = int(((self.bin_G < 0.0) | (self.bin_G > self.cfg.g_max)).sum())
+    self.bin_G.clamp_(0.0, self.cfg.g_max)
+    return n, g_min
+
+  @torch.no_grad()
   def sampling_probabilities(self) -> torch.Tensor:
     c = self.cfg
     NB = self.library.num_bins
     uniform = torch.full((NB,), 1.0 / NB, device=self.device)
-    G = torch.where(self.bin_visits > 0, self.bin_G, torch.full_like(self.bin_G, c.g_max * 0.5))
+    bin_G = self.bin_G.clamp(0.0, c.g_max) if c.clamp_returns else self.bin_G
+    G = torch.where(self.bin_visits > 0, bin_G, torch.full_like(self.bin_G, c.g_max * 0.5))
     soft = torch.softmax(-c.softmax_temp * G / c.g_max, dim=0)
     hist = self.bin_weight_hist / self.bin_weight_hist.sum()
     probs = c.mix_uniform * uniform + c.mix_softmax * soft + c.mix_history * hist
@@ -268,6 +281,7 @@ class LibraryMotionCommandCfg(MotionCommandCfg):
   softmax_temp: float = 25.0
   g_max: float = 10.0
   return_ema: float = 0.05
+  clamp_returns: bool = False  # bin returns (EMA input, sampled G, loaded bin_G) clamped to [0, g_max]; off = paper
   weight_ema: float = 0.01
   sampling_mode: Literal["return", "uniform", "start"] = "return"  # type: ignore[assignment]
   cache_dir: str = ""
