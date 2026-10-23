@@ -225,23 +225,26 @@ class AnalyticHeads:
 
   # ---- termination ---------------------------------------------------------
 
-  def termination(self, kin_next: dict, ref_bp: torch.Tensor, ref_bq: torch.Tensor):
+  def termination(self, kin_next: dict, ref_bp: torch.Tensor, ref_bq: torch.Tensor, scale: torch.Tensor | None = None):
     """Reference tracked-body poses [B,Bt,3]/[B,Bt,4] at the target frame. Returns (hard_bool [B], soft_prob [B]).
 
     Anchor height / tilt as in BeyondMimic; with ee_term_z > 0 also the end-effector height error. The
-    re-anchored reference used by mjlab's ee_body_pos keeps the reference z, so world z is compared."""
+    re-anchored reference used by mjlab's ee_body_pos keeps the reference z, so world z is compared.
+    scale [B] (optional): per-sample multiplier of every threshold and sigmoid temperature (hard-clip
+    curriculum, see LibraryMotionCommand.term_scale_env); the env terminations use the same factor."""
     c = self.cfg
     ref_ap, ref_aq = ref_bp[:, self.anchor], ref_bq[:, self.anchor]
     B = ref_ap.shape[0]
     g = self.gravity.expand(B, 3)
+    k = scale if scale is not None else torch.ones(B, device=ref_bp.device)
     dz = (ref_ap[:, 2] - kin_next["anchor_pos"][:, 2]).abs()
     tilt = (quat_apply_inverse(ref_aq, g)[:, 2] - quat_apply_inverse(kin_next["anchor_quat"], g)[:, 2]).abs()
-    hard = (dz > c.term_z) | (tilt > c.term_tilt)
-    pz = torch.sigmoid((dz - c.term_z) / c.term_z_temp)
-    pt = torch.sigmoid((tilt - c.term_tilt) / c.term_tilt_temp)
+    hard = (dz > c.term_z * k) | (tilt > c.term_tilt * k)
+    pz = torch.sigmoid((dz - c.term_z * k) / (c.term_z_temp * k))
+    pt = torch.sigmoid((tilt - c.term_tilt * k) / (c.term_tilt_temp * k))
     alive = (1.0 - pz) * (1.0 - pt)
     if c.ee_term_z > 0:
       ez = (ref_bp[:, self.ee, 2] - kin_next["body_pos"][:, self.ee, 2]).abs()  # [B, n_ee]
-      hard = hard | (ez > c.ee_term_z).any(-1)
-      alive = alive * (1.0 - torch.sigmoid((ez - c.ee_term_z) / c.ee_term_temp)).prod(-1)
+      hard = hard | (ez > c.ee_term_z * k[:, None]).any(-1)
+      alive = alive * (1.0 - torch.sigmoid((ez - c.ee_term_z * k[:, None]) / (c.ee_term_temp * k[:, None]))).prod(-1)
     return hard, 1.0 - alive

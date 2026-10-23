@@ -19,7 +19,8 @@ import torch
 
 from mjlab.managers import CommandTerm
 from mjlab.tasks.tracking.mdp.commands import MotionCommand, MotionCommandCfg
-from mjlab.utils.lab_api.math import quat_from_euler_xyz, quat_mul, sample_uniform
+from mjlab.tasks.tracking.mdp.rewards import _get_body_indexes
+from mjlab.utils.lab_api.math import quat_apply_inverse, quat_from_euler_xyz, quat_mul, sample_uniform
 
 from .motions import MotionLibrary
 
@@ -103,6 +104,17 @@ class LibraryMotionCommand(MotionCommand):
         hit = torch.tensor([nw > 1.0 for nw in name_w], device=self.device)[lib.bin_clip]
         print(f"[LibraryMotionCommand] name keywords {nws}: {int(sum(nw > 1.0 for nw in name_w))} clips, "
               f"{hit.float().mean().item() * 100:.2f}% of bins -> {self.bin_prior[hit].sum().item() * 100:.2f}% of the uniform share")
+    # Hard-clip termination curriculum (v2 r13): clips whose name contains a hard_names keyword get every
+    # termination threshold (env terms below + the trainer's soft head) multiplied by hard_mult, which the
+    # trainer anneals back to 1; other clips keep 1. Episodes keep the factor of the clip they reset into.
+    hn = [str(k).lower() for k in cfg.hard_names]
+    self.clip_hard = torch.tensor([any(k in c.name.lower() for k in hn) for c in lib.clips], dtype=torch.bool, device=self.device)
+    self.env_hard = torch.zeros(E, dtype=torch.bool, device=self.device)
+    self.term_scale_env = torch.ones(E, device=self.device)
+    self.hard_mult = 1.0
+    if hn:
+      hb = self.clip_hard[lib.bin_clip]
+      print(f"[LibraryMotionCommand] hard set {hn}: {int(self.clip_hard.sum())} clips, {hb.float().mean().item() * 100:.2f}% of bins")
     # Sequential clip assignment for "start" (evaluation) mode.
     ec = cfg.eval_clips if cfg.eval_clips else tuple(range(lib.num_clips))
     self.eval_clips = torch.tensor(ec, dtype=torch.long, device=self.device)
@@ -176,6 +188,10 @@ class LibraryMotionCommand(MotionCommand):
   def anchor_ang_vel_w(self) -> torch.Tensor:
     return self._cur["body_ang_vel"][:, self.motion_anchor_body_index]
 
+  def set_hard_mult(self, m: float) -> None:
+    self.hard_mult = float(m)
+    self.term_scale_env = 1.0 + (self.hard_mult - 1.0) * self.env_hard.float()
+
   # ---- return-based reset sampling -----------------------------------------
 
   @torch.no_grad()
@@ -241,6 +257,9 @@ class LibraryMotionCommand(MotionCommand):
   def _resample_command(self, env_ids: torch.Tensor):
     frames = self.sample_frames(env_ids)
     self.time_steps[env_ids] = frames
+    hard = self.clip_hard[self.library.clip_of_frame(frames)]
+    self.env_hard[env_ids] = hard
+    self.term_scale_env[env_ids] = 1.0 + (self.hard_mult - 1.0) * hard.float()
     self.clip_end_env[env_ids] = self.library.clip_end_of_frame[frames].long()
     rs = self.library.root_state(frames)
     origins = self._env.scene.env_origins[env_ids]
@@ -285,6 +304,29 @@ def motion_clip_end(env: "ManagerBasedRlEnv", command_name: str) -> torch.Tensor
   return cmd.time_steps >= cmd.clip_end_env - 1  # type: ignore[attr-defined]
 
 
+# mjlab's anchor / end-effector terminations with the per-env threshold multiplier of the hard-clip curriculum
+# (LibraryMotionCommand.term_scale_env, 1 outside the hard set); swapped in by make_env_cfg when it is used.
+
+
+def scaled_anchor_pos_z(env: "ManagerBasedRlEnv", command_name: str, threshold: float) -> torch.Tensor:
+  cmd = env.command_manager.get_term(command_name)
+  return (cmd.anchor_pos_w[:, -1] - cmd.robot_anchor_pos_w[:, -1]).abs() > threshold * cmd.term_scale_env  # type: ignore[attr-defined]
+
+
+def scaled_anchor_ori(env: "ManagerBasedRlEnv", asset_cfg, command_name: str, threshold: float) -> torch.Tensor:
+  g = env.scene[asset_cfg.name].data.gravity_vec_w
+  cmd = env.command_manager.get_term(command_name)
+  dz = quat_apply_inverse(cmd.anchor_quat_w, g)[:, 2] - quat_apply_inverse(cmd.robot_anchor_quat_w, g)[:, 2]  # type: ignore[attr-defined]
+  return dz.abs() > threshold * cmd.term_scale_env  # type: ignore[attr-defined]
+
+
+def scaled_body_pos_z(env: "ManagerBasedRlEnv", command_name: str, threshold: float, body_names=None) -> torch.Tensor:
+  cmd = env.command_manager.get_term(command_name)
+  idx = _get_body_indexes(cmd, body_names)
+  err = (cmd.body_pos_relative_w[:, idx, -1] - cmd.robot_body_pos_w[:, idx, -1]).abs()  # type: ignore[attr-defined]
+  return (err > (threshold * cmd.term_scale_env)[:, None]).any(-1)  # type: ignore[attr-defined]
+
+
 @dataclass(kw_only=True)
 class LibraryMotionCommandCfg(MotionCommandCfg):
   motion_files: tuple[str, ...] = ()
@@ -299,6 +341,7 @@ class LibraryMotionCommandCfg(MotionCommandCfg):
   weight_ema: float = 0.01
   source_weights: tuple = ()  # ((source prefix, weight), ...): prior of the uniform share, see LibraryMotionCommand
   name_weights: tuple = ()  # ((name keyword, weight), ...): max with the source weight (case-insensitive substring)
+  hard_names: tuple = ()  # clip-name keywords of the hard set (termination curriculum, case-insensitive substring)
   sampling_mode: Literal["return", "uniform", "start"] = "return"  # type: ignore[assignment]
   cache_dir: str = ""
   num_workers: int = 32

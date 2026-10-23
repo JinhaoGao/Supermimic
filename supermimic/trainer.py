@@ -42,6 +42,11 @@ class TrainCfg:
   robot_variant: str = ""  # see env_cfg.base_tracking_cfg (g1: eval; e2: nodamp)
   source_weights: tuple = ()  # ((source prefix, weight), ...) prior of the reset sampler's uniform share
   name_weights: tuple = ()  # ((name keyword, weight), ...) max with it (skill quotas, e.g. crawl / getup)
+  # Hard-clip termination curriculum: clips matching hard_names (name keywords) get every termination threshold
+  # (env + soft head, sigmoid temperatures too) multiplied by a piecewise-linear schedule over absolute
+  # iterations ((it, mult), ...), constant outside; e.g. ((104000, 2.0), (108000, 2.0), (114000, 1.0)).
+  hard_names: tuple = ()
+  hard_term_schedule: tuple = ()
   num_envs: int = 4096
   device: str = "cuda:0"
   seed: int = 0
@@ -135,7 +140,7 @@ class Trainer:
       cfg.motion_files, cfg.num_envs, mode="train", episode_length_s=cfg.episode_length_s, robot=cfg.robot,
       library_key=self.LIB_KEY, cache_dir=cfg.cache_dir, num_workers=cfg.num_workers,
       ee_term_z=cfg.heads.ee_term_z, robot_variant=cfg.robot_variant, source_weights=cfg.source_weights,
-      name_weights=cfg.name_weights,
+      name_weights=cfg.name_weights, hard_names=cfg.hard_names,
     )
     env_cfg.seed = cfg.seed
     self.env = ManagerBasedRlEnv(cfg=env_cfg, device=self.device)
@@ -197,7 +202,7 @@ class Trainer:
     self.ep_ret = torch.zeros(E, device=self.device)
     self._gamma_pow = cfg.gamma ** torch.arange(L, device=self.device, dtype=torch.float32)
     self._ar = torch.arange(E, device=self.device)
-    self.stats = {"ep_return_norm": [], "ep_len": [], "ep_failed": [], "term_mismatch": []}
+    self.stats = {"ep_return_norm": [], "ep_len": [], "ep_failed": [], "term_mismatch": [], "hard_ep_failed": [], "hard_ep_len": []}
     # ---- watchdog ----
     self.wd_reward_ema: float | None = None
     self.wd_hist: deque = deque()
@@ -223,7 +228,7 @@ class Trainer:
 
     self.env.step(a_exec)
     next_state = self.sim.state()
-    r, term_hard = self.fns.post(next_state, self.kin, a_exec, self.prev_action, *ref_cur)
+    r, term_hard = self.fns.post(next_state, self.kin, a_exec, self.prev_action, *ref_cur, self.cmd.term_scale_env)
     terminated = self.env.reset_terminated.bool()
     timeouts = self.env.reset_time_outs.bool()
     done = terminated | timeouts
@@ -279,6 +284,10 @@ class Trainer:
     self.stats["ep_return_norm"].extend(norm_ret.tolist())
     self.stats["ep_len"].extend(L.tolist())
     self.stats["ep_failed"].extend(failed.float().tolist())
+    hard = self.cmd.env_hard[ids]
+    if bool(hard.any()):
+      self.stats["hard_ep_failed"].extend(failed[hard].float().tolist())
+      self.stats["hard_ep_len"].extend(L[hard].tolist())
 
   # ---------------------------------------------------------------------------
   # 2. World model
@@ -317,6 +326,8 @@ class Trainer:
     bias = self.sim.bias_from_xi(xi, self.nj)
     t_g0 = time.time()
     with torch.no_grad():
+      # Termination multiplier of the hard-clip curriculum for the clip each rollout starts in (1 elsewhere).
+      term_scale = 1.0 + (self.cmd.hard_mult - 1.0) * self.cmd.clip_hard[self.lib.clip_of_frame(st["frame"])].float()
       hs, hp = st["hist_states"], st["hist_prev_action"]
       hist_n = hs.shape[1]
       obs_hist = heads.proprio(
@@ -336,7 +347,7 @@ class Trainer:
     feats_n, goals_n, rews, dsoft = [], [], [], []
     p = (pack["joint_pos"], pack["joint_vel"], pack["body_pos"], pack["body_quat"], pack["body_lin_vel"], pack["body_ang_vel"])
     for t in range(H):
-      s, obs_hist, prev_a, f_loc, kin, r, d, fn, gn = self.fns.imagine_step(s, obs_hist, prev_a, f_loc, clip_end_loc, xi, bias, kin, *p)
+      s, obs_hist, prev_a, f_loc, kin, r, d, fn, gn = self.fns.imagine_step(s, obs_hist, prev_a, f_loc, clip_end_loc, xi, bias, kin, *p, term_scale)
       J = J + (g**t) * c * r
       c = c * (1.0 - d)
       feats_n.append(fn.detach())
@@ -486,6 +497,17 @@ class Trainer:
         return self._rollback(f"critic loss median {recent:.3g} > {cfg.wd_vloss_ratio} x {base:.3g}")
     return False
 
+  def hard_mult_at(self, it: int) -> float:
+    pts = sorted((int(a), float(b)) for a, b in self.cfg.hard_term_schedule)
+    if not pts:
+      return 1.0
+    if it <= pts[0][0]:
+      return pts[0][1]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+      if it <= x1:
+        return y0 + (y1 - y0) * (it - x0) / max(x1 - x0, 1)
+    return pts[-1][1]
+
   def _healthy(self) -> bool:
     if self.wd_reward_ema is None or not self.wd_hist:
       return False
@@ -546,6 +568,8 @@ class Trainer:
     agg: dict[str, list[float]] = {}
     while self.it < cfg.iterations:
       t0 = time.time()
+      if cfg.hard_term_schedule:
+        self.cmd.set_hard_mult(self.hard_mult_at(self.it))
       self._step_carry += cfg.env_steps_per_iter
       n_steps = int(self._step_carry)
       self._step_carry -= n_steps
@@ -583,6 +607,14 @@ class Trainer:
           scal["train/ep_len"] = float(np.mean(self.stats["ep_len"]))
           scal["train/ep_failed_frac"] = float(np.mean(self.stats["ep_failed"]))
         scal["train/term_mismatch"] = float(np.mean(self.stats["term_mismatch"])) if self.stats["term_mismatch"] else 0.0
+        hard_txt = ""
+        if cfg.hard_names:
+          scal["hard/term_mult"] = self.cmd.hard_mult
+          if self.stats["hard_ep_failed"]:
+            scal["hard/ep_failed_frac"] = float(np.mean(self.stats["hard_ep_failed"]))
+            scal["hard/ep_len"] = float(np.mean(self.stats["hard_ep_len"]))
+          hard_txt = (f" | hard x{self.cmd.hard_mult:.2f} fail {scal.get('hard/ep_failed_frac', float('nan')):.2f} "
+                      f"len {scal.get('hard/ep_len', float('nan')):.0f}")
         scal["sampler/entropy"] = self.cmd.metrics["sampling_entropy"][0].item()
         scal["sampler/top1_prob"] = self.cmd.metrics["sampling_top1_prob"][0].item()
         scal["sampler/bins_visited_frac"] = (self.cmd.bin_visits > 0).float().mean().item()
@@ -594,7 +626,7 @@ class Trainer:
         print(
           f"[it {self.it:7d} | {scal['train/wall_h']:5.2f} h] wm {scal.get('wm/loss', 0):.4f} (e1 {scal.get('wm/err_step1', 0):.3f}, e{cfg.wm.k} {scal.get(f'wm/err_step{cfg.wm.k}', 0):.3f}) "
           f"| imag_ret {scal.get('pi/imagined_return', 0):.4f} rew {scal.get('pi/imagined_reward_norm', 0):.3f} surv {scal.get('pi/survival_H', 0):.3f} | "
-          f"ep_ret {scal.get('train/ep_return_norm', 0):.3f} len {scal.get('train/ep_len', 0):.0f} fail {scal.get('train/ep_failed_frac', 0):.2f} | "
+          f"ep_ret {scal.get('train/ep_return_norm', 0):.3f} len {scal.get('train/ep_len', 0):.0f} fail {scal.get('train/ep_failed_frac', 0):.2f}{hard_txt} | "
           f"{scal['time/iter']*1000:.0f} ms/it (c {scal['time/collect']*1000:.0f} wm {scal['time/wm']*1000:.0f} pi {scal['time/policy']*1000:.0f} ref {scal.get('time/ref_gather', 0)*1000:.0f}) fps {fps:.0f}",
           flush=True,
         )

@@ -33,6 +33,10 @@ def main():
                  help="reset-sampler prior per data source, e.g. noetix_kungfu=6,sportsmeeting=10 (clip '<robot>__<source>_...')")
   p.add_argument("--name_weights", type=str, default="",
                  help="reset-sampler weight per clip-name keyword (case-insensitive substring), e.g. crawl=4,getup=4")
+  p.add_argument("--hard_names", type=str, default="",
+                 help="clip-name keywords (comma-separated, case-insensitive) of the hard set for --hard_term_schedule")
+  p.add_argument("--hard_term_schedule", type=str, default="",
+                 help="termination multiplier of the hard set, piecewise linear over absolute iterations, e.g. 104000:2,108000:2,114000:1")
   p.add_argument("--ee_term_z", type=float, default=0.0,
                  help="end-effector height termination in m (env + soft head); 0 = off as in the paper, 0.25 = BeyondMimic / team benchmark")
   p.add_argument("--run_name", type=str, default="run")
@@ -85,6 +89,8 @@ def main():
     robot_variant=args.robot_variant,
     source_weights=tuple((kv.split("=")[0], float(kv.split("=")[1])) for kv in args.source_weights.split(",") if kv),
     name_weights=tuple((kv.split("=")[0], float(kv.split("=")[1])) for kv in args.name_weights.split(",") if kv),
+    hard_names=tuple(k for k in args.hard_names.split(",") if k),
+    hard_term_schedule=tuple((int(kv.split(":")[0]), float(kv.split(":")[1])) for kv in args.hard_term_schedule.split(",") if kv),
     num_envs=args.num_envs,
     device=args.device,
     seed=args.seed,

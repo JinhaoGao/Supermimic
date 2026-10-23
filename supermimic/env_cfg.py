@@ -90,6 +90,7 @@ def make_env_cfg(
   robot_variant: str = "",
   source_weights: tuple = (),
   name_weights: tuple = (),
+  hard_names: tuple = (),
 ) -> ManagerBasedRlEnvCfg:
   assert mode in ("train", "eval")
   cfg = base_tracking_cfg(robot, robot_variant)
@@ -116,6 +117,7 @@ def make_env_cfg(
     eval_clips=tuple(eval_clips),
     source_weights=tuple(tuple(kv) for kv in source_weights) if mode == "train" else (),
     name_weights=tuple(tuple(kv) for kv in name_weights) if mode == "train" else (),
+    hard_names=tuple(hard_names) if mode == "train" else (),
   )
 
   # Minimal observation group (the trainer builds policy inputs itself).
@@ -146,6 +148,13 @@ def make_env_cfg(
     cfg.terminations["ee_body_pos"].params["threshold"] = float(ee_term_z)
   else:
     cfg.terminations.pop("ee_body_pos", None)
+  if hard_names and mode == "train":  # hard-clip curriculum: per-env threshold multiplier (library_command)
+    from .library_command import scaled_anchor_ori, scaled_anchor_pos_z, scaled_body_pos_z
+
+    cfg.terminations["anchor_pos"].func = scaled_anchor_pos_z
+    cfg.terminations["anchor_ori"].func = scaled_anchor_ori
+    if "ee_body_pos" in cfg.terminations:
+      cfg.terminations["ee_body_pos"].func = scaled_body_pos_z
   cfg.terminations["clip_end"] = TerminationTermCfg(
     func=motion_clip_end, params={"command_name": "motion"}, time_out=True
   )
