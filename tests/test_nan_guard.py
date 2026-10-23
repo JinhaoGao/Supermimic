@@ -1,4 +1,4 @@
-"""Watchdog behaviour around non-finite iterations (single process, CPU; needs the trainer's imports = mjlab venv).
+"""Watchdog behaviour around non-finite iterations (single process, CPU; mjlab / tensorboard stubbed when missing).
 
   python tests/test_nan_guard.py      # or: pytest tests/test_nan_guard.py
 
@@ -20,7 +20,9 @@ from collections import deque
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import test_sampler_clamp  # noqa: E402,F401  (stubs mjlab / tensorboard when missing: runs without the mjlab venv)
 from supermimic.distributed import DistCtx  # noqa: E402
 from supermimic.trainer import Trainer, TrainCfg  # noqa: E402
 from supermimic.world_model import mlp  # noqa: E402

@@ -21,8 +21,10 @@ and skips that optimizer step (optimizer state untouched). The watchdog treats
 an iteration with a skipped update or a non-finite imagined reward as a
 transient and only acts (rollback) after wd_nf_patience consecutive ones;
 checkpoints written while non-finite (or with non-finite weights) are never
-rollback targets. Simulator states that come back non-finite end their episode
-as a failure (the replay keeps the finite pre-step state).
+rollback targets. With wd_reward_floor set, each rank's finite imagined reward
+is clamped from below first (one rank's spike must not roll everyone back).
+Simulator states that come back non-finite end their episode as a failure (the
+replay keeps the finite pre-step state).
 """
 
 from __future__ import annotations
@@ -110,6 +112,12 @@ class TrainCfg:
   wd_max_rollbacks: int = 6
   wd_force_at: int = -1  # debug: force one rollback at this iteration
   wd_nf_patience: int = 100  # consecutive non-finite iterations (skipped update / NaN imagined reward) before a rollback
+  # Lower bound on each rank's imagined reward (normalized) before the rank mean and the EMA; None = off (as before),
+  # production -1.0. bj31 g1v2_ddp8_ws86k 2026-10-23: one rank's value came back finite but astronomically negative
+  # (rank 0 0.918, rank-mean EMA -2.2 at it 100808 -> rollback; the EMA restarted from such a value read -47392 at the
+  # end of the warm-up -> rollback #2): two LR halvings for nothing (weights intact, grad clipping). A real collapse
+  # (10-22: 0.91 -> 0.4) stays far above -1; non-finite values keep the non-finite path.
+  wd_reward_floor: float | None = None
   wd_early_ckpt: int = 500  # one early checkpoint (rollback point) at this iteration when none exists yet (0 = off)
   # Logging / eval / checkpoints.
   log_interval: int = 50
@@ -282,6 +290,8 @@ class Trainer:
     self.wd_quiet_until = cfg.wd_warmup
     self.wd_forced = False
     self.wd_nf_streak = 0  # consecutive non-finite iterations
+    self.guard_floored = 0  # per-rank imagined rewards raised to wd_reward_floor since start (sum over ranks)
+    self.guard_floor_iters = 0  # iterations with at least one of them (same on every rank)
 
   # ---------------------------------------------------------------------------
   # 1. Data collection
@@ -620,9 +630,20 @@ class Trainer:
     cfg = self.cfg
     r = float(m_pi.get("pi/imagined_reward_norm", float("nan")))
     vl = float(m_pi.get("critic/loss", float("nan")))
+    floor, raw = cfg.wd_reward_floor, None
+    if floor is not None and math.isfinite(r) and r < floor:  # one rank's spike must not drag the mean (see TrainCfg)
+      raw, r = r, float(floor)
+    n_floored = int(raw is not None)
     if self.dist.enabled:  # data parallel: every rank decides on the same rank means -> rolls back together
-      g = self.dist.reduce_scalars({"r": r, "vl": vl}, "mean", check_keys=False)
+      s = {"r": r, "vl": vl}
+      if floor is not None:  # same keys on every rank (cfg); off: the reduce of before
+        s["floored"] = float(n_floored)
+      g = self.dist.reduce_scalars(s, "mean", check_keys=False)
       r, vl = g["r"], g["vl"]
+      if floor is not None:
+        n_floored = round(g["floored"] * self.dist.world)
+    if n_floored:
+      self._note_reward_floor(n_floored, raw)
     if skipped or not math.isfinite(r):
       # Transient: the non-finite updates were skipped, the weights are intact. Only a long streak means the
       # weights / normalizers themselves are broken -> roll back (no checkpoint yet: keep skipping, never give up).
@@ -659,6 +680,30 @@ class Trainer:
       if recent > cfg.wd_vloss_ratio * max(base, 1e-6):
         return self._rollback(f"critic loss median {recent:.3g} > {cfg.wd_vloss_ratio} x {base:.3g}")
     return False
+
+  def _note_reward_floor(self, n: int, raw: float | None) -> None:
+    """n ranks (identical on every rank) had their imagined reward floored this iteration; raw: this rank's value."""
+    self.guard_floored += n
+    self.guard_floor_iters += 1
+    k = self.guard_floor_iters
+    if k <= 3 or k % 100 == 0:  # same k on every rank -> every rank joins the gather
+      raws = self.dist.all_gather_object(raw)
+      which = ", ".join(f"rank {i} {v:.4g}" for i, v in enumerate(raws) if v is not None)
+      self._print(f"[guard] it {self.it}: imagined reward floored to {self.cfg.wd_reward_floor:g} on {n}/{self.dist.world} "
+                  f"rank(s) (raw: {which}); {k} iterations / {self.guard_floored} rank values floored so far", flush=True)
+
+  def _guard_scalars(self) -> dict:
+    """Watchdog / NaN-guard scalars: built from rank-reduced state only, so keys and values match on every rank."""
+    scal = {}
+    if self.wd_reward_ema is not None:
+      scal["guard/reward_ema"] = self.wd_reward_ema  # same on every rank (watchdog runs on rank means)
+    scal["guard/rollbacks_total"] = self.wd_rollbacks
+    for k, v in self.guard_skips.items():
+      scal[f"guard/skips_{k}"] = v  # cumulative, same on every rank
+    scal["guard/nonfinite_iters"] = self.guard_nf_iters
+    if self.cfg.wd_reward_floor is not None:  # key depends on cfg only
+      scal["guard/reward_floored"] = self.guard_floored  # cumulative floored rank values
+    return scal
 
   def _healthy(self) -> bool:
     """May the checkpoint written at this iteration become the rollback target? Never while non-finite: the EMA is
@@ -901,12 +946,7 @@ class Trainer:
           scal["sampler/entropy"] = self.cmd.metrics["sampling_entropy"][0].item()
           scal["sampler/top1_prob"] = self.cmd.metrics["sampling_top1_prob"][0].item()
           scal["sampler/bins_visited_frac"] = (self.cmd.bin_visits > 0).float().mean().item()
-        if self.wd_reward_ema is not None:
-          scal["guard/reward_ema"] = self.wd_reward_ema  # same on every rank (watchdog runs on rank means)
-        scal["guard/rollbacks_total"] = self.wd_rollbacks
-        for k, v in self.guard_skips.items():
-          scal[f"guard/skips_{k}"] = v  # cumulative, same on every rank
-        scal["guard/nonfinite_iters"] = self.guard_nf_iters
+        scal.update(self._guard_scalars())
         if self.main:
           for k, v in scal.items():
             self.writer.add_scalar(k, v, self.it)

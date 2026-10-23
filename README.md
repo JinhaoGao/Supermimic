@@ -156,6 +156,14 @@ instead of giving up. Checkpoints written during a non-finite streak or with non
 rollback target; one early rollback point is written at `--wd_early_ckpt` (500). Simulator states that come back
 non-finite end their episode as a failure (`guard/sim_nonfinite`).
 
+Reward floor (2026-10-23, bj31 `g1v2_ddp8_ws86k`): one rank's imagined reward came back finite but astronomically
+negative (rank 0 read 0.918 while the rank-mean EMA hit −2.2 at it 100808; after that rollback the EMA read −47392 at
+the end of the warm-up → rollback #2). Weights were fine, but each rollback halves the LR and the sixth ends the run.
+`--wd_reward_floor F` clamps each rank's finite value to ≥ F before the rank mean and the EMA (production −1.0;
+default off = the behaviour above, bitwise). A real collapse (0.91 → 0.4) is far above −1 and still rolls back;
+non-finite values keep the non-finite path. Rank 0 logs floored iterations with the raw values (first 3, then every
+100), `guard/reward_floored` counts the floored rank values.
+
 ## End-effector termination
 
 The paper drops BeyondMimic's end-effector termination; without it the G1 / E2 full-atlas policies swing feet and

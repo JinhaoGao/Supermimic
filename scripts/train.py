@@ -122,6 +122,10 @@ def main():
   p.add_argument("--wd_force_at", type=int, default=-1, help="debug: force one rollback at this iteration")
   p.add_argument("--wd_nf_patience", type=int, default=100, help="consecutive non-finite iterations (skipped updates) before a rollback")
   p.add_argument("--wd_early_ckpt", type=int, default=500, help="early checkpoint / rollback point at this iteration if none exists (0 = off)")
+  p.add_argument("--wd_reward_floor", type=float, default=None,
+                 help="floor each rank's imagined reward (normalized) at this value before the rank mean / watchdog EMA "
+                      "(production -1.0; default off = as before). A finite but astronomically negative value on one rank caused two "
+                      "needless rollbacks on bj31 (2026-10-23)")
   p.add_argument("--no_compile", action="store_true")
   p.add_argument("--compile_mode", type=str, default=None, help="e.g. reduce-overhead or max-autotune")
   p.add_argument("--num_threads", type=int, default=0, help="CPU threads: OMP/MKL/OpenBLAS env + torch.set_num_threads (0 = leave defaults)")
@@ -213,6 +217,7 @@ def main():
     wd_force_at=args.wd_force_at,
     wd_nf_patience=args.wd_nf_patience,
     wd_early_ckpt=args.wd_early_ckpt,
+    wd_reward_floor=args.wd_reward_floor,
     compile_mode=args.compile_mode,
     world_size=dctx.world,
     base_lr_scale=args.lr_scale,
