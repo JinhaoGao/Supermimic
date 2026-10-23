@@ -17,9 +17,11 @@ Checks:
     prior from the broadcast clip list (checked by the start-up state check, which also catches a rank whose prior
     differs); after per-rank return updates + merge the sampling probabilities are bitwise equal on every rank;
   * wiring: the bj27 g1v2_scratch command line -> TrainCfg / HeadsCfg (scripts/train.py), conflicting flags rejected,
-    --motion_list read verbatim; Trainer.__init__ -> make_env_cfg kwargs; make_env_cfg -> base_tracking_cfg(robot,
+    --motion_list read verbatim (any missing file fails before the Trainer); Trainer.__init__ -> make_env_cfg kwargs; make_env_cfg -> base_tracking_cfg(robot,
     variant), source / name weights (train mode only), ee_body_pos threshold / removal; eval_ckpt.py on master-format,
-    v1 and ddp-bj31 checkpoints (EE switch / threshold / robot variant as trained, overrides).
+    v1 and ddp-bj31 checkpoints (EE switch / threshold / robot variant as trained, overrides);
+  * resume guard: Trainer.load warns about every differing setting of the checkpoint's run and loads the reset
+    sampler's state only for the same clip list.
 """
 
 from __future__ import annotations
@@ -414,6 +416,18 @@ def test_train_cli_v2_flags():
         assert "another machine" in str(e)
       else:
         raise AssertionError("a list of missing files must fail")
+      # partly missing: fails too, before the Trainer (build_cache would die on rank 0 only; nothing is dropped)
+      partial = os.path.join(tmp, "partial.txt")
+      with open(partial, "w") as f:
+        f.write("\n".join(clips[:2] + ["/nonexistent/g1__lafan1_9.npz"] + clips[2:]) + "\n")
+      n_before = len(seen)
+      try:
+        run([], files=("--motion_list", partial))
+      except FileNotFoundError as e:
+        assert "1 of 4 files" in str(e) and "/nonexistent/g1__lafan1_9.npz" in str(e) and "verbatim" in str(e), str(e)
+      else:
+        raise AssertionError("a partly missing list must fail")
+      assert len(seen) == n_before, "Trainer must not be reached"
 
 
 def test_trainer_and_env_cfg_wiring():
@@ -511,6 +525,60 @@ def test_eval_ckpt_any_checkpoint():
     assert run(v1_heads_dict(), ["--ee_term_z", "0.3"], variant="") == (True, 0.3, 0.02, "")
     assert run(dataclasses.asdict(HeadsCfg()), variant="") == (True, 0.25, 0.02, "")  # ddp-bj31 r52
     assert run(dataclasses.asdict(HeadsCfg()), ["--ee_threshold", "0.2"], variant="") == (True, 0.2, 0.02, "")
+
+
+def test_resume_guard():
+  """--resume from another setup (real Trainer.load): every differing training setting is reported, for master v2 / v1 /
+  ddp-bj31 checkpoint cfgs; the reset sampler's state is loaded only for the same clip list (by basename: bj27 vs bj31
+  roots load), with a warning otherwise; a watchdog rollback (own checkpoint) checks nothing."""
+  NB = 64
+  names = [f"g1__lafan1_{i}.npz" for i in range(4)]
+  G = torch.arange(NB, dtype=torch.float32) / NB
+  with tempfile.TemporaryDirectory() as tmp:
+    def ckpt(heads: dict, files=None, nb=NB, **over) -> str:
+      t = tsc.make_trainer(tmp, nb, False)
+      cfg = dataclasses.asdict(t.cfg)
+      cfg.update(motion_files=files if files is not None else [f"/bj27/{n}" for n in names], heads=heads, **over)
+      path = os.path.join(tmp, f"ck{len(os.listdir(tmp))}.pt")
+      torch.save({"it": 86000, "env_steps": 1, "policy": t.policy.state_dict(), "critic": t.critic.state_dict(), "wm": t.wm.state_dict(),
+                  "opt_wm": t.opt_wm.state_dict(), "opt_pi": t.opt_pi.state_dict(), "opt_v": t.opt_v.state_dict(),
+                  "bin_G": G[:nb] if nb <= NB else torch.zeros(nb), "bin_visits": torch.ones(nb), "lr_scale": 1.0, "cfg": cfg}, path)
+      return path
+
+    def load(path, rollback=False, **over):  # this run: bj31 roots
+      t = tsc.make_trainer(tmp, NB, False)
+      t.cfg = dataclasses.replace(t.cfg, motion_files=[f"/bj31/{n}" for n in names], **over)
+      Trainer.load(t, path, rollback=rollback)
+      return t, [s for s in t.prints if "WARNING" in s]
+
+    v2 = dict(robot_variant="eval+evalcontact", source_weights=_weights(G1V2_SOURCES))
+    g1v2 = ckpt(master_heads_dict(ee_term_z=0.25), **v2)  # bj27 g1v2_scratch model_86000, master format
+    t, w = load(g1v2, **v2)  # same recipe, other roots: silent, sampler state loaded
+    assert w == [] and torch.equal(t.cmd.bin_G, G) and t.it == 86000, w
+    t, w = load(g1v2)  # v2 flags forgotten
+    assert len(w) == 2 and "robot_variant = 'eval+evalcontact' in the checkpoint, '' here" in w[0] and "source_weights" in w[1], w
+    assert torch.equal(t.cmd.bin_G, G)
+    print("  " + "\n  ".join(w))
+    _, w = load(ckpt(master_heads_dict(ee_term_z=0.0), **v2), **v2)  # master default: EE off -> this branch's default on
+    assert w == ["[Trainer] WARNING resume from another setup: heads.ee_termination = False in the checkpoint, True here"], w
+    _, w = load(ckpt(v1_heads_dict()), **v2)  # v1: no EE keys = off
+    assert len(w) == 3 and "heads.ee_termination = False" in w[-1], w
+    _, w = load(ckpt(v1_heads_dict()), heads=HeadsCfg(ee_termination=False, ee_term_z=0.3))  # off on both: threshold moot
+    assert w == [], w
+    _, w = load(ckpt(dataclasses.asdict(HeadsCfg())), heads=HeadsCfg(ee_term_z=0.3), sampler_clamp_returns=True)
+    assert len(w) == 2 and "sampler_clamp_returns = False" in w[0] and "heads.ee_term_z = 0.25 in the checkpoint, 0.3 here" in w[1], w
+    # other clip list: sampler state never lands on other clips
+    for files, nb, why in (([f"/bj27/x{n}" for n in names], NB, "same bin count, other clip list"),
+                           ([f"/bj27/{n}" for n in names[::-1]], NB, "same bin count, other clip list"),
+                           ([f"/bj27/{n}" for n in names[:3]], NB, "same bin count, other clip list"),
+                           (None, 100, "100 bins in the checkpoint, 64 here")):
+      t, w = load(ckpt(dataclasses.asdict(HeadsCfg()), files=files, nb=nb))
+      assert float(t.cmd.bin_G.abs().sum()) == 0.0 and why in w[-1] and "not loaded" in w[-1], (files, w)
+      assert len(w) == (1 if files is None else 2), w  # + the motion-files line
+    print("  " + "\n  ".join(w))
+    # rollback: own checkpoint, settings / clip list not compared
+    t, w = load(g1v2, rollback=True)
+    assert w == [] and torch.equal(t.cmd.bin_G, G)
 
 
 if __name__ == "__main__":

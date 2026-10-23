@@ -535,20 +535,68 @@ class Trainer:
     )
     return path
 
+  def _resume_diffs(self, ck_cfg: dict) -> tuple[list[str], bool]:
+    """(training settings of the checkpoint's run that differ from this run, same clip list). Resume only: a rollback
+    reloads this run's own checkpoint. Keys missing in master / v1 checkpoints take their defaults there (no variant,
+    no prior, no clamp; EE via HeadsCfg.from_dict). Clip lists compare by basename (bj27 vs bj31 roots); no list in
+    the checkpoint = unknown = same."""
+    cur = self.cfg
+
+    def w(x) -> tuple:
+      return tuple((str(k), float(v)) for k, v in (x or ()))
+
+    pairs = [
+      ("robot", ck_cfg.get("robot", "g1"), cur.robot),
+      ("robot_variant", ck_cfg.get("robot_variant", "") or "", cur.robot_variant or ""),
+      ("source_weights", w(ck_cfg.get("source_weights")), w(cur.source_weights)),
+      ("name_weights", w(ck_cfg.get("name_weights")), w(cur.name_weights)),
+      ("sampler_clamp_returns", bool(ck_cfg.get("sampler_clamp_returns", False)), bool(cur.sampler_clamp_returns)),
+    ]
+    diffs = [f"{k} = {a!r} in the checkpoint, {b!r} here" for k, a, b in pairs if a != b]
+    try:
+      hk = HeadsCfg.from_dict(ck_cfg["heads"])
+      a, b = asdict(hk), asdict(cur.heads)
+      if not (hk.ee_termination or cur.heads.ee_termination):  # threshold / temperature unused when off on both
+        for d in (a, b):
+          for k in ("ee_term_z", "ee_term_z_temp"):
+            d.pop(k)
+      diffs += [f"heads.{k} = {a.get(k)!r} in the checkpoint, {b[k]!r} here" for k in b if a.get(k) != b[k]]
+    except Exception as e:  # noqa: BLE001 -- a warning helper must never stop a resume
+      diffs.append(f"heads cfg not comparable ({type(e).__name__}: {e})")
+    same_clips = True
+    ck_files = ck_cfg.get("motion_files")
+    if ck_files is not None:
+      if len(ck_files) != len(cur.motion_files):
+        same_clips = False
+        diffs.append(f"motion files: {len(ck_files)} in the checkpoint, {len(cur.motion_files)} here")
+      elif [os.path.basename(f) for f in ck_files] != [os.path.basename(f) for f in cur.motion_files]:
+        same_clips = False
+        diffs.append(f"motion files: {len(ck_files)} on both, but other basenames / order")
+    return diffs, same_clips
+
   def load(self, path: str, rollback: bool = False) -> None:
     ck = torch.load(path, map_location=self.device, weights_only=False)
+    same_clips = True
+    if not rollback:  # resume: v2 options / EE / data are silent dimensions -> say what differs (identical on every rank)
+      diffs, same_clips = self._resume_diffs(ck.get("cfg") or {})
+      for d in diffs:
+        self._print(f"[Trainer] WARNING resume from another setup: {d}")
     self.policy.load_state_dict(ck["policy"])
     self.critic.load_state_dict(ck["critic"])
     self.wm.load_state_dict(ck["wm"])
     self.opt_wm.load_state_dict(ck["opt_wm"])
     self.opt_pi.load_state_dict(ck["opt_pi"])
     self.opt_v.load_state_dict(ck["opt_v"])
-    if ck["bin_G"].shape == self.cmd.bin_G.shape:
+    if ck["bin_G"].shape == self.cmd.bin_G.shape and same_clips:
       self.cmd.bin_G.copy_(ck["bin_G"])
       self.cmd.bin_visits.copy_(ck["bin_visits"])
       if self.cmd.cfg.clamp_returns:  # resume / rollback: the EMA restarts from bounded values (same on every rank)
         n, g_min = self.cmd.clamp_bin_returns_()
         self._print(f"[Trainer] clamp_returns: {n} of {self.cmd.bin_G.numel()} loaded bin returns clamped to [0, {self.cmd.cfg.g_max:g}] (min before {g_min:.3f})")
+    else:  # bins of another library: they would land on the wrong clips
+      why = (f"{ck['bin_G'].numel()} bins in the checkpoint, {self.cmd.bin_G.numel()} here" if ck["bin_G"].shape != self.cmd.bin_G.shape
+             else "same bin count, other clip list")
+      self._print(f"[Trainer] WARNING reset-sampler state (bin_G / bin_visits) of {path} not loaded ({why}): the return-based sampler starts from scratch")
     self.it = ck["it"]
     self.env_steps = ck["env_steps"]
     for s in self.sched:

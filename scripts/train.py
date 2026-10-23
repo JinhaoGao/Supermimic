@@ -49,12 +49,14 @@ def motion_files_from_args(args) -> list[str]:
   --blacklist / --name_exclude / --max_motions."""
   if args.motion_list:
     files = [l.strip() for l in open(os.path.expanduser(args.motion_list)) if l.strip()]
+    # Any missing file is fatal (here, on rank 0, before the broadcast): the list is used verbatim and is the cache
+    # key, nothing is dropped. Otherwise build_cache dies on the first missing header (rank 0 only, the others hang
+    # in the barrier until torchrun tears them down), or, with a cache of this exact list, trains on the stale clips.
     missing = [f for f in files if not os.path.exists(f)]
     if missing:
       msg = f"--motion_list {args.motion_list}: {len(missing)} of {len(files)} files do not exist here (first: {missing[0]})"
-      if len(missing) == len(files):
-        raise FileNotFoundError(msg + " -- a list written on another machine?")
-      print(f"[train] WARNING {msg}; they fail the cache build and are dropped", flush=True)
+      raise FileNotFoundError(msg + (" -- a list written on another machine?" if len(missing) == len(files) else
+                                     " -- fix the list (it is used verbatim, nothing is dropped)"))
   else:
     from supermimic.motions import collect_motion_files
 

@@ -188,8 +188,14 @@ on|off` / `--ee_term_z`).
   unchanged (the prior is constant and shared; it never enters bin_G / bin_visits); with `--sampler_clamp_returns` the
   clamp acts on the softmax's returns only, the prior on the uniform share only.
 * `--motion_list` (a run's `motion_files.txt`) replaces `--motion_dirs` / `--blacklist`; rank 0 reads it and
-  broadcasts it like the directory scan. A list of paths from another machine fails fast (all files missing).
-* `scripts/launch_bj31_v2.example.sh`: the bj27 `g1v2_scratch` recipe (87.01% v4 at 86000) per rank on bj31's 8 GPUs.
+  broadcasts it like the directory scan. It is used verbatim (it is the cache key): any listed file missing on this
+  machine fails fast on rank 0, before the broadcast (a list from another machine: all missing); nothing is dropped.
+* `scripts/launch_bj31_v2.example.sh`: the bj27 `g1v2_scratch` recipe (87.01% v4 at 86000) per rank on bj31's 8 GPUs,
+  on g1v2_scratch's exact clip list (`DATASET=v2list`, default) or on the r52 set (`DATASET=dir`: same v2 options,
+  different data and source shares, not a replication).
+* Resume (`--resume`) prints a WARNING for every training setting of the checkpoint's run that differs from this run
+  (robot / variant, source / name weights, heads incl. EE termination, sampler clamp, clip list) and skips the reset
+  sampler's state, with a WARNING, when the clip list differs (bin count, or basenames / order).
 
 ## Layout
 
