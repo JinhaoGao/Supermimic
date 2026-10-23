@@ -199,6 +199,8 @@ class LibraryMotionCommand(MotionCommand):
     finite = torch.isfinite(returns)
     if not bool(finite.all()):
       bin_ids, returns = bin_ids[finite], returns[finite]
+    if self.cfg.clamp_returns:
+      returns = returns.clamp(0.0, self.cfg.g_max)
     if bin_ids.numel() == 0:
       return
     NB = self.library.num_bins
@@ -217,7 +219,8 @@ class LibraryMotionCommand(MotionCommand):
     c = self.cfg
     NB = self.library.num_bins
     uniform = self.bin_prior if self.bin_prior is not None else torch.full((NB,), 1.0 / NB, device=self.device)
-    G = torch.where(self.bin_visits > 0, self.bin_G, torch.full_like(self.bin_G, c.g_max * 0.5))
+    bin_G = self.bin_G.clamp(0.0, c.g_max) if c.clamp_returns else self.bin_G
+    G = torch.where(self.bin_visits > 0, bin_G, torch.full_like(self.bin_G, c.g_max * 0.5))
     soft = torch.softmax(-c.softmax_temp * G / c.g_max, dim=0)
     hist = self.bin_weight_hist / self.bin_weight_hist.sum()
     probs = c.mix_uniform * uniform + c.mix_softmax * soft + c.mix_history * hist
@@ -338,6 +341,10 @@ class LibraryMotionCommandCfg(MotionCommandCfg):
   softmax_temp: float = 25.0
   g_max: float = 10.0
   return_ema: float = 0.05
+  # Clamp bin returns (EMA input and sampled G) to [0, g_max]. Off = paper: a clip-end bin whose last reward is
+  # negative (joint-limit penalty) gets G << 0 through the time-out bootstrap r_last / (1 - gamma) and takes the whole
+  # softmax + history share (sampler/top1_prob 0.5 in every G1 run; found by the bj31 session, branch ddp-bj31 5bb8c0d).
+  clamp_returns: bool = False
   weight_ema: float = 0.01
   source_weights: tuple = ()  # ((source prefix, weight), ...): prior of the uniform share, see LibraryMotionCommand
   name_weights: tuple = ()  # ((name keyword, weight), ...): max with the source weight (case-insensitive substring)

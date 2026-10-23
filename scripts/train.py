@@ -37,6 +37,7 @@ def main():
                  help="clip-name keywords (comma-separated, case-insensitive) of the hard set for --hard_term_schedule")
   p.add_argument("--hard_term_schedule", type=str, default="",
                  help="termination multiplier of the hard set, piecewise linear over absolute iterations, e.g. 104000:2,108000:2,114000:1")
+  p.add_argument("--sampler_clamp_returns", action="store_true", help="clamp reset-sampler bin returns to [0, g_max]")
   p.add_argument("--ee_term_z", type=float, default=0.0,
                  help="end-effector height termination in m (env + soft head); 0 = off as in the paper, 0.25 = BeyondMimic / team benchmark")
   p.add_argument("--run_name", type=str, default="run")
@@ -90,6 +91,7 @@ def main():
     source_weights=tuple((kv.split("=")[0], float(kv.split("=")[1])) for kv in args.source_weights.split(",") if kv),
     name_weights=tuple((kv.split("=")[0], float(kv.split("=")[1])) for kv in args.name_weights.split(",") if kv),
     hard_names=tuple(k for k in args.hard_names.split(",") if k),
+    sampler_clamp_returns=args.sampler_clamp_returns,
     hard_term_schedule=tuple((int(kv.split(":")[0]), float(kv.split(":")[1])) for kv in args.hard_term_schedule.split(",") if kv),
     num_envs=args.num_envs,
     device=args.device,

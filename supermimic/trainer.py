@@ -47,6 +47,7 @@ class TrainCfg:
   # iterations ((it, mult), ...), constant outside; e.g. ((104000, 2.0), (108000, 2.0), (114000, 1.0)).
   hard_names: tuple = ()
   hard_term_schedule: tuple = ()
+  sampler_clamp_returns: bool = False  # reset sampler bin returns clamped to [0, g_max] (library_command)
   num_envs: int = 4096
   device: str = "cuda:0"
   seed: int = 0
@@ -140,7 +141,7 @@ class Trainer:
       cfg.motion_files, cfg.num_envs, mode="train", episode_length_s=cfg.episode_length_s, robot=cfg.robot,
       library_key=self.LIB_KEY, cache_dir=cfg.cache_dir, num_workers=cfg.num_workers,
       ee_term_z=cfg.heads.ee_term_z, robot_variant=cfg.robot_variant, source_weights=cfg.source_weights,
-      name_weights=cfg.name_weights, hard_names=cfg.hard_names,
+      name_weights=cfg.name_weights, hard_names=cfg.hard_names, clamp_returns=cfg.sampler_clamp_returns,
     )
     env_cfg.seed = cfg.seed
     self.env = ManagerBasedRlEnv(cfg=env_cfg, device=self.device)
@@ -457,6 +458,8 @@ class Trainer:
       self.cmd.bin_G[:nb].copy_(ck["bin_G"])
       self.cmd.bin_visits[:nb].copy_(ck["bin_visits"])
       print(f"[Trainer] sampler statistics of {nb} bins restored into the extended library ({self.cmd.bin_G.shape[0]} bins)")
+    if self.cfg.sampler_clamp_returns:
+      self.cmd.bin_G.clamp_(0.0, self.cmd.cfg.g_max)
     self.it = ck["it"]
     self.env_steps = ck["env_steps"]
     for s in self.sched:
