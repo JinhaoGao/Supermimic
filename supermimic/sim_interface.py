@@ -46,6 +46,12 @@ class SimInterface:
     env_thr = float(ee_term.params["threshold"]) if ee_term is not None else 0.0
     if abs(env_thr - heads_cfg.ee_term_z) > 1e-9:
       raise ValueError(f"env ee_body_pos threshold {env_thr} != heads ee_term_z {heads_cfg.ee_term_z}")
+    # Root-orientation termination: same switch / threshold in the env (root_ori) and the heads.
+    ro_term = env.cfg.terminations.get("root_ori")
+    ro_thr = float(ro_term.params["threshold"]) if ro_term is not None else 0.0
+    if abs(ro_thr - heads_cfg.root_ori_term) > 1e-9:
+      raise ValueError(f"env root_ori threshold {ro_thr} != heads root_ori_term {heads_cfg.root_ori_term}")
+    ro_idx = tracked_names.index(ro_term.params["body_name"]) if ro_term is not None else None
     self.heads = AnalyticHeads(
       self.fk,
       tracked_local,
@@ -54,6 +60,7 @@ class SimInterface:
       self.robot.data.soft_joint_pos_limits[0],
       heads_cfg,
       ee_indices=ee_idx,
+      root_ori_index=ro_idx,
     )
     self.nj = self.heads.nj
     self.xi_dim = 4 + self.nj

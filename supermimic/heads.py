@@ -28,6 +28,7 @@ import torch
 
 from .fk import TorchFK
 from .math_utils import (
+  quat_angle,
   quat_apply,
   quat_apply_inverse,
   quat_error_magnitude,
@@ -81,6 +82,12 @@ class HeadsCfg:
   # MotionAtlas v4 benchmark terminates on it at 0.25 m, so v2 runs train with it (env + soft head).
   ee_term_z: float = 0.0
   ee_term_temp: float = 0.02
+  # Root-orientation termination (branch ddp-bj31-v2 ecc551f, 10-25; +1.0 pp on v4 there): fail when the robot root's
+  # (G1 pelvis) full rotation angle vs the reference, yaw included, exceeds root_ori_term rad, the eval site's root_ori
+  # test at 1.0 (the anchor tilt test sees neither the yaw nor the pelvis / torso decoupling through the waist); soft
+  # term sigmoid((angle - A) / root_ori_term_temp) in the noisy-OR. 0 = off.
+  root_ori_term: float = 0.0
+  root_ori_term_temp: float = 0.05
   extra: dict = field(default_factory=dict)
 
   @property
@@ -105,6 +112,7 @@ class AnalyticHeads:
     soft_joint_limits: torch.Tensor,
     cfg: HeadsCfg,
     ee_indices: list[int] | None = None,
+    root_ori_index: int | None = None,
   ):
     self.fk = fk
     self.cfg = cfg
@@ -113,6 +121,9 @@ class AnalyticHeads:
     self.ee = torch.as_tensor(list(ee_indices or []), dtype=torch.long, device=self.device)  # within the tracked list
     if cfg.ee_term_z > 0 and self.ee.numel() == 0:
       raise ValueError("ee_term_z > 0 needs the end-effector bodies (env termination 'ee_body_pos')")
+    self.root_ori = root_ori_index  # root body (pelvis) within the tracked-body list (root_ori_term)
+    if cfg.root_ori_term > 0 and root_ori_index is None:
+      raise ValueError("root_ori_term > 0 needs the root body's index in the tracked-body list")
     self.anchor = anchor_index  # index within the tracked-body list
     self.anchor_local = int(tracked_local_ids[anchor_index])
     self.nj = default_joint_pos.shape[-1]
@@ -280,4 +291,8 @@ class AnalyticHeads:
       ez = (ref_bp[:, self.ee, 2] - kin_next["body_pos"][:, self.ee, 2]).abs()  # [B, n_ee]
       hard = hard | (ez > c.ee_term_z * k[:, None]).any(-1)
       alive = alive * (1.0 - torch.sigmoid((ez - c.ee_term_z * k[:, None]) / (c.ee_term_temp * k[:, None]))).prod(-1)
+    if c.root_ori_term > 0:
+      ang = quat_angle(ref_bq[:, self.root_ori], kin_next["body_quat"][:, self.root_ori])
+      hard = hard | (ang > c.root_ori_term * k)
+      alive = alive * (1.0 - torch.sigmoid((ang - c.root_ori_term * k) / (c.root_ori_term_temp * k)))
     return hard, 1.0 - alive

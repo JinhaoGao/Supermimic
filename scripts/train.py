@@ -54,6 +54,10 @@ def main():
   p.add_argument("--goal_ref_root", action="store_true",
                  help="goal frames + reference anchor height / body-frame lin & ang vel / projected gravity (no odometry needed)")
   p.add_argument("--critic_errors", action="store_true", help="privileged tracking-error features for the critic")
+  p.add_argument("--root_ori_term", type=float, default=0.0,
+                 help="terminate when the robot root's (G1 pelvis) full rotation angle vs the reference, yaw included, exceeds "
+                      "this [rad] (env + soft term in imagination); 1.0 = the eval site's root_ori test; 0 = off")
+  p.add_argument("--root_ori_term_temp", type=float, default=0.05, help="sigmoid temperature of the imagined root_ori term")
   p.add_argument("--wm_body_frame", action="store_true",
                  help="WM features / targets in the root frame (no ZYX heading, singular at pitch +-90 deg); resuming a "
                       "heading-frame checkpoint starts a fresh WM -> use --policy_delay")
@@ -152,7 +156,7 @@ def main():
     policy_freeze=args.policy_freeze,
     wm_delay_lr=args.wm_delay_lr,
     heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos, goal_ref_root=args.goal_ref_root, critic_errors=args.critic_errors,
-                   ee_term_z=args.ee_term_z),
+                   ee_term_z=args.ee_term_z, root_ori_term=args.root_ori_term, root_ori_term_temp=args.root_ori_term_temp),
   )
   print(f"[train] log_dir = {log_dir}")
   os.makedirs(log_dir, exist_ok=True)

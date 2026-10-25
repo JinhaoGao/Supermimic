@@ -41,7 +41,7 @@ class Evaluator:
     self.num_envs = min(self.num_clips, max_envs)
     env_cfg = make_env_cfg(
       motion_files, self.num_envs, mode="eval", robot=robot, library_key=library_key, eval_clips=self.eval_clips, cache_dir=cache_dir,
-      ee_term_z=heads_cfg.ee_term_z, robot_variant=robot_variant,
+      ee_term_z=heads_cfg.ee_term_z, robot_variant=robot_variant, root_ori_term=heads_cfg.root_ori_term,
     )
     self.env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
     self.sim = SimInterface(self.env, heads_cfg)

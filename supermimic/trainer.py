@@ -179,6 +179,7 @@ class Trainer:
       library_key=self.LIB_KEY, cache_dir=cfg.cache_dir, num_workers=cfg.num_workers,
       ee_term_z=cfg.heads.ee_term_z, robot_variant=cfg.robot_variant, source_weights=cfg.source_weights,
       name_weights=cfg.name_weights, hard_names=cfg.hard_names, clamp_returns=cfg.sampler_clamp_returns,
+      root_ori_term=cfg.heads.root_ori_term,
     )
     env_cfg.seed = cfg.seed
     self.env = ManagerBasedRlEnv(cfg=env_cfg, device=self.device)

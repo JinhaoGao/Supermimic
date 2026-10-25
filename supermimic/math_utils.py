@@ -71,6 +71,14 @@ def quat_error_magnitude(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
   return torch.linalg.norm(axis_angle_from_quat(quat_mul(q1, quat_conjugate(q2))), dim=-1)
 
 
+def quat_angle(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+  """Full rotation angle in [0, pi] between q1 and q2 (yaw included): 2 atan2(|v|, |w|) of q1 q2^*. The team eval
+  site's quat_error_angle (2 arccos(|w|) of normalized quaternions) without normalization and with finite gradients
+  everywhere (ported from branch ddp-bj31-v2 ecc551f)."""
+  dq = quat_mul(q1, quat_conjugate(q2))
+  return 2.0 * torch.atan2(torch.linalg.vector_norm(dq[..., 1:], dim=-1), dq[..., 0].abs())
+
+
 def matrix_from_quat(q: torch.Tensor) -> torch.Tensor:
   w, x, y, z = q.unbind(-1)
   two_s = 2.0 / (q * q).sum(-1)

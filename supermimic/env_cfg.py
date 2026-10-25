@@ -19,7 +19,10 @@ from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationT
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.tasks.tracking import mdp
 
-from .library_command import LibraryMotionCommandCfg, motion_clip_end
+from .library_command import LibraryMotionCommandCfg, bad_root_ori_full, motion_clip_end
+
+# Robot root (free-joint) body: the body of the root-orientation termination (the eval site compares qpos[3:7]).
+ROOT_BODY = {"g1": "pelvis", "e2": "base_link"}
 
 
 def _zero_joint_damping(spec_fn):
@@ -92,6 +95,7 @@ def make_env_cfg(
   name_weights: tuple = (),
   hard_names: tuple = (),
   clamp_returns: bool = False,
+  root_ori_term: float = 0.0,
 ) -> ManagerBasedRlEnvCfg:
   assert mode in ("train", "eval")
   cfg = base_tracking_cfg(robot, robot_variant)
@@ -157,6 +161,10 @@ def make_env_cfg(
     cfg.terminations["anchor_ori"].func = scaled_anchor_ori
     if "ee_body_pos" in cfg.terminations:
       cfg.terminations["ee_body_pos"].func = scaled_body_pos_z
+  if root_ori_term > 0:  # the eval site's root_ori test (train and eval mode, like ee_body_pos); HeadsCfg.root_ori_term
+    cfg.terminations["root_ori"] = TerminationTermCfg(
+      func=bad_root_ori_full, params={"command_name": "motion", "threshold": float(root_ori_term), "body_name": ROOT_BODY[robot]}
+    )
   cfg.terminations["clip_end"] = TerminationTermCfg(
     func=motion_clip_end, params={"command_name": "motion"}, time_out=True
   )
