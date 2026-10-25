@@ -45,6 +45,12 @@ class HeadsCfg:
   hist: int = 10  # proprioceptive history length
   dt: float = 0.02
   goal_anchor_pos: bool = False  # include ref anchor position relative to the robot anchor (needs odometry on hardware)
+  # + per goal frame the reference anchor's height, body-frame linear / angular velocity and projected gravity (10 values,
+  # reference side only, so deployable without odometry; every open-source reproduction feeds the reference root motion)
+  goal_ref_root: bool = False
+  # Privileged tracking errors as extra critic inputs (training only): per tracked body the position error in the robot
+  # anchor frame and the orientation error angle, plus the anchor height error, against goal frame 0.
+  critic_errors: bool = False
   # Sensor noise (uniform half-widths), Table A.1.
   noise_joint_pos: float = 0.01
   noise_joint_vel: float = 0.5
@@ -114,7 +120,8 @@ class AnalyticHeads:
     self.soft_lim = soft_joint_limits.to(self.device).reshape(self.nj, 2)
     self.gravity = torch.tensor([0.0, 0.0, -1.0], device=self.device)
     self.proprio_dim = 3 * self.nj + 6
-    self.goal_frame_dim = 2 * self.nj + 6 + (3 if cfg.goal_anchor_pos else 0)
+    self.goal_frame_dim = sum(n for _, n in self.goal_layout())
+    self.critic_err_dim = 4 * len(tracked_local_ids) + 1 if cfg.critic_errors else 0
     self.state_dim = 13 + 2 * self.nj
     self.feat_dim = 13 + 2 * self.nj  # 1 + 6 + 3 + 3 + 2J
 
@@ -151,6 +158,12 @@ class AnalyticHeads:
       [p[:, 2:3], rot6d_from_quat(rot_local), quat_apply_inverse(yq, v), quat_apply_inverse(qw, w), q, qd], dim=-1
     )
 
+  def goal_layout(self, cfg: HeadsCfg | None = None) -> list[tuple[str, int]]:
+    """Segments of one goal frame (name, size) in order; cfg defaults to this head's (graft: a checkpoint's)."""
+    c = cfg or self.cfg
+    out = [("q", self.nj), ("qd", self.nj)] + ([("anchor_pos", 3)] if c.goal_anchor_pos else []) + [("rot6d", 6)]
+    return out + ([("ref_root", 10)] if c.goal_ref_root else [])
+
   # ---- observation ---------------------------------------------------------
 
   def proprio(self, s: torch.Tensor, prev_action: torch.Tensor, bias: torch.Tensor, noise: bool) -> torch.Tensor:
@@ -166,8 +179,10 @@ class AnalyticHeads:
       q_rel, qd, w_b, g_b = u(q_rel, c.noise_joint_pos), u(qd, c.noise_joint_vel), u(w_b, c.noise_ang_vel), u(g_b, c.noise_gravity)
     return torch.cat([q_rel, qd, w_b, g_b, prev_action], dim=-1)
 
-  def goal(self, kin: dict, ref_q: torch.Tensor, ref_qd: torch.Tensor, ref_ap: torch.Tensor, ref_aq: torch.Tensor) -> torch.Tensor:
-    """K reference frames relative to the robot anchor. Inputs [B,K,*] -> [B,K,G]."""
+  def goal(self, kin: dict, ref_q: torch.Tensor, ref_qd: torch.Tensor, ref_ap: torch.Tensor, ref_aq: torch.Tensor,
+           ref_av: torch.Tensor | None = None, ref_aw: torch.Tensor | None = None) -> torch.Tensor:
+    """K reference frames relative to the robot anchor. Inputs [B,K,*] -> [B,K,G]. ref_av / ref_aw: reference anchor
+    linear / angular velocity (world), needed with goal_ref_root."""
     B, K = ref_q.shape[0], ref_q.shape[1]
     rob_ap = kin["anchor_pos"][:, None, :].expand(B, K, 3).reshape(-1, 3)
     rob_aq = kin["anchor_quat"][:, None, :].expand(B, K, 4).reshape(-1, 4)
@@ -176,7 +191,25 @@ class AnalyticHeads:
     if self.cfg.goal_anchor_pos:
       parts.append(rel_p.view(B, K, 3))
     parts.append(rot6d_from_quat(rel_q).view(B, K, 6))
+    if self.cfg.goal_ref_root:
+      aq = ref_aq.reshape(-1, 4)
+      v_b = quat_apply_inverse(aq, ref_av.reshape(-1, 3)).view(B, K, 3)
+      w_b = quat_apply_inverse(aq, ref_aw.reshape(-1, 3)).view(B, K, 3)
+      g_b = quat_apply_inverse(aq, self.gravity.expand(B * K, 3)).view(B, K, 3)
+      parts += [ref_ap[..., 2:3], v_b, w_b, g_b]
     return torch.cat(parts, dim=-1)
+
+  def critic_errors(self, kin: dict, ref_bp: torch.Tensor, ref_bq: torch.Tensor) -> torch.Tensor:
+    """[B, 4*Bt+1] tracking errors of the state (kin) against reference bodies [B,Bt,*] re-anchored as in the reward:
+    position error in the robot anchor frame (full rotation: no yaw singularity when inverted), orientation error
+    angle, anchor height error."""
+    body_pos_rel, body_quat_rel, ref_ap, _ = self.relative_reference(kin, ref_bp, ref_bq)
+    B, Bt = ref_bp.shape[0], ref_bp.shape[1]
+    aq = kin["anchor_quat"][:, None, :].expand(B, Bt, 4).reshape(-1, 4)
+    dp = quat_apply_inverse(aq, (body_pos_rel - kin["body_pos"]).reshape(-1, 3)).view(B, Bt * 3)
+    dq = quat_error_magnitude(body_quat_rel.reshape(-1, 4), kin["body_quat"].reshape(-1, 4)).view(B, Bt)
+    dz = (ref_ap[:, 2] - kin["anchor_pos"][:, 2])[:, None]
+    return torch.cat([dp, dq, dz], dim=-1)
 
   # ---- reward --------------------------------------------------------------
 

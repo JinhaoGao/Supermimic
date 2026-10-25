@@ -44,9 +44,11 @@ class Policy(nn.Module):
 
 
 class Critic(nn.Module):
-  def __init__(self, feat_dim: int, goal_frame_dim: int, K: int, xi_dim: int, hidden: tuple[int, ...] = (256, 128)):
+  def __init__(self, feat_dim: int, goal_frame_dim: int, K: int, xi_dim: int, hidden: tuple[int, ...] = (256, 128), err_dim: int = 0):
     super().__init__()
-    self.net = mlp(feat_dim + K * goal_frame_dim + xi_dim, hidden, 1, act=nn.ELU)
+    # feat_n = [state features, normalized tracking errors (err_dim, HeadsCfg.critic_errors)]
+    self.err_norm = RunningMeanStd(err_dim) if err_dim else None
+    self.net = mlp(feat_dim + err_dim + K * goal_frame_dim + xi_dim, hidden, 1, act=nn.ELU)
 
   def forward(self, feat_n: torch.Tensor, goal_n: torch.Tensor, xi: torch.Tensor) -> torch.Tensor:
     B = feat_n.shape[0]

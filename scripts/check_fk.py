@@ -99,8 +99,8 @@ def main():
       prev_a = a
     kin = heads.kin(state)
   # Goal refs sanity.
-  ref_q, ref_qd, ref_ap, ref_aq = sim.goal_refs(cmd.time_steps.clone(), cmd.clip_end_env.clone())
-  g = heads.goal(kin, ref_q, ref_qd, ref_ap, ref_aq)
+  refs = sim.goal_refs(cmd.time_steps.clone(), cmd.clip_end_env.clone())
+  g = heads.goal(kin, *refs)
   print("goal shape:", tuple(g.shape), "finite:", bool(torch.isfinite(g).all()))
   print("\nmax abs errors over rollout:")
   for k, v in worst.items():

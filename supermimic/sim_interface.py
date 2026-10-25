@@ -109,17 +109,21 @@ class SimInterface:
 
   @torch.no_grad()
   def goal_refs(self, frame: torch.Tensor, clip_end: torch.Tensor):
-    """K-frame goal references for all envs: (ref_q [E,K,J], ref_qd, ref_ap [E,K,3], ref_aq [E,K,4])."""
+    """K-frame goal references for all envs: (ref_q [E,K,J], ref_qd, ref_ap [E,K,3], ref_aq [E,K,4], ref_av [E,K,3],
+    ref_aw [E,K,3]); the anchor velocities (world) only with goal_ref_root, else None."""
     K = self.heads.cfg.K
     E = frame.shape[0]
     fr = window_frames(frame, clip_end, K).reshape(-1)
-    g = self.lib.gather(fr, fields=["joint_pos", "joint_vel", "body_pos", "body_quat"])
+    vel = self.heads.cfg.goal_ref_root
+    g = self.lib.gather(fr, fields=["joint_pos", "joint_vel", "body_pos", "body_quat"] + (["body_lin_vel", "body_ang_vel"] if vel else []))
     a = self.heads.anchor
     return (
       g["joint_pos"].view(E, K, -1),
       g["joint_vel"].view(E, K, -1),
       g["body_pos"].view(E, K, -1, 3)[:, :, a],
       g["body_quat"].view(E, K, -1, 4)[:, :, a],
+      g["body_lin_vel"].view(E, K, -1, 3)[:, :, a] if vel else None,
+      g["body_ang_vel"].view(E, K, -1, 3)[:, :, a] if vel else None,
     )
 
   def current_ref(self) -> tuple:

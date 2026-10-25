@@ -57,6 +57,8 @@ def main():
   heads = {k: v for k, v in ck["cfg"]["heads"].items() if k != "extra"}
   nj = ck["dims"]["nj"]
   heads["goal_anchor_pos"] = ck["dims"]["goal_frame"] == 2 * nj + 9  # old checkpoints lack the flag
+  heads.setdefault("goal_ref_root", False)
+  heads.setdefault("critic_errors", False)
   mj = env.sim.mj_model
   # PD gains per policy joint (mjlab builtin position actuators: gainprm[0] = kp, biasprm[2] = -kd).
   pd_kp, pd_kd = [], []
@@ -160,7 +162,9 @@ def export_onnx(ck: dict, meta: dict, path: str) -> None:
     "goal": f"[1,{d['K']},{d['goal_frame']}] future reference frames t..t+K-1 (clamped at clip end); per frame: "
     f"ref_joint_pos({nj}), ref_joint_vel({nj}), "
     + ("ref_anchor_pos_in_robot_anchor_frame(3), " if meta["heads"]["goal_anchor_pos"] else "")
-    + "ref_anchor_rot6d_in_robot_anchor_frame(6)",
+    + "ref_anchor_rot6d_in_robot_anchor_frame(6)"
+    + (", ref_anchor_height_world(1), ref_anchor_lin_vel_in_ref_anchor_frame(3), ref_anchor_ang_vel_in_ref_anchor_frame(3), "
+       "ref_anchor_projected_gravity(3)" if meta["heads"]["goal_ref_root"] else ""),
     "action": f"[1,{nj}] in action_joint_names order; joint target = action_offset + action_scale * action",
   }
   model = onnx.load(path)
@@ -175,6 +179,9 @@ def export_onnx(ck: dict, meta: dict, path: str) -> None:
     "body_names": json.dumps(meta["body_names"]),
     "anchor_body_name": meta["anchor_body_name"],
     "layout": json.dumps(layout),
+    # goal frame segments in order (evaluators / deploy code dispatch on this): q, qd, [anchor_pos,] rot6d[, ref_root]
+    "goal_layout": ",".join(["q", "qd"] + (["anchor_pos"] if meta["heads"]["goal_anchor_pos"] else []) + ["rot6d"]
+                            + (["ref_root"] if meta["heads"]["goal_ref_root"] else [])),
   }
   if "pd_kp" in meta:  # robot constants for external MuJoCo evaluators (explicit PD, see main())
     props["joint_stiffness"] = json.dumps(meta["pd_kp"])

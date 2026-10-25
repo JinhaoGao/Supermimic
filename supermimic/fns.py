@@ -35,8 +35,8 @@ class StepFns:
     obs = self.heads.proprio(state, prev_action, bias, noise)
     return kin, obs
 
-  def _act(self, obs_hist, kin, ref_q, ref_qd, ref_ap, ref_aq):
-    goal = self.heads.goal(kin, ref_q, ref_qd, ref_ap, ref_aq)
+  def _act(self, obs_hist, kin, ref_q, ref_qd, ref_ap, ref_aq, ref_av=None, ref_aw=None):
+    goal = self.heads.goal(kin, ref_q, ref_qd, ref_ap, ref_aq, ref_av, ref_aw)
     a = self.policy(obs_hist, goal)
     return goal, a
 
@@ -49,27 +49,39 @@ class StepFns:
 
   # ---- imagination (grad) --------------------------------------------------
 
-  def critic_inputs(self, s, goal):
+  def critic_inputs(self, s, goal, err=None):
+    """Normalized critic inputs; err (critic_errors) is appended to the state features."""
     feat = self.wm.features(s)
     fd = self.heads.feat_dim
     c = self.policy.input_clip
     feat_n = ((feat - self.wm.in_norm.mean[:fd]) / self.wm.in_norm.std[:fd]).clamp(-c, c)
+    if err is not None:
+      feat_n = torch.cat([feat_n, self.critic.err_norm.normalize(err).clamp(-c, c)], dim=-1)
     goal_n = self.policy.goal_norm.normalize(goal).clamp(-c, c)
     return feat_n, goal_n
 
-  def goal_from_pack(self, kin, f_loc, clip_end_loc, p_q, p_qd, p_bp, p_bq):
+  def critic_err(self, kin, f_loc, p_bp, p_bq):
+    """Critic error features against the reference at the rollouts' local frames (None without critic_errors)."""
+    if not self.heads.critic_err_dim:
+      return None
+    ar = torch.arange(f_loc.shape[0], device=f_loc.device)
+    return self.heads.critic_errors(kin, p_bp[ar, f_loc], p_bq[ar, f_loc])
+
+  def goal_from_pack(self, kin, f_loc, clip_end_loc, p_q, p_qd, p_bp, p_bq, p_blv=None, p_bav=None):
     N = f_loc.shape[0]
     ar = torch.arange(N, device=f_loc.device)[:, None]
     idx = window_frames(f_loc, clip_end_loc, self.heads.cfg.K)  # [N,K]
     a_idx = self.heads.anchor
-    return self.heads.goal(kin, p_q[ar, idx], p_qd[ar, idx], p_bp[ar, idx, a_idx], p_bq[ar, idx, a_idx])
+    vel = self.heads.cfg.goal_ref_root
+    return self.heads.goal(kin, p_q[ar, idx], p_qd[ar, idx], p_bp[ar, idx, a_idx], p_bq[ar, idx, a_idx],
+                           p_blv[ar, idx, a_idx] if vel else None, p_bav[ar, idx, a_idx] if vel else None)
 
   def _imagine_step(self, s, obs_hist, prev_a, f_loc, clip_end_loc, xi, bias, kin, p_q, p_qd, p_bp, p_bq, p_blv, p_bav, term_scale=None):
     heads = self.heads
     N = s.shape[0]
     ar = torch.arange(N, device=s.device)
-    goal = self.goal_from_pack(kin, f_loc, clip_end_loc, p_q, p_qd, p_bp, p_bq)
-    fn, gn = self.critic_inputs(s, goal)
+    goal = self.goal_from_pack(kin, f_loc, clip_end_loc, p_q, p_qd, p_bp, p_bq, p_blv, p_bav)
+    fn, gn = self.critic_inputs(s, goal, self.critic_err(kin, f_loc, p_bp, p_bq))
     a = self.policy(obs_hist, goal)
     s_next = self.wm.step(s, a, xi)
     kin_next = heads.kin(s_next)

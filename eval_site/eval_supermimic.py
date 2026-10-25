@@ -20,6 +20,9 @@ Frame convention: goal row 0 is the frame the state after this control step is s
 likewise the frame the reward compares the next state with. Root angular velocity and gravity come
 from the IMU sensors (as for the other runners), the robot anchor orientation from xquat.
 Exports whose goal carries the reference anchor position (2*nj+9 values, needs odometry) are refused.
+Metadata goal_layout "q,qd,rot6d,ref_root" (round 18, 10-25; absent = "q,qd,rot6d"): each goal frame
+additionally ends with the reference anchor's world height (1), linear velocity (3) and angular velocity
+(3) in the reference anchor frame and its projected gravity (3) -> 2*nj+16 values, reference side only.
 """
 
 from __future__ import annotations
@@ -65,10 +68,14 @@ def configure(runner) -> None:
     (H, P), (K, G) = hist, goal
     if P != 3 * nj + 6:
         raise RuntimeError(f"obs_hist frame has {P} values, expected 3*{nj}+6")
-    if G == 2 * nj + 9:
+    layout = [str(x) for x in (md.get("goal_layout") or ["q", "qd", "rot6d"])]
+    if G == 2 * nj + 9 or "anchor_pos" in layout:
         raise RuntimeError("goal carries the reference anchor position (needs odometry); export a deployable policy")
-    if G != 2 * nj + 6:
-        raise RuntimeError(f"goal frame has {G} values, expected 2*{nj}+6")
+    if layout not in (["q", "qd", "rot6d"], ["q", "qd", "rot6d", "ref_root"]):
+        raise RuntimeError(f"unsupported goal_layout {layout}")
+    ref_root = layout[-1] == "ref_root"
+    if G != 2 * nj + 6 + (10 if ref_root else 0):
+        raise RuntimeError(f"goal frame has {G} values, expected 2*{nj}+6{' + 10' if ref_root else ''} (goal_layout {layout})")
     if cfg.obs_expected_input_dim is not None and H * P + K * G != cfg.obs_expected_input_dim:
         raise RuntimeError(f"profile expects input {cfg.obs_expected_input_dim}, ONNX has {H * P + K * G}")
     if cfg.rotation_6d_layout != "matrix_3x2_row_major":
@@ -91,6 +98,7 @@ def configure(runner) -> None:
         "H": H,
         "K": K,
         "ref_anchor": runner.motion.body_names.index(runner.anchor_body_name),
+        "ref_root": ref_root,
         "output": "action" if "action" in outputs else outputs[0],
         "hist": None,
     }
@@ -116,7 +124,13 @@ def goal_window(runner, timestep: int) -> np.ndarray:
     robot_rot = quat_to_matrix(runner.data.xquat[runner.anchor_body_id])
     ref_rot = quat_to_matrix(motion.body_quat_w[idx, runner._sm["ref_anchor"]])
     rel = np.einsum("ji,tjk->tik", robot_rot, ref_rot)  # R_robot^T R_ref, [K, 3, 3]
-    return np.concatenate([ref_q, ref_dq, rel[:, :, :2].reshape(K, 6)], axis=1)
+    parts = [ref_q, ref_dq, rel[:, :, :2].reshape(K, 6)]
+    if runner._sm["ref_root"]:
+        a = runner._sm["ref_anchor"]
+        to_ref = lambda v: np.einsum("tji,tj->ti", ref_rot, v)  # noqa: E731  R_ref^T v
+        parts += [motion.body_pos_w[idx, a, 2:3].astype(np.float64), to_ref(motion.body_lin_vel_w[idx, a].astype(np.float64)),
+                  to_ref(motion.body_ang_vel_w[idx, a].astype(np.float64)), to_ref(np.broadcast_to(GRAVITY, (K, 3)))]
+    return np.concatenate(parts, axis=1)
 
 
 def act(runner, timestep: int) -> np.ndarray:

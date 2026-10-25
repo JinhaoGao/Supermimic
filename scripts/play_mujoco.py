@@ -148,7 +148,11 @@ class MujocoPlayer:
     if self.h.get("goal_anchor_pos", True):
       parts.append(rel_p)  # needs odometry on hardware; off in deployable policies
     parts.append(rot6d_from_quat(rel_q))
-    return torch.cat(parts, dim=-1)  # [K, 67] or [K, 64]
+    if self.h.get("goal_ref_root", False):  # reference anchor height, body-frame lin / ang vel, projected gravity
+      raq = ref.bq[fr, ref.anchor]
+      parts += [ref.bp[fr, ref.anchor][:, 2:3], quat_apply_inverse(raq, ref.blv[fr, ref.anchor]),
+                quat_apply_inverse(raq, ref.bav[fr, ref.anchor]), quat_apply_inverse(raq, GRAVITY.expand(self.K, 3))]
+    return torch.cat(parts, dim=-1)  # [K, 2J+6] (+3 anchor_pos, +10 ref_root)
 
   def set_reference_pose(self, dd: mujoco.MjData, ref: Reference, frame: int, with_velocity: bool = True):
     dd.qpos[self.fq : self.fq + 3] = ref.bp[frame, ref.root].numpy()

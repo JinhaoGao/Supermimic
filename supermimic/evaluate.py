@@ -92,9 +92,9 @@ class Evaluator:
     limit = max_steps or int(clip_len.sum().item() / E * 2) + int(clip_len.max().item()) + 10
     policy.eval()
     for _ in range(limit):
-      ref_q, ref_qd, ref_ap, ref_aq = sim.goal_refs(frame, clip_end)
+      refs = sim.goal_refs(frame, clip_end)
       ref_cur = sim.current_ref()
-      _, a = fns.act(hist.buf, kin, ref_q, ref_qd, ref_ap, ref_aq)
+      _, a = fns.act(hist.buf, kin, *refs)
       env.step(a)
       next_state = sim.state()
       r, _ = fns.post(next_state, kin, a, prev_action, *ref_cur)

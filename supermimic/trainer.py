@@ -19,7 +19,7 @@ import os
 import random
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 
 import numpy as np
 import torch
@@ -28,7 +28,7 @@ from torch.utils.tensorboard import SummaryWriter
 from .env_cfg import make_env_cfg
 from .evaluate import Evaluator
 from .fns import StepFns
-from .heads import HeadsCfg
+from .heads import HeadsCfg, window_frames
 from .policy import Critic, Policy
 from .replay import ReplayBuffer
 from .sim_interface import ObsHistory, SimInterface
@@ -173,7 +173,7 @@ class Trainer:
     assert abs(self.dt - hc.dt) < 1e-9, f"env dt {self.dt} != heads dt {hc.dt}"
 
     self.policy = Policy(self.heads.proprio_dim, hc.hist, self.heads.goal_frame_dim, hc.K, self.nj, input_clip=cfg.input_clip).to(self.device)
-    self.critic = Critic(self.heads.feat_dim, self.heads.goal_frame_dim, hc.K, self.xi_dim).to(self.device)
+    self.critic = Critic(self.heads.feat_dim, self.heads.goal_frame_dim, hc.K, self.xi_dim, err_dim=self.heads.critic_err_dim).to(self.device)
     self.wm = DynamicsModel(self.nj, self.xi_dim, self.dt, cfg.wm).to(self.device)
     self.fns = StepFns(self.heads, self.policy, self.wm, self.critic, compile_=cfg.compile, mode=cfg.compile_mode)
     self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.wm.lr)
@@ -198,7 +198,8 @@ class Trainer:
     n_params = lambda m: sum(p.numel() for p in m.parameters())  # noqa: E731
     print(f"[Trainer] policy {n_params(self.policy)/1e6:.1f}M  critic {n_params(self.critic)/1e6:.2f}M  wm {n_params(self.wm)/1e6:.1f}M")
     print(f"[Trainer] {self.lib.summary()}")
-    print(f"[Trainer] goal_frame_dim={self.heads.goal_frame_dim} (anchor_pos={hc.goal_anchor_pos}), eval clips {len(self.eval_clip_ids)}")
+    print(f"[Trainer] goal_frame_dim={self.heads.goal_frame_dim} (anchor_pos={hc.goal_anchor_pos}, ref_root={hc.goal_ref_root}), "
+          f"critic error features {self.heads.critic_err_dim}, eval clips {len(self.eval_clip_ids)}")
 
     # ---- simulator bookkeeping ----
     self.env.reset()
@@ -237,9 +238,9 @@ class Trainer:
   @torch.no_grad()
   def collect_step(self) -> None:
     cfg = self.cfg
-    ref_q, ref_qd, ref_ap, ref_aq = self.sim.goal_refs(self.frame, self.clip_end)
+    refs = self.sim.goal_refs(self.frame, self.clip_end)
     ref_cur = self.sim.current_ref()  # reference at frame f_t: reward target of this step
-    goal, a = self.fns.act(self.hist.buf, self.kin, ref_q, ref_qd, ref_ap, ref_aq)
+    goal, a = self.fns.act(self.hist.buf, self.kin, *refs)
     self.policy.obs_norm.update(self.hist.buf[:, -1])
     self.policy.goal_norm.update(goal)
     a_exec = a + cfg.action_noise_std * torch.randn_like(a)
@@ -356,6 +357,8 @@ class Trainer:
       # Reference window pack for this batch: frames f0 .. f0+H+K-1 of every rollout.
       Lw = H + K
       pack = self.lib.gather_windows(st["frame"], Lw)
+      if heads.critic_err_dim:  # error normalizer statistics from the rollout start states (real replay states)
+        self.critic.err_norm.update(heads.critic_errors(kin, pack["body_pos"][:, 0], pack["body_quat"][:, 0]))
       f_loc = torch.zeros(N, dtype=torch.long, device=self.device)
       clip_end_loc = torch.clamp(st["clip_end"] - st["frame"], max=Lw)
     self._t_gather = time.time() - t_g0
@@ -388,8 +391,9 @@ class Trainer:
       goals_n.append(gn.detach())
       rews.append(r.detach())
       dsoft.append(d.detach())
-    goal_H = self.fns.goal_from_pack(kin, f_loc, clip_end_loc, p[0], p[1], p[2], p[3])
-    fn_H, gn_H = self.fns.critic_inputs(s, goal_H)
+    goal_H = self.fns.goal_from_pack(kin, f_loc, clip_end_loc, *p)
+    err_H = self.fns.critic_err(kin, f_loc, p[2], p[3])
+    fn_H, gn_H = self.fns.critic_inputs(s, goal_H, err_H)
     if cfg.use_critic:
       V_H = self.critic(fn_H, gn_H, xi)
       if cfg.clip_values:
@@ -497,6 +501,7 @@ class Trainer:
 
   def load(self, path: str, rollback: bool = False) -> None:
     ck = torch.load(path, map_location=self.device, weights_only=False)
+    new_goal = self._graft_inputs(ck)
     self.policy.load_state_dict(ck["policy"])
     self.critic.load_state_dict(ck["critic"])
     self.wm.load_state_dict(ck["wm"])
@@ -522,9 +527,101 @@ class Trainer:
     if not rollback and float(ck.get("lr_scale", 1.0)) != 1.0:
       self._set_lr_scale(float(ck["lr_scale"]))
       print(f"[Trainer] lr_scale {self.lr_scale} restored from checkpoint")
+    if new_goal:
+      self._calibrate_goal_norm(new_goal)
     self.wd_healthy_ckpt = path
     self.wd_quiet_until = self.it + self.cfg.wd_warmup
     print(f"[Trainer] resumed from {path} at iteration {self.it}")
+
+  # ---------------------------------------------------------------------------
+  # Input graft: resume a checkpoint with fewer goal segments / no critic error features (10-25, round 18).
+  # ---------------------------------------------------------------------------
+
+  def _graft_inputs(self, ck: dict) -> list[str]:
+    """Rewrite ``ck`` in place from its goal / critic input layout to this run's: every input column of the goal encoder
+    and of the critic's first layer, their Adam moments and the goal normalizer move to their new positions; new inputs
+    get zero weights, so the grafted networks compute exactly what they computed before. Returns the goal segments that
+    are new (their normalizer statistics still need calibrating)."""
+    known = {f.name for f in fields(HeadsCfg)}
+    old_h = HeadsCfg(**{k: v for k, v in ck["cfg"]["heads"].items() if k in known})
+    if ck["dims"]["goal_frame"] == 2 * self.nj + 9:  # checkpoints from before the goal_anchor_pos flag
+      old_h.goal_anchor_pos = True
+    old_seg, new_seg = self.heads.goal_layout(old_h), self.heads.goal_layout()
+    old_err = 4 * len(self.heads.tracked) + 1 if old_h.critic_errors else 0
+    new_err = self.heads.critic_err_dim
+    if old_seg == new_seg and old_err == new_err:
+      return []
+    assert sum(n for _, n in old_seg) == ck["dims"]["goal_frame"], (old_seg, ck["dims"])
+    missing = [n for n, _ in old_seg if n not in dict(new_seg)]
+    if missing or (old_err and old_err != new_err):
+      raise ValueError(f"graft can only add inputs; checkpoint has {missing or 'critic error features'} this run lacks")
+
+    def frame_map(seg_from, seg_to):  # new goal-frame column -> old column (-1 = new input)
+      off, start = 0, {}
+      for n, k in seg_from:
+        start[n], off = off, off + k
+      return torch.cat([torch.arange(start[n], start[n] + k) if n in start else torch.full((k,), -1) for n, k in seg_to])
+
+    fm = frame_map(old_seg, new_seg)
+    Go, Gn, K = ck["dims"]["goal_frame"], len(fm), self.cfg.heads.K
+    goal_cols = torch.cat([torch.where(fm >= 0, fm + k * Go, -1) for k in range(K)])  # encoder input map
+    fd, xd = self.heads.feat_dim, self.xi_dim
+    crit_cols = torch.cat([torch.arange(fd), torch.full((new_err,), -1), torch.where(goal_cols >= 0, goal_cols + fd + old_err, -1),
+                           torch.arange(xd) + fd + old_err + K * Go])
+
+    def remap(w, cols):  # [out, in_old] -> [out, in_new], zero columns for new inputs
+      out = torch.zeros(w.shape[0], len(cols), dtype=w.dtype, device=w.device)
+      keep = cols >= 0
+      out[:, keep.to(w.device)] = w[:, cols[keep].to(w.device)]
+      return out
+
+    def graft(sd, opt_sd, module, key, cols):
+      sd[key] = remap(sd[key], cols)
+      idx = [n for n, _ in module.named_parameters()].index(key)
+      st = opt_sd["state"].get(idx)
+      if st is not None:
+        for m in ("exp_avg", "exp_avg_sq"):
+          st[m] = remap(st[m], cols)
+
+    pol, crit = ck["policy"], ck["critic"]
+    graft(pol, ck["opt_pi"], self.policy, "encoder.0.weight", goal_cols)
+    graft(crit, ck["opt_v"], self.critic, "net.0.weight", crit_cols)
+    keep = fm >= 0
+    for b, fill in (("mean", 0.0), ("var", 1.0)):
+      v = torch.full((Gn,), fill, dtype=pol[f"goal_norm.{b}"].dtype, device=pol[f"goal_norm.{b}"].device)
+      v[keep.to(v.device)] = pol[f"goal_norm.{b}"][fm[keep].to(v.device)]
+      pol[f"goal_norm.{b}"] = v
+    for k, v in self.critic.state_dict().items():  # new critic error normalizer: fresh statistics
+      crit.setdefault(k, v)
+    new = [n for n, _ in new_seg if n not in dict(old_seg)]
+    print(f"[Trainer] graft: goal frame {Go} -> {Gn} (new {new}), critic error features {old_err} -> {new_err}")
+    return new
+
+  @torch.no_grad()
+  def _calibrate_goal_norm(self, segments: list[str], n: int = 65536) -> None:
+    """Normalizer statistics of grafted goal segments from n random library frames (the running count of the
+    checkpoint is too large for training updates to move them). Only segments that depend on the reference alone."""
+    assert set(segments) <= {"ref_root"}, segments
+    lib, K = self.lib, self.cfg.heads.K
+    fr = torch.randint(0, lib.time_step_total, (n,), device=self.device)
+    clip_end = lib.clip_end[lib.clip_of_frame(fr)]
+    win = window_frames(fr, clip_end, K).reshape(-1)
+    g = lib.gather(win, fields=["joint_pos", "joint_vel", "body_pos", "body_quat", "body_lin_vel", "body_ang_vel"])
+    a = self.heads.anchor
+    ap, aq = g["body_pos"].view(n, K, -1, 3)[:, :, a], g["body_quat"].view(n, K, -1, 4)[:, :, a]
+    kin = {"anchor_pos": ap[:, 0], "anchor_quat": aq[:, 0]}
+    goal = self.heads.goal(kin, g["joint_pos"].view(n, K, -1), g["joint_vel"].view(n, K, -1), ap, aq,
+                           g["body_lin_vel"].view(n, K, -1, 3)[:, :, a], g["body_ang_vel"].view(n, K, -1, 3)[:, :, a])
+    x = goal.reshape(-1, goal.shape[-1])
+    off = 0
+    gn = self.policy.goal_norm
+    for name, k in self.heads.goal_layout():
+      if name in segments:
+        gn.mean[off : off + k] = x[:, off : off + k].mean(0)
+        gn.var[off : off + k] = x[:, off : off + k].var(0, unbiased=False)
+        print(f"[Trainer] goal_norm {name}: mean {gn.mean[off:off + k].cpu().numpy().round(3).tolist()} "
+              f"std {gn.std[off:off + k].cpu().numpy().round(3).tolist()}")
+      off += k
 
   # ---------------------------------------------------------------------------
   # Watchdog: G1 full-atlas run 2026-10-22 collapsed at ~41k iterations (imagined reward 0.91 -> 0.4 in

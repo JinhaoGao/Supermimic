@@ -51,6 +51,9 @@ def main():
   p.add_argument("--rollouts", type=int, default=4096)
   p.add_argument("--no_critic", action="store_true")
   p.add_argument("--goal_anchor_pos", action="store_true", help="include ref anchor position in the goal (needs odometry on hardware)")
+  p.add_argument("--goal_ref_root", action="store_true",
+                 help="goal frames + reference anchor height / body-frame lin & ang vel / projected gravity (no odometry needed)")
+  p.add_argument("--critic_errors", action="store_true", help="privileged tracking-error features for the critic")
   p.add_argument("--wm_batches", type=int, default=10)
   p.add_argument("--wm_windows", type=int, default=2048)
   p.add_argument("--wm_k", type=int, default=8)
@@ -135,7 +138,8 @@ def main():
     clean_prev_action=args.clean_prev_action or args.fixes,
     compile_mode=args.compile_mode,
     wm=WorldModelCfg(k=args.wm_k, lr=args.lr, batches_per_update=args.wm_batches, windows_per_batch=args.wm_windows),
-    heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos, ee_term_z=args.ee_term_z),
+    heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos, goal_ref_root=args.goal_ref_root, critic_errors=args.critic_errors,
+                   ee_term_z=args.ee_term_z),
   )
   print(f"[train] log_dir = {log_dir}")
   os.makedirs(log_dir, exist_ok=True)
