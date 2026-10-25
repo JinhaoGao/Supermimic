@@ -16,6 +16,10 @@ Examples:
   # scripts/launch_bj31_v2.example.sh for the 8-GPU version)
   python scripts/train.py --motion_list <motion_files.txt> --robot g1 --robot_variant eval+evalcontact --ee_term_z 0.25 \
       --source_weights noetix_kungfu=10,noetix_kungfu_dance_show=15,sportsmeeting=10,lafan1=15,g1_all=10,mixamo_cn=2,virtual_point=3
+  # Warm start with early stop on the in-training eval + watchdog on the survival-weighted imagined reward (8-GPU
+  # version: scripts/launch_bj31_r15ws.example.sh)
+  python scripts/train.py ... --resume model_136000.pt --eval_interval 2000 --es_eval_fail_ratio 1.5 --es_patience 2 \
+      --wd_signal imagined_reward_alive --wd_reward_floor -1.0
 """
 
 from __future__ import annotations
@@ -148,6 +152,16 @@ def main():
                  help="floor each rank's imagined reward (normalized) at this value before the rank mean / watchdog EMA "
                       "(production -1.0; default off = as before). A finite but astronomically negative value on one rank caused two "
                       "needless rollbacks on bj31 (2026-10-23)")
+  p.add_argument("--wd_signal", type=str, default="imagined_reward_norm", choices=["imagined_reward_norm", "imagined_reward_alive"],
+                 help="watchdog reward signal: imagined_reward_norm (default, as before: mean reward over every imagined step, "
+                      "dead ones included) or imagined_reward_alive (sum_t c_t r_t / sum_t c_t with the policy objective's "
+                      "survival weights c_t: blind to post-death world-model divergence); --wd_reward_floor applies to either")
+  # Early stop on the in-training benchmark (needs evaluation: --eval_interval > 0, no --no_eval). Off by default.
+  p.add_argument("--es_eval_fail_ratio", type=float, default=None,
+                 help="stop when an in-training eval fails >= R x median(failed of all previous evals of this run, >= 3 of "
+                      "them) for --es_patience consecutive evals (writes <log_dir>/earlystop.json, saves model_final); "
+                      "also keeps the checkpoint with the fewest eval failures (model_best_eval.pt, best_eval.json). Default off")
+  p.add_argument("--es_patience", type=int, default=2, help="consecutive bad evals before the early stop (default 2)")
   p.add_argument("--no_compile", action="store_true")
   p.add_argument("--compile_mode", type=str, default=None, help="e.g. reduce-overhead or max-autotune")
   p.add_argument("--num_threads", type=int, default=0, help="CPU threads: OMP/MKL/OpenBLAS env + torch.set_num_threads (0 = leave defaults)")
@@ -172,6 +186,11 @@ def main():
     p.error(f"--hard_term_schedule {args.hard_term_schedule!r}: {e}")
   if hard_schedule and not hard_names:
     p.error("--hard_term_schedule needs --hard_names (the hard set it applies to)")
+  if args.es_eval_fail_ratio is not None:
+    if not args.es_eval_fail_ratio > 0 or args.es_patience < 1:
+      p.error("--es_eval_fail_ratio must be > 0 and --es_patience >= 1")
+    if args.no_eval or args.eval_interval <= 0:
+      p.error("--es_eval_fail_ratio needs the in-training evaluation (drop --no_eval, --eval_interval > 0)")
 
   if args.num_threads > 0:
     # Before torch / numpy spin up their pools (they are imported below). Pool workers inherit the env.
@@ -249,6 +268,9 @@ def main():
     wd_nf_patience=args.wd_nf_patience,
     wd_early_ckpt=args.wd_early_ckpt,
     wd_reward_floor=args.wd_reward_floor,
+    wd_signal=args.wd_signal,
+    es_eval_fail_ratio=args.es_eval_fail_ratio,
+    es_patience=args.es_patience,
     compile_mode=args.compile_mode,
     world_size=dctx.world,
     base_lr_scale=args.lr_scale,

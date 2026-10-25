@@ -31,6 +31,12 @@ master 4314a50 / c1c94be / 5f020a9 (merged): hard-clip termination curriculum
 only, so every rank applies the same one), resume into a library extended by
 appending clips (scripts/extend_cache.py; the old bins keep their sampler
 statistics), and the sampler return clamp, which is this branch's switch already.
+
+Opt-in (2026-10-25): wd_signal "imagined_reward_alive" makes the watchdog watch
+sum_t c_t r_t / sum_t c_t (the survival weights of the policy objective; logged
+as pi/imagined_reward_alive either way) instead of the unweighted mean; early
+stop (es_eval_fail_ratio / es_patience) on the in-training eval's failures, with
+rank 0's result broadcast so every rank stops at the same iteration.
 """
 
 from __future__ import annotations
@@ -132,6 +138,19 @@ class TrainCfg:
   # (10-22: 0.91 -> 0.4) stays far above -1; non-finite values keep the non-finite path.
   wd_reward_floor: float | None = None
   wd_early_ckpt: int = 500  # one early checkpoint (rollback point) at this iteration when none exists yet (0 = off)
+  # Reward signal of the watchdog EMA (both normalized by reward_max_per_step, both logged every iteration):
+  #   "imagined_reward_norm" (default, as before): mean of r_t over every imagined step and rollout, dead ones included;
+  #   "imagined_reward_alive": sum_t c_t r_t / sum_t c_t with the survival weights c_t of the policy objective
+  #   J = sum_t gamma^t c_t r_t. 10-24 diagnosis: spikes of the first come from world-model divergence after the soft
+  #   termination (states the objective weights ~0); r16 (bj27) rolled back 6x on them down to LR 2e-8 and gave up.
+  wd_signal: str = "imagined_reward_norm"
+  # Early stop on the in-training benchmark (None = off, the loop as before). After every eval: bad if its failed
+  # count >= es_eval_fail_ratio x median(failed of all previous evals of this run; needs >= 3, median floored at 1);
+  # es_patience bad evals in a row -> stop (earlystop.json, model_final, clean exit on every rank). 10-24: failures of
+  # the deterministic eval rise ~28k iterations before the v4 cliff (corr -0.984). Also tracks the eval with the
+  # fewest failures (best_eval.json + model_best_eval.pt, rewritten at every new best).
+  es_eval_fail_ratio: float | None = None
+  es_patience: int = 2
   # Logging / eval / checkpoints.
   log_interval: int = 50
   eval_interval: int = 2000
@@ -162,9 +181,27 @@ def finite_mean(v) -> float:
   return float(a[f].mean()) if f.any() else float("nan")
 
 
+WD_SIGNALS = {"imagined_reward_norm": "imagined reward", "imagined_reward_alive": "imagined alive reward"}  # -> log label
+ES_MIN_PREV = 3  # early stop: previous evals needed before the first verdict
+
+
 def _check_cfg(cfg: TrainCfg) -> None:
+  if cfg.wd_signal not in WD_SIGNALS:
+    raise ValueError(f"wd_signal {cfg.wd_signal!r}: one of {sorted(WD_SIGNALS)}")
+  if cfg.es_eval_fail_ratio is not None and not (cfg.es_eval_fail_ratio > 0 and cfg.es_patience >= 1):
+    raise ValueError(f"early stop needs es_eval_fail_ratio > 0 and es_patience >= 1 (got {cfg.es_eval_fail_ratio}, {cfg.es_patience})")
   if cfg.hard_term_schedule and not cfg.hard_names:
     raise ValueError("hard_term_schedule needs hard_names (the hard set it applies to)")
+
+
+def early_stop_verdict(prev_failed: list, failed: float, ratio: float) -> tuple[bool, float | None]:
+  """Is an eval with ``failed`` failures bad, given the failed counts of all previous evals of the run? ->
+  (bad, threshold). threshold = ratio x max(median(prev), 1) once there are ES_MIN_PREV previous evals (the floor at 1
+  keeps a median of 0 failures from making every later eval bad), else (False, None)."""
+  if len(prev_failed) < ES_MIN_PREV:
+    return False, None
+  thr = float(ratio) * max(float(np.median(np.asarray(prev_failed, dtype=np.float64))), 1.0)
+  return bool(float(failed) >= thr), thr
 
 
 def clip_grads(params, norm: float, elem: float | None) -> float:
@@ -274,6 +311,11 @@ class Trainer:
     if cfg.hard_names:
       self._print(f"[Trainer] hard-clip termination curriculum: {int(self.cmd.clip_hard.sum())} clips match {list(cfg.hard_names)}, "
                   f"schedule {list(cfg.hard_term_schedule) or 'none (x1)'}")
+    if cfg.wd_signal != "imagined_reward_norm":
+      self._print(f"[Trainer] watchdog signal: pi/{cfg.wd_signal}")
+    if cfg.es_eval_fail_ratio is not None:
+      self._print(f"[Trainer] early stop: eval failed >= {cfg.es_eval_fail_ratio:g} x median(previous evals, >= {ES_MIN_PREV}) for "
+                  f"{cfg.es_patience} evals in a row" + ("" if cfg.eval_enabled and cfg.eval_interval > 0 else " -- INACTIVE: evaluation is off"))
     self._print(f"[Trainer] library fingerprint {self.lib.fingerprint} ({os.path.basename(self.lib.cache_dir)})")
     if dctx.enabled:
       self._print(
@@ -304,6 +346,12 @@ class Trainer:
                   "hard_ep_failed": [], "hard_ep_len": []}
     self._ee_on = hc.ee_termination
     self._hard_on = bool(cfg.hard_names)  # curriculum off: term_scale None everywhere (the code path before it)
+    # ---- early stop (in-training benchmark; same state on every rank: rank 0's eval result is broadcast) ----
+    self._es_on = cfg.es_eval_fail_ratio is not None and cfg.eval_enabled and cfg.eval_interval > 0
+    self.es_hist: list[dict] = []  # one entry per eval of this run: it, failed, return_mean, threshold, bad
+    self.es_streak = 0
+    self.es_best: dict | None = None  # eval with the fewest failures: it, failed, return_mean, ckpt
+    self.es_stop: dict | None = None  # set when the early stop fired (the loop ends after that iteration)
     # ---- NaN guard ----
     self.guard_skips = {"wm": 0, "pi": 0, "critic": 0}  # skipped (non-finite) updates since start, same on every rank
     self.guard_nf_iters = 0  # iterations with a skipped update or a non-finite imagined reward
@@ -466,11 +514,12 @@ class Trainer:
     prev_a = st["prev_action"]
     c = torch.ones(N, device=self.device)
     J = torch.zeros(N, device=self.device)
-    feats_n, goals_n, rews, dsoft = [], [], [], []
+    feats_n, goals_n, rews, dsoft, alive = [], [], [], [], []
     p = (pack["joint_pos"], pack["joint_vel"], pack["body_pos"], pack["body_quat"], pack["body_lin_vel"], pack["body_ang_vel"])
     for t in range(H):
       s, obs_hist, prev_a, f_loc, kin, r, d, fn, gn = self.fns.imagine_step(s, obs_hist, prev_a, f_loc, clip_end_loc, xi, bias, kin, *p, term_scale)
       J = J + (g**t) * c * r
+      alive.append(c.detach())  # c_t: survival weight of r_t in J (product of 1 - d_s for s < t; c_0 = 1)
       c = c * (1.0 - d)
       feats_n.append(fn.detach())
       goals_n.append(gn.detach())
@@ -491,6 +540,9 @@ class Trainer:
     metrics = {
       "pi/imagined_return": (J.mean() / H).item(),
       "pi/imagined_reward_norm": torch.stack(rews).mean().item() / self.cfg.heads.reward_max_per_step,
+      # sum_t c_t r_t / sum_t c_t over all rollouts (c as in J, no discount): the reward the objective actually weighs;
+      # the mean above also averages the steps after a soft death, where the world model diverges (10-24).
+      "pi/imagined_reward_alive": self._alive_reward(torch.stack(alive), torch.stack(rews)),
       "pi/survival_H": c.mean().item(),
       "pi/grad_norm": gn_pi,
       "pi/loss": loss_pi.item(),
@@ -499,6 +551,11 @@ class Trainer:
     if cfg.use_critic:
       metrics.update(self._fit_critic(feats_n, goals_n, fn_H.detach(), gn_H.detach(), xi, rews, dsoft))
     return metrics
+
+  def _alive_reward(self, c: torch.Tensor, r: torch.Tensor) -> float:
+    """sum c_t r_t / sum c_t over [H, N] survival weights c and rewards r, normalized by reward_max_per_step (the same
+    units as pi/imagined_reward_norm, so wd_drop / wd_reward_floor mean the same). c_0 = 1: the denominator >= N."""
+    return ((c * r).sum() / c.sum()).item() / self.cfg.heads.reward_max_per_step
 
   def _fit_critic(self, feats_n, goals_n, fn_H, gn_H, xi, rews, dsoft) -> dict:
     cfg, H = self.cfg, self.cfg.H
@@ -703,9 +760,12 @@ class Trainer:
   def _watchdog(self, m_pi: dict, skipped: int = 0) -> bool:
     """Update watchdog statistics; roll back if training collapsed. Returns True after a rollback.
 
-    skipped: module updates the NaN guard skipped this iteration (identical on every rank)."""
+    skipped: module updates the NaN guard skipped this iteration (identical on every rank).
+    The reward signal is pi/<cfg.wd_signal> (default imagined_reward_norm, as before; imagined_reward_alive: the
+    survival-weighted mean of the policy objective); the floor, the rank mean and every test below act on it alike."""
     cfg = self.cfg
-    r = float(m_pi.get("pi/imagined_reward_norm", float("nan")))
+    r = float(m_pi.get(f"pi/{cfg.wd_signal}", float("nan")))
+    label = WD_SIGNALS[cfg.wd_signal]
     vl = float(m_pi.get("critic/loss", float("nan")))
     floor, raw = cfg.wd_reward_floor, None
     if floor is not None and math.isfinite(r) and r < floor:  # one rank's spike must not drag the mean (see TrainCfg)
@@ -728,7 +788,7 @@ class Trainer:
       self.wd_nf_streak += 1
       if self.wd_nf_streak <= 3 or self.wd_nf_streak % 100 == 0:
         sk = ", ".join(f"{k} {v}" for k, v in self.guard_skips.items())
-        self._print(f"[guard] it {self.it}: non-finite (imagined reward {r:.4g}, {skipped} updates skipped; streak {self.wd_nf_streak}, total skips {sk})", flush=True)
+        self._print(f"[guard] it {self.it}: non-finite ({label} {r:.4g}, {skipped} updates skipped; streak {self.wd_nf_streak}, total skips {sk})", flush=True)
       if not cfg.wd_enabled or self.wd_nf_streak < cfg.wd_nf_patience:
         return False
       self.wd_nf_streak = 0
@@ -750,7 +810,7 @@ class Trainer:
       return False
     best = max(e for _, e in self.wd_hist)
     if self.wd_reward_ema < best - cfg.wd_drop:
-      return self._rollback(f"imagined reward EMA {self.wd_reward_ema:.3f} < best {best:.3f} - {cfg.wd_drop}")
+      return self._rollback(f"{label} EMA {self.wd_reward_ema:.3f} < best {best:.3f} - {cfg.wd_drop}")
     if len(self.wd_vloss) >= 500:
       recent = float(np.median(list(self.wd_vloss)[-50:]))
       base = float(np.median(self.wd_vloss))
@@ -766,7 +826,7 @@ class Trainer:
     if k <= 3 or k % 100 == 0:  # same k on every rank -> every rank joins the gather
       raws = self.dist.all_gather_object(raw)
       which = ", ".join(f"rank {i} {v:.4g}" for i, v in enumerate(raws) if v is not None)
-      self._print(f"[guard] it {self.it}: imagined reward floored to {self.cfg.wd_reward_floor:g} on {n}/{self.dist.world} "
+      self._print(f"[guard] it {self.it}: {WD_SIGNALS[self.cfg.wd_signal]} floored to {self.cfg.wd_reward_floor:g} on {n}/{self.dist.world} "
                   f"rank(s) (raw: {which}); {k} iterations / {self.guard_floored} rank values floored so far", flush=True)
 
   def _guard_scalars(self) -> dict:
@@ -1090,6 +1150,7 @@ class Trainer:
         p_ck = self.save(str(self.it)) if self.main else self._ckpt_path(str(self.it))  # all ranks track the path
         if self._healthy():
           self.wd_healthy_ckpt = p_ck
+      ev = None  # rank 0's eval summary (early stop)
       if cfg.eval_enabled and eval_slot and self.main:
         te = time.time()
         try:
@@ -1100,6 +1161,7 @@ class Trainer:
           print(f"[eval it {self.it}] return {res['scalars']['return_mean']:.4f} min {res['scalars']['return_min']:.3f} failed {int(res['scalars']['failed'])}/{res['num_clips']} ({time.time()-te:.0f}s)", flush=True)
           with open(os.path.join(cfg.log_dir, "eval.jsonl"), "a") as f:
             f.write(json.dumps({"it": self.it, "env_steps": self.env_steps, "wall_s": time.time() - self._t_start, **res["scalars"], "failed_clips": res["failed_clips"]}) + "\n")
+          ev = {"failed": float(res["scalars"]["failed"]), "return_mean": float(res["scalars"]["return_mean"]), "num_clips": int(res["num_clips"])}
         except Exception as e:  # noqa: BLE001
           import traceback
 
@@ -1108,6 +1170,9 @@ class Trainer:
           cfg.eval_enabled = False
       if dctx.enabled and (ckpt_slot or eval_slot):
         dctx.barrier()  # the other ranks wait (CPU barrier) while rank 0 saves / evaluates
+      # Early stop (opt-in): _es_on and eval_slot depend on cfg / the iteration only -> every rank takes part.
+      if self._es_on and eval_slot and self._early_stop_step(ev, ckpt_slot):
+        break
     if dctx.enabled:
       self._merge_sampler()
       self._check_consistency("final")
@@ -1115,6 +1180,58 @@ class Trainer:
       self.save("final")
     if dctx.enabled:
       dctx.barrier()
+
+  # ---------------------------------------------------------------------------
+  # Early stop on the in-training benchmark (opt-in, cfg.es_eval_fail_ratio)
+  # ---------------------------------------------------------------------------
+
+  def _early_stop_step(self, ev_local: dict | None, ckpt_saved: bool) -> bool:
+    """After an eval slot: rank 0's eval summary (None if it did not evaluate: eval switched off after an error) goes
+    to every rank, which all update the same history / best / streak and return the same verdict (True = stop now).
+    Every new best eval (fewest failures, ties: higher return) is saved as model_best_eval.pt (its own file: a regular
+    model_<it>.pt is overwritten when a watchdog rollback re-reaches <it>); ckpt_saved: a regular checkpoint of the
+    same weights was written at this iteration too."""
+    cfg, dctx = self.cfg, self.dist
+    ev = dctx.broadcast_object(ev_local) if dctx.enabled else ev_local
+    if ev is None:
+      return False
+    failed, ret = float(ev["failed"]), float(ev["return_mean"])
+    prev = [h["failed"] for h in self.es_hist]
+    bad, thr = early_stop_verdict(prev, failed, cfg.es_eval_fail_ratio)
+    self.es_streak = self.es_streak + 1 if bad else 0
+    self.es_hist.append({"it": self.it, "failed": failed, "return_mean": ret, "threshold": thr, "bad": bad, "streak": self.es_streak})
+    b = self.es_best
+    if b is None or (failed, -ret) < (b["failed"], -b["return_mean"]):
+      if self.main:
+        self.save("best_eval")
+      if dctx.enabled:
+        dctx.barrier()  # the other ranks wait (CPU barrier) while rank 0 saves
+      self.es_best = {"it": self.it, "failed": failed, "return_mean": ret, "ckpt": self._ckpt_path("best_eval"),
+                      "regular_ckpt": self._ckpt_path(str(self.it)) if ckpt_saved else None}
+      if self.main:
+        with open(os.path.join(cfg.log_dir, "best_eval.json"), "w") as f:
+          json.dump(self.es_best, f, indent=1)
+    if self.main:
+      self.writer.add_scalar("es/streak", self.es_streak, self.it)
+      self.writer.add_scalar("es/best_failed", self.es_best["failed"], self.it)
+      if thr is not None:
+        self.writer.add_scalar("es/threshold", thr, self.it)
+      verdict = "warming up" if thr is None else f"threshold {thr:.1f} -> {'BAD' if bad else 'ok'}, streak {self.es_streak}/{cfg.es_patience}"
+      print(f"[es] it {self.it}: eval failed {failed:.0f} ({verdict}); best it {self.es_best['it']} failed {self.es_best['failed']:.0f}", flush=True)
+    if self.es_streak < cfg.es_patience:
+      return False
+    self.es_stop = {
+      "iteration": self.it, "reason": f"{self.es_streak} consecutive evals with failed >= {cfg.es_eval_fail_ratio:g} x median of the previous ones",
+      "es_eval_fail_ratio": cfg.es_eval_fail_ratio, "es_patience": cfg.es_patience, "best_eval": self.es_best,
+      "final_ckpt": self._ckpt_path("final"), "history": self.es_hist,
+    }
+    if self.main:
+      print(f"[earlystop] it {self.it}: eval failed {failed:.0f} >= {thr:.1f} ({cfg.es_eval_fail_ratio:g} x median of {len(prev)} previous evals) "
+            f"for {self.es_streak} evals in a row; best eval it {self.es_best['it']} (failed {self.es_best['failed']:.0f}): "
+            f"{self.es_best['ckpt']}; saving model_final and stopping", flush=True)
+      with open(os.path.join(cfg.log_dir, "earlystop.json"), "w") as f:
+        json.dump(self.es_stop, f, indent=1)
+    return True
 
   def run(self) -> None:
     self._t_start = time.time()

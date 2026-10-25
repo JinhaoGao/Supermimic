@@ -164,6 +164,21 @@ default off = the behaviour above, bitwise). A real collapse (0.91 → 0.4) is f
 non-finite values keep the non-finite path. Rank 0 logs floored iterations with the raw values (first 3, then every
 100), `guard/reward_floored` counts the floored rank values.
 
+Watchdog signal (2026-10-25): `pi/imagined_reward_norm` averages r_t over every imagined step, also after a soft death,
+where the world model diverges; the policy objective weighs those steps ~0 (J = Σ γᵗ cₜ rₜ). bj27 r16 rolled back six
+times on such spikes (LR down to 2e-8) and gave up. `pi/imagined_reward_alive` = Σ cₜ rₜ / Σ cₜ (same cₜ as J, same
+units) is logged every iteration; `--wd_signal imagined_reward_alive` makes the watchdog (floor, rank mean, EMA, drop
+test) use it. Default `imagined_reward_norm` = the behaviour above.
+
+Early stop (2026-10-25, opt-in): the 8-GPU lines degrade after a peak; failures of the deterministic in-training eval
+correlate −0.984 with v4 and rise ~28k iterations before the cliff. With `--es_eval_fail_ratio R` (`--es_patience P`,
+default 2) an eval is bad when its failed count ≥ R × median(failed of all earlier evals of the run; ≥ 3 of them,
+median floored at 1); P bad evals in a row → `[earlystop]` on rank 0, `<log_dir>/earlystop.json` (iteration, history,
+best-eval checkpoint), `model_final.pt`, clean exit on every rank (rank 0's eval result is broadcast, every rank takes
+the same decision). The eval with the fewest failures is tracked in `best_eval.json` and saved as `model_best_eval.pt`
+(rewritten at every new best only; a regular `model_<it>.pt` can be overwritten after a watchdog rollback). Needs the
+in-training eval (`--eval_interval`, no `--no_eval`).
+
 ## End-effector termination
 
 The paper drops BeyondMimic's end-effector termination; without it the G1 / E2 full-atlas policies swing feet and
@@ -202,8 +217,25 @@ on|off` / `--ee_term_z`).
   on g1v2_scratch's exact clip list (`DATASET=v2list`, default) or on the r52 set (`DATASET=dir`: same v2 options,
   different data and source shares, not a replication).
 * Resume (`--resume`) prints a WARNING for every training setting of the checkpoint's run that differs from this run
-  (robot / variant, source / name weights, heads incl. EE termination, sampler clamp, clip list) and skips the reset
-  sampler's state, with a WARNING, when the clip list differs (bin count, or basenames / order).
+  (robot / variant, source / name weights, heads incl. EE termination, sampler clamp, curriculum, H, clip list) and skips
+  the reset sampler's state, with a WARNING, when the clip list differs (bin count, or basenames / order), except for an
+  extended list (below). The log line of the resume shows the resulting policy LR (= --lr × checkpoint lr_scale × cosine).
+
+## master 5f020a9 (curriculum, extend_cache, clamp) under data parallel
+
+* `--sampler_clamp_returns`: master 5f020a9 is the same fix as this branch's 5bb8c0d (same flag, same TrainCfg /
+  command-cfg names): one code path, checkpoints of either branch compare / resume (`tests/test_merge_master_1025.py`).
+* `--hard_names k1,k2 --hard_term_schedule it:mult,...` (master 4314a50; bj27 r13 / r14): termination thresholds and
+  soft temperatures of the matching clips × a piecewise-linear multiplier over absolute iterations. The multiplier is a
+  function of cfg and iteration only (same on every rank, after a rollback / resume too); the hard set is checked across
+  ranks (`curriculum` state group). Off (no `--hard_names`) = the code before, bitwise.
+* `scripts/extend_cache.py --old_list --extra --cache_dir --out_list` (master c1c94be): run once before training; the cache
+  of old + extra is the old cache's rows + the extra files (== a full rebuild, bitwise). Every rank maps the same
+  library (`library` fingerprint in the state check). A checkpoint of the old list resumes into old + extra with its
+  sampler statistics in the first bins (only if the bin count of the old files matches).
+* `scripts/launch_bj31_r15ws.example.sh prep|launch`: bj27's best G1 checkpoint (g1v2_clamp_r15 model_136000, 89.85% v4)
+  warm-started on bj31's 8 GPUs with r15's recipe per rank + in-training eval / early stop / alive watchdog signal /
+  floor, effective LR 2.5e-5 (`--lr 8.9252e-4` against the checkpoint's lr_scale 0.0625 and cosine(136000) 0.448).
 
 ## Layout
 
@@ -233,6 +265,9 @@ on|off` / `--ee_term_z`).
 | `supermimic/robots/g1_eval_model.py` | G1 `eval` / `evalcontact` robot variants (team eval / deploy model) |
 | `scripts/export_eval_onnx.py`, `eval_site/` | export for and analysis of the team's MuJoCo benchmark |
 | `scripts/launch_bj31_v2.example.sh` | example (not run): v2 recipe on bj31, 8 GPUs + `--sampler_clamp_returns` |
+| `scripts/extend_cache.py`, `scripts/wm_diag.py` | append clips to a packed cache (master c1c94be) / world-model diagnostic (master 4314a50) |
+| `scripts/launch_bj31_r15ws.example.sh` | example (not run): r15 warm start on bj31, 8 GPUs + early stop / alive watchdog signal |
+| `tests/test_merge_master_1025.py`, `tests/test_early_stop_alive.py` | master 5f020a9 merge (clamp / curriculum / extend under DDP); early stop + alive signal (real loop, 3 gloo ranks) |
 
 ## Setup and run
 
