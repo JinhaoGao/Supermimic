@@ -50,16 +50,17 @@ set -euo pipefail
 STEP="${1:?prep | launch | launch_T | launch_C}"
 REPO="${REPO:-/home/ubuntu/supermimic/supermimic_repro_oriterm}"  # ddp-bj31-v2 checkout / rsync with this file
 VENV="${VENV:-/home/ubuntu/supermimic/mjlab/.venv}"
-SRC_CKPT=/data2/supermimic/logs/2026-10-25_12-31-57_g1v2_r15ws_ddp8/model_148000.pt
-CKPT=/data2/supermimic/warmstart_r15ws_model_148000.pt
-CKPT_MD5=cb3cbd99b12144017fe4649f1290b990  # 291,457,320 bytes; md5 of $SRC_CKPT read 2026-10-25 (it 148000, lr_scale 0.0625)
+SRC_CKPT="${SRC_CKPT:-/data2/supermimic/logs/2026-10-25_12-31-57_g1v2_r15ws_ddp8/model_148000.pt}"
+CKPT="${CKPT:-/data2/supermimic/warmstart_r15ws_model_148000.pt}"
+CKPT_MD5="${CKPT_MD5:-cb3cbd99b12144017fe4649f1290b990}"  # 291,457,320 bytes; md5 of $SRC_CKPT read 2026-10-25 (it 148000, lr_scale 0.0625)
 LIST=/data2/supermimic/prep_1025/g1v2_r15_255008_bj31.txt
 NEW_CACHE=/data2/supermimic/cache/lib_255008_3b84d5f141
 EVAL_NAMES=/data2/supermimic/lists/eval_1024_g1atlasv1.txt
 SOURCES=noetix_kungfu=10,noetix_kungfu_dance_show=15,sportsmeeting=10,lafan1=15,g1_all=10,mixamo_cn=2,virtual_point=3
 NAMES=tengkong=200,kongfan=200,shoufan=200,erqijiao=200,danpaijiao=200,xuanfeng=200,waibailian=100,lihetui=100,saotang=100,ceti=100,houti=100,zhengti=100
 ITERS="${ITERS:-160000}"
-LR="${LR:-8.9252e-4}"  # x lr_scale 0.0625 (restored) x cosine(148000) 0.376766 = 2.10169e-5 = the live run's LR at 148000
+LR="${LR:-8.9252e-4}"  # (10-25 run from 160000: SRC_CKPT/CKPT/CKPT_MD5/ITERS/RUN_T/RUN_C overridden; same LR -> 1.7214e-5 = the live run's LR at 160000)
+# x lr_scale 0.0625 (restored) x cosine(148000) 0.376766 = 2.10169e-5 = the live run's LR at 148000
 STAGGER_S="${STAGGER_S:-330}"  # >= 300: the second arm starts after the first one's env build / cache mapping / compile
 RUN_T="${RUN_T:-g1v2_ro10_148k_T4}"
 RUN_C="${RUN_C:-g1v2_ro0_148k_C4}"
