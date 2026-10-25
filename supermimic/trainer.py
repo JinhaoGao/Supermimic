@@ -87,7 +87,13 @@ class TrainCfg:
   wd_drop: float = 0.2
   wd_window: int = 4000
   wd_vloss_ratio: float = 50.0  # or when median critic loss of the last 50 its > ratio * median of the last 2000
-  wd_warmup: int = 500  # iterations after start / resume / rollback before the watchdog may trigger
+  # Iterations after start / resume / rollback before the watchdog may trigger. Also the reward baseline starts only
+  # after it: a resume begins with an empty replay that fills with fresh episode starts (easy states, imagined reward
+  # ~0.90) and then turns over to the sampler's hard mid-episode states (~0.8) -- with a 500-iteration warm-up every
+  # round-16 resume (10-24, G1 and E2) "collapsed" against that inflated baseline although the imagined return,
+  # survival and WM errors were flat. >= replay turnover (replay_capacity / env_steps_per_iter) + margin.
+  wd_warmup: int = 1500
+  wd_sustain: int = 200  # the reward drop must hold this many consecutive iterations (single-iteration outliers)
   wd_lr_factor: float = 0.5  # LR multiplier applied at every rollback
   wd_max_rollbacks: int = 6
   wd_force_at: int = -1  # debug: force one rollback at this iteration
@@ -98,6 +104,16 @@ class TrainCfg:
   eval_enabled: bool = True
   eval_clips: int = 0  # 0 = all clips; otherwise a fixed random subset of this size
   eval_envs: int = 1024
+  # Fixes from the comparison with open-source reproductions (10-25), all off by default (v2 behaviour):
+  input_clip: float = 10.0  # clamp of normalized policy / critic inputs; 10 sigma saturates pitch rate at 5.5 rad/s,
+  #                           roll beyond 56 deg and tilt beyond 103 deg on the G1 v2 statistics (flips are blind)
+  clip_values: bool = False  # bootstrap V_H and the lambda-return values clamped to +-r_max/(1-gamma) (targets already are)
+  critic_weight_survival: bool = False  # critic loss weighted by the imagined survival probability (post-death states)
+  imag_truncate: bool = False  # imagined rollouts end at the clip end with a critic bootstrap (the env times out there;
+  #                               v2 kept tracking the frozen last frame, whose velocity targets are not zero)
+  wm_prefix_mask: bool = False  # WM windows that cross an episode end keep their steps up to it (v2 dropped the whole
+  #                                window: the last k-1 transitions before every fall got up to k x less weight)
+  clean_prev_action: bool = False  # proprio a_{t-1} = the policy's action, not the executed noisy one (as deployed)
   wm: WorldModelCfg = field(default_factory=WorldModelCfg)
   heads: HeadsCfg = field(default_factory=HeadsCfg)
 
@@ -156,7 +172,7 @@ class Trainer:
     self.dt = self.env.step_dt
     assert abs(self.dt - hc.dt) < 1e-9, f"env dt {self.dt} != heads dt {hc.dt}"
 
-    self.policy = Policy(self.heads.proprio_dim, hc.hist, self.heads.goal_frame_dim, hc.K, self.nj).to(self.device)
+    self.policy = Policy(self.heads.proprio_dim, hc.hist, self.heads.goal_frame_dim, hc.K, self.nj, input_clip=cfg.input_clip).to(self.device)
     self.critic = Critic(self.heads.feat_dim, self.heads.goal_frame_dim, hc.K, self.xi_dim).to(self.device)
     self.wm = DynamicsModel(self.nj, self.xi_dim, self.dt, cfg.wm).to(self.device)
     self.fns = StepFns(self.heads, self.policy, self.wm, self.critic, compile_=cfg.compile, mode=cfg.compile_mode)
@@ -212,6 +228,7 @@ class Trainer:
     self.wd_rollbacks = 0
     self.wd_quiet_until = cfg.wd_warmup
     self.wd_forced = False
+    self.wd_low = 0
 
   # ---------------------------------------------------------------------------
   # 1. Data collection
@@ -257,7 +274,8 @@ class Trainer:
       self.ep_ret[ids] = 0.0
     else:
       self.state = next_state
-    self.prev_action = torch.where(done[:, None], torch.zeros_like(a_exec), a_exec)
+    a_obs = a if cfg.clean_prev_action else a_exec
+    self.prev_action = torch.where(done[:, None], torch.zeros_like(a_obs), a_obs)
     self.frame = self.cmd.time_steps.clone()
     self.clip_end = self.cmd.clip_end_env.clone()
     self.kin, obs = self.fns.refresh(self.state, self.prev_action, self.sim.bias_from_xi(self.xi, self.nj), True)
@@ -299,14 +317,14 @@ class Trainer:
     self.wm.train()
     agg: dict[str, float] = {}
     for _ in range(cfg.batches_per_update):
-      batch = self.buffer.sample_windows(cfg.windows_per_batch, cfg.k)
+      batch = self.buffer.sample_windows(cfg.windows_per_batch, cfg.k, prefix=self.cfg.wm_prefix_mask)
       self.wm.update_stats(batch)
-      loss, e1, ek = self.fns.wm_loss(batch["s0"], batch["actions"], batch["next_states"], batch["xi"], batch["mask"])
+      loss, e1, ek = self.fns.wm_loss(batch["s0"], batch["actions"], batch["next_states"], batch["xi"], batch["step_mask"])
       self.opt_wm.zero_grad(set_to_none=True)
       loss.backward()
       gn = clip_grads(list(self.wm.parameters()), cfg.grad_clip, None)
       self.opt_wm.step()
-      m = {"wm/loss": loss.item(), "wm/err_step1": e1.item(), f"wm/err_step{cfg.k}": ek.item(), "wm/grad_norm": gn, "wm/valid_frac": batch["mask"].float().mean().item()}
+      m = {"wm/loss": loss.item(), "wm/err_step1": e1.item(), f"wm/err_step{cfg.k}": ek.item(), "wm/grad_norm": gn, "wm/valid_frac": batch["mask"].float().mean().item(), "wm/step_valid_frac": batch["step_mask"].float().mean().item()}
       for k, v in m.items():
         agg[k] = agg.get(k, 0.0) + v / cfg.batches_per_update
     return agg
@@ -345,11 +363,26 @@ class Trainer:
     prev_a = st["prev_action"]
     c = torch.ones(N, device=self.device)
     J = torch.zeros(N, device=self.device)
-    feats_n, goals_n, rews, dsoft = [], [], [], []
+    feats_n, goals_n, rews, dsoft, surv, lives = [], [], [], [], [], []
+    v_max = cfg.heads.reward_max_per_step / (1.0 - g)
+    # Clip-end truncation (imag_truncate): step t is a transition of the episode only while t < tlim (target frame
+    # f0 + t <= clip_end - 2); the state reached at t = tlim is the env's time-out state -> critic bootstrap there.
+    tlim = (clip_end_loc - 1) if cfg.imag_truncate else None
     p = (pack["joint_pos"], pack["joint_vel"], pack["body_pos"], pack["body_quat"], pack["body_lin_vel"], pack["body_ang_vel"])
     for t in range(H):
       s, obs_hist, prev_a, f_loc, kin, r, d, fn, gn = self.fns.imagine_step(s, obs_hist, prev_a, f_loc, clip_end_loc, xi, bias, kin, *p, term_scale)
-      J = J + (g**t) * c * r
+      if tlim is not None:
+        if cfg.use_critic:
+          v_t = self.critic(fn, gn, xi)  # value of s_t (fn, gn are the critic inputs of the step's start state)
+          if cfg.clip_values:
+            v_t = v_t.clamp(-v_max, v_max)
+          J = J + (g**t) * c * (tlim == t).float() * v_t
+        live = (t < tlim).float()
+      else:
+        live = torch.ones_like(c)
+      J = J + (g**t) * c * live * r
+      surv.append(c.detach())
+      lives.append(live)
       c = c * (1.0 - d)
       feats_n.append(fn.detach())
       goals_n.append(gn.detach())
@@ -359,6 +392,10 @@ class Trainer:
     fn_H, gn_H = self.fns.critic_inputs(s, goal_H)
     if cfg.use_critic:
       V_H = self.critic(fn_H, gn_H, xi)
+      if cfg.clip_values:
+        V_H = V_H.clamp(-v_max, v_max)
+      if tlim is not None:
+        V_H = V_H * (tlim >= H).float()
       J = J + (g**H) * c * V_H
     loss_pi = -J.mean() / H
     self.opt_pi.zero_grad(set_to_none=True)
@@ -368,36 +405,53 @@ class Trainer:
     for p_ in self.wm.parameters():
       p_.requires_grad_(True)
 
+    rmax = self.cfg.heads.reward_max_per_step
+    R_all, L_all = torch.stack(rews), torch.stack(lives)
     metrics = {
       "pi/imagined_return": (J.mean() / H).item(),
-      "pi/imagined_reward_norm": torch.stack(rews).mean().item() / self.cfg.heads.reward_max_per_step,
+      "pi/imagined_reward_norm": ((R_all * L_all).sum() / L_all.sum().clamp(min=1.0)).item() / rmax,
+      # watchdog metric: per-step rewards clamped to [-r_max, r_max] (a few diverged rollouts with unbounded joint-limit
+      # penalties drove the plain mean to -17 on single iterations: E2 round 16, 10-24)
+      "pi/imagined_reward_robust": ((R_all.clamp(-rmax, rmax) * L_all).sum() / L_all.sum().clamp(min=1.0)).item() / rmax,
       "pi/survival_H": c.mean().item(),
       "pi/grad_norm": gn_pi,
       "pi/loss": loss_pi.item(),
       "time/ref_gather": self._t_gather,
     }
     if cfg.use_critic:
-      metrics.update(self._fit_critic(feats_n, goals_n, fn_H.detach(), gn_H.detach(), xi, rews, dsoft))
+      metrics.update(self._fit_critic(feats_n, goals_n, fn_H.detach(), gn_H.detach(), xi, rews, dsoft, tlim,
+                                      surv if cfg.critic_weight_survival else None))
     return metrics
 
-  def _fit_critic(self, feats_n, goals_n, fn_H, gn_H, xi, rews, dsoft) -> dict:
+  def _fit_critic(self, feats_n, goals_n, fn_H, gn_H, xi, rews, dsoft, tlim=None, surv=None) -> dict:
     cfg, H = self.cfg, self.cfg.H
     g, lam = cfg.gamma, cfg.lam
     N = xi.shape[0]
+    v_max = self.cfg.heads.reward_max_per_step / (1.0 - g)
     with torch.no_grad():
       V = [self.critic(feats_n[t], goals_n[t], xi) for t in range(H)] + [self.critic(fn_H, gn_H, xi)]
+      if cfg.clip_values:
+        V = [v.clamp(-v_max, v_max) for v in V]
       R = [None] * (H + 1)
       R[H] = V[H]
       for t in reversed(range(H)):
-        R[t] = rews[t] + g * (1.0 - dsoft[t]) * ((1.0 - lam) * V[t + 1] + lam * R[t + 1])
+        nxt = (1.0 - lam) * V[t + 1] + lam * R[t + 1]
+        if tlim is not None:  # the state after step tlim-1 is a time-out: bootstrap, no lambda-mixing beyond it
+          nxt = torch.where(tlim == t + 1, V[t + 1], nxt)
+        R[t] = rews[t] + g * (1.0 - dsoft[t]) * nxt
       targets = torch.stack(R[:H], dim=1)
       if cfg.clip_value_targets:
-        v_max = self.cfg.heads.reward_max_per_step / (1.0 - g)
         targets = targets.clamp(-v_max, v_max)
+      W = torch.ones(N, H, device=self.device)
+      if tlim is not None:
+        W = W * (torch.arange(H, device=self.device)[None, :] < tlim[:, None]).float()
+      if surv is not None:
+        W = W * torch.stack(surv, dim=1)
     F = torch.stack(feats_n, dim=1).reshape(N * H, -1)
     G = torch.stack(goals_n, dim=1).reshape(N * H, -1)
     X = xi[:, None, :].expand(N, H, -1).reshape(N * H, -1)
     T = targets.reshape(N * H)
+    Wf = W.reshape(N * H)
     total = N * H
     mb = total // cfg.critic_minibatches
     losses = []
@@ -406,7 +460,8 @@ class Trainer:
       for i in range(cfg.critic_minibatches):
         idx = perm[i * mb : (i + 1) * mb]
         v = self.critic(F[idx], G[idx], X[idx])
-        loss = 2.0 * torch.nn.functional.huber_loss(v, T[idx], delta=cfg.critic_huber_delta)
+        hub = 2.0 * torch.nn.functional.huber_loss(v, T[idx], delta=cfg.critic_huber_delta, reduction="none")
+        loss = (hub * Wf[idx]).sum() / Wf[idx].sum().clamp(min=1e-6)
         self.opt_v.zero_grad(set_to_none=True)
         loss.backward()
         clip_grads(list(self.critic.parameters()), cfg.grad_clip_norm, None)
@@ -481,7 +536,7 @@ class Trainer:
     cfg = self.cfg
     if not cfg.wd_enabled:
       return False
-    r = float(m_pi.get("pi/imagined_reward_norm", float("nan")))
+    r = float(m_pi.get("pi/imagined_reward_robust", m_pi.get("pi/imagined_reward_norm", float("nan"))))
     vl = float(m_pi.get("critic/loss", float("nan")))
     if math.isfinite(vl):
       self.wd_vloss.append(vl)
@@ -489,17 +544,19 @@ class Trainer:
       return self._rollback("imagined reward is not finite")
     a = cfg.wd_ema
     self.wd_reward_ema = r if self.wd_reward_ema is None else (1 - a) * self.wd_reward_ema + a * r
-    self.wd_hist.append((self.it, self.wd_reward_ema))
-    while self.wd_hist and self.wd_hist[0][0] < self.it - cfg.wd_window:
-      self.wd_hist.popleft()
     if cfg.wd_force_at >= 0 and self.it >= cfg.wd_force_at and not self.wd_forced:
       self.wd_forced = True
       return self._rollback(f"forced at {self.it} (debug)")
-    if self.it < self.wd_quiet_until:
+    if self.it < self.wd_quiet_until:  # no baseline from the warm-up (replay refill after a start / resume)
+      self.wd_low = 0
       return False
+    self.wd_hist.append((self.it, self.wd_reward_ema))
+    while self.wd_hist and self.wd_hist[0][0] < self.it - cfg.wd_window:
+      self.wd_hist.popleft()
     best = max(e for _, e in self.wd_hist)
-    if self.wd_reward_ema < best - cfg.wd_drop:
-      return self._rollback(f"imagined reward EMA {self.wd_reward_ema:.3f} < best {best:.3f} - {cfg.wd_drop}")
+    self.wd_low = self.wd_low + 1 if self.wd_reward_ema < best - cfg.wd_drop else 0
+    if self.wd_low >= cfg.wd_sustain:
+      return self._rollback(f"imagined reward EMA {self.wd_reward_ema:.3f} < best {best:.3f} - {cfg.wd_drop} for {self.wd_low} its")
     if len(self.wd_vloss) >= 500:
       recent = float(np.median(list(self.wd_vloss)[-50:]))
       base = float(np.median(self.wd_vloss))

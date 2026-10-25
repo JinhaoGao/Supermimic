@@ -19,17 +19,20 @@ class Policy(nn.Module):
     z_dim: int = 32,
     enc_hidden: tuple[int, ...] = (2048, 1024, 512, 256),
     dec_hidden: tuple[int, ...] = (2048, 1024, 512, 256),
+    input_clip: float = 10.0,
   ):
     super().__init__()
     self.proprio_dim, self.hist, self.goal_frame_dim, self.K, self.action_dim = proprio_dim, hist, goal_frame_dim, K, action_dim
+    self.input_clip = float(input_clip)  # clamp of the normalized inputs (TrainCfg.input_clip; baked into exports)
     self.obs_norm = RunningMeanStd(proprio_dim)
     self.goal_norm = RunningMeanStd(goal_frame_dim)
     self.encoder = mlp(K * goal_frame_dim, enc_hidden, z_dim, act=nn.ELU)
     self.decoder = mlp(z_dim + hist * proprio_dim, dec_hidden, action_dim, act=nn.ELU)
 
   def normalize_inputs(self, obs_hist: torch.Tensor, goal: torch.Tensor):
-    on = self.obs_norm.normalize(obs_hist).clamp(-10.0, 10.0)
-    gn = self.goal_norm.normalize(goal).clamp(-10.0, 10.0)
+    c = self.input_clip
+    on = self.obs_norm.normalize(obs_hist).clamp(-c, c)
+    gn = self.goal_norm.normalize(goal).clamp(-c, c)
     return on, gn
 
   def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:

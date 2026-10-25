@@ -159,12 +159,11 @@ class DynamicsModel(nn.Module):
 
   @torch.no_grad()
   def update_stats(self, batch: dict) -> None:
-    s0, actions, next_states, mask = batch["s0"], batch["actions"], batch["next_states"], batch["mask"]
-    prev = torch.cat([s0[:, None], next_states[:, :-1]], dim=1)[mask]
-    nxt = next_states[mask]
-    D = prev.shape[-1]
-    prev, nxt = prev.reshape(-1, D), nxt.reshape(-1, D)
-    self.in_norm.update(torch.cat([self.features(prev), actions[mask].reshape(-1, self.nj)], -1))
+    s0, actions, next_states = batch["s0"], batch["actions"], batch["next_states"]
+    m = batch["step_mask"] if "step_mask" in batch else batch["mask"][:, None].expand(-1, actions.shape[1])
+    prev = torch.cat([s0[:, None], next_states[:, :-1]], dim=1)[m]  # [M, D] valid (s_j, s_j+1) pairs
+    nxt = next_states[m]
+    self.in_norm.update(torch.cat([self.features(prev), actions[m]], -1))
     self.tgt_norm.update(self.targets(prev, nxt))
     self.err_norm.update(self.diffs(prev, nxt))
 
@@ -177,9 +176,8 @@ class DynamicsModel(nn.Module):
       s = self.step(s, actions[:, j], xi)
       errs.append(self.state_error(s, next_states[:, j]))
     errs = torch.stack(errs, dim=1)  # [n,k]
-    m = mask.float()
-    denom = m.sum().clamp(min=1.0)
-    loss = (errs.mean(1) * m).sum() / denom
-    e1 = (errs[:, 0] * m).sum() / denom
-    ek = (errs[:, -1] * m).sum() / denom
+    m = (mask if mask.dim() == 2 else mask[:, None].expand(-1, k)).float()  # [n,k] step mask
+    loss = (errs * m).sum() / m.sum().clamp(min=1.0)
+    e1 = (errs[:, 0] * m[:, 0]).sum() / m[:, 0].sum().clamp(min=1.0)
+    ek = (errs[:, -1] * m[:, -1]).sum() / m[:, -1].sum().clamp(min=1.0)
     return loss, e1.detach(), ek.detach()

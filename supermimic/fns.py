@@ -52,8 +52,9 @@ class StepFns:
   def critic_inputs(self, s, goal):
     feat = self.wm.features(s)
     fd = self.heads.feat_dim
-    feat_n = ((feat - self.wm.in_norm.mean[:fd]) / self.wm.in_norm.std[:fd]).clamp(-10.0, 10.0)
-    goal_n = self.policy.goal_norm.normalize(goal).clamp(-10.0, 10.0)
+    c = self.policy.input_clip
+    feat_n = ((feat - self.wm.in_norm.mean[:fd]) / self.wm.in_norm.std[:fd]).clamp(-c, c)
+    goal_n = self.policy.goal_norm.normalize(goal).clamp(-c, c)
     return feat_n, goal_n
 
   def goal_from_pack(self, kin, f_loc, clip_end_loc, p_q, p_qd, p_bp, p_bq):

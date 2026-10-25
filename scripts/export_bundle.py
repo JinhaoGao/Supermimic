@@ -102,6 +102,7 @@ def main():
   meta = {
     "ckpt": os.path.abspath(args.ckpt),
     "iteration": ck["it"],
+    "input_clip": ck["cfg"].get("input_clip", 10.0),
     "robot": robot_name,
     "robot_variant": robot_variant,
     "mjlab_commit": mjlab_commit,
@@ -144,7 +145,7 @@ def export_onnx(ck: dict, meta: dict, path: str) -> None:
   from supermimic.policy import Policy
 
   d = meta["dims"]
-  policy = Policy(d["proprio"], d["hist"], d["goal_frame"], d["K"], d["nj"]).eval()
+  policy = Policy(d["proprio"], d["hist"], d["goal_frame"], d["K"], d["nj"], input_clip=ck["cfg"].get("input_clip", 10.0)).eval()
   policy.load_state_dict(ck["policy"])
   obs = torch.zeros(1, d["hist"], d["proprio"])
   goal = torch.zeros(1, d["K"], d["goal_frame"])

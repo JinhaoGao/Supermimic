@@ -39,7 +39,7 @@ def main():
   if args.ee_term_z is not None:  # e.g. score a v1 checkpoint under the v2 (end-effector) termination
     hk["ee_term_z"] = args.ee_term_z
   heads_cfg = HeadsCfg(**hk)
-  policy = Policy(d["proprio"], d["hist"], d["goal_frame"], d["K"], d["nj"]).to(args.device)
+  policy = Policy(d["proprio"], d["hist"], d["goal_frame"], d["K"], d["nj"], input_clip=ck["cfg"].get("input_clip", 10.0)).to(args.device)
   policy.load_state_dict(ck["policy"])
   n_sub = args.eval_clips if args.eval_clips is not None else int(cfg.get("eval_clips", 0))
   eval_clips: tuple[int, ...] = ()

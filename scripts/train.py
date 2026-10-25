@@ -66,6 +66,15 @@ def main():
   p.add_argument("--no_watchdog", action="store_true", help="disable the collapse watchdog (auto-rollback + LR halving)")
   p.add_argument("--wd_drop", type=float, default=0.2)
   p.add_argument("--wd_force_at", type=int, default=-1, help="debug: force one rollback at this iteration")
+  p.add_argument("--wd_warmup", type=int, default=1500, help="watchdog quiet iterations after start / resume / rollback")
+  # 10-25 fixes from the open-source comparison (all off by default)
+  p.add_argument("--input_clip", type=float, default=10.0, help="clamp of normalized policy / critic inputs (v2: 10)")
+  p.add_argument("--clip_values", action="store_true", help="clamp bootstrap / lambda-return values to +-r_max/(1-gamma)")
+  p.add_argument("--critic_weight_survival", action="store_true", help="critic loss weighted by imagined survival")
+  p.add_argument("--imag_truncate", action="store_true", help="imagined rollouts end at the clip end with a critic bootstrap")
+  p.add_argument("--wm_prefix_mask", action="store_true", help="WM windows crossing an episode end keep the steps up to it")
+  p.add_argument("--clean_prev_action", action="store_true", help="proprio a_{t-1} = policy action (not the noisy executed one)")
+  p.add_argument("--fixes", action="store_true", help="all six 10-25 fixes above, input_clip 50")
   p.add_argument("--no_compile", action="store_true")
   p.add_argument("--compile_mode", type=str, default=None, help="e.g. reduce-overhead or max-autotune")
   args = p.parse_args()
@@ -117,6 +126,13 @@ def main():
     wd_enabled=not args.no_watchdog,
     wd_drop=args.wd_drop,
     wd_force_at=args.wd_force_at,
+    wd_warmup=args.wd_warmup,
+    input_clip=50.0 if args.fixes and args.input_clip == 10.0 else args.input_clip,
+    clip_values=args.clip_values or args.fixes,
+    critic_weight_survival=args.critic_weight_survival or args.fixes,
+    imag_truncate=args.imag_truncate or args.fixes,
+    wm_prefix_mask=args.wm_prefix_mask or args.fixes,
+    clean_prev_action=args.clean_prev_action or args.fixes,
     compile_mode=args.compile_mode,
     wm=WorldModelCfg(k=args.wm_k, lr=args.lr, batches_per_update=args.wm_batches, windows_per_batch=args.wm_windows),
     heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos, ee_term_z=args.ee_term_z),

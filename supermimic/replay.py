@@ -42,11 +42,13 @@ class ReplayBuffer:
     """0 = newest written slot."""
     return (self.ptr - 1 - slot) % self.C
 
-  def sample_windows(self, n: int, k: int):
+  def sample_windows(self, n: int, k: int, prefix: bool = False):
     """Sample n windows of k consecutive transitions.
 
     Returns dict with s0 [n,D], actions [n,k,A], next_states [n,k,D], xi [n,X],
-    frame [n,k], prev_action [n,A], term [n,k], done [n,k] and mask [n] (bool).
+    frame [n,k], prev_action [n,A], term [n,k], done [n,k], mask [n] (bool, window usable) and step_mask [n,k]
+    (bool, transition j belongs to the window's episode). prefix=False: a window with an episode end before its last
+    step is dropped whole; prefix=True: it keeps the steps up to and including that end.
     """
     env = torch.randint(0, self.E, (n,), device=self.device)
     # Start slots must be at least k-1 steps older than the newest slot.
@@ -56,9 +58,16 @@ class ReplayBuffer:
     slots = (start[:, None] + offs[None, :]) % self.C  # [n,k]
     env_k = env[:, None].expand(n, k)
     done = self.done[env_k, slots]
-    # No episode end inside the window except possibly at the last step.
-    mask = ~done[:, :-1].any(dim=1) if k > 1 else torch.ones(n, dtype=torch.bool, device=self.device)
-    mask &= age < self.size
+    written = age < self.size
+    if prefix:
+      before = torch.cat([torch.zeros_like(done[:, :1]), done[:, :-1]], dim=1)  # an episode ended before step j
+      step_mask = (torch.cumsum(before.int(), dim=1) == 0) & written[:, None]
+      mask = step_mask[:, 0]
+    else:
+      # No episode end inside the window except possibly at the last step.
+      mask = ~done[:, :-1].any(dim=1) if k > 1 else torch.ones(n, dtype=torch.bool, device=self.device)
+      mask &= written
+      step_mask = mask[:, None].expand(n, k)
     return dict(
       s0=self.state[env, start],
       actions=self.action[env_k, slots],
@@ -70,6 +79,7 @@ class ReplayBuffer:
       done=done,
       reward=self.reward[env_k, slots],
       mask=mask,
+      step_mask=step_mask,
     )
 
   def sample_starts(self, n: int, hist: int):

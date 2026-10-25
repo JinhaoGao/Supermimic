@@ -109,7 +109,7 @@ class MujocoPlayer:
       self.backend = "onnx"
       print(f"[play] policy backend: onnxruntime ({onnx_path})")
     else:
-      self.policy = Policy(d["proprio"], d["hist"], d["goal_frame"], d["K"], d["nj"]).to(device).eval()
+      self.policy = Policy(d["proprio"], d["hist"], d["goal_frame"], d["K"], d["nj"], input_clip=m.get("input_clip", 10.0)).to(device).eval()
       self.policy.load_state_dict(torch.load(os.path.join(bundle, "policy.pt"), map_location=device))
       self.backend = "torch"
       print(f"[play] policy backend: torch ({os.path.join(bundle, 'policy.pt')})")
