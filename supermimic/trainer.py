@@ -36,7 +36,9 @@ Opt-in (2026-10-25): wd_signal "imagined_reward_alive" makes the watchdog watch
 sum_t c_t r_t / sum_t c_t (the survival weights of the policy objective; logged
 as pi/imagined_reward_alive either way) instead of the unweighted mean; early
 stop (es_eval_fail_ratio / es_patience) on the in-training eval's failures, with
-rank 0's result broadcast so every rank stops at the same iteration.
+rank 0's result broadcast so every rank stops at the same iteration; a watchdog
+rollback drops the evals of the abandoned branch from its history, and a resume
+at an eval slot evaluates the loaded weights first.
 """
 
 from __future__ import annotations
@@ -148,7 +150,9 @@ class TrainCfg:
   # count >= es_eval_fail_ratio x median(failed of all previous evals of this run; needs >= 3, median floored at 1);
   # es_patience bad evals in a row -> stop (earlystop.json, model_final, clean exit on every rank). 10-24: failures of
   # the deterministic eval rise ~28k iterations before the v4 cliff (corr -0.984). Also tracks the eval with the
-  # fewest failures (best_eval.json + model_best_eval.pt, rewritten at every new best).
+  # fewest failures (best_eval.json + model_best_eval.pt, rewritten at every new best). A watchdog rollback drops the
+  # evals after its target from the history (streak / median of the restored branch only); resumed at an eval slot,
+  # the loaded weights are evaluated before the first update (history and best start from them).
   es_eval_fail_ratio: float | None = None
   es_patience: int = 2
   # Logging / eval / checkpoints.
@@ -360,6 +364,7 @@ class Trainer:
     self.wd_hist: deque = deque()
     self.wd_vloss: deque = deque(maxlen=2000)
     self.wd_healthy_ckpt: str | None = None
+    self._resume_from: tuple[str, str] | None = None  # (path, clip-list relation) of --resume (Trainer.load)
     self.wd_rollbacks = 0
     self.wd_quiet_until = cfg.wd_warmup
     self.wd_forced = False
@@ -640,10 +645,11 @@ class Trainer:
 
   def _resume_diffs(self, ck_cfg: dict) -> tuple[list[str], str]:
     """(training settings of the checkpoint's run that differ from this run, clip-list relation). Resume only: a
-    rollback reloads this run's own checkpoint. Keys missing in master / v1 checkpoints take their defaults there (no
-    variant, no prior, no clamp, no curriculum; EE via HeadsCfg.from_dict). Clip lists compare by basename (bj27 vs
-    bj31 roots): "same" (or no list in the checkpoint = unknown = same), "prefix" (this list = the checkpoint's +
-    clips appended, scripts/extend_cache.py; master c1c94be) or "other"."""
+    rollback reloads this run's own checkpoint, or the resume checkpoint with the relation found here (Trainer.load).
+    Keys missing in master / v1 checkpoints take their defaults there (no variant, no prior, no clamp, no curriculum;
+    EE via HeadsCfg.from_dict). Clip lists compare by basename (bj27 vs bj31 roots): "same" (or no list in the
+    checkpoint = unknown = same), "prefix" (this list = the checkpoint's + clips appended, scripts/extend_cache.py;
+    master c1c94be) or "other"."""
     cur = self.cfg
 
     def w(x) -> tuple:
@@ -694,18 +700,22 @@ class Trainer:
 
   def load(self, path: str, rollback: bool = False) -> None:
     ck = torch.load(path, map_location=self.device, weights_only=False)
-    rel = "same"  # rollback: this run's own checkpoint
-    if not rollback:  # resume: v2 options / EE / data are silent dimensions -> say what differs (identical on every rank)
+    if rollback:  # this run's own checkpoint ("same"), or the resume checkpoint (until this run wrote a healthy one; r15
+      # rolled back to it twice): then the clip-list relation found at the resume (prefix / other), not "same"
+      rf = self._resume_from
+      rel = rf[1] if rf is not None and rf[0] == path else "same"
+    else:  # resume: v2 options / EE / data are silent dimensions -> say what differs (identical on every rank)
       diffs, rel = self._resume_diffs(ck.get("cfg") or {})
       for d in diffs:
         self._print(f"[Trainer] WARNING resume from another setup: {d}")
+      self._resume_from = (path, rel)
     self.policy.load_state_dict(ck["policy"])
     self.critic.load_state_dict(ck["critic"])
     self.wm.load_state_dict(ck["wm"])
     self.opt_wm.load_state_dict(ck["opt_wm"])
     self.opt_pi.load_state_dict(ck["opt_pi"])
     self.opt_v.load_state_dict(ck["opt_v"])
-    self._load_sampler_state(ck, rel, path)
+    self._load_sampler_state(ck, rel, path, rollback)
     self.it = ck["it"]
     self.env_steps = ck["env_steps"]
     for s in self.sched:
@@ -718,12 +728,13 @@ class Trainer:
     self._print(f"[Trainer] resumed from {path} at iteration {self.it}" + ("" if rollback else
                 f" (policy lr {self.opt_pi.param_groups[0]['lr']:.3e} = lr x lr_scale {self.lr_scale:g} x cosine {self.sched[1].lr_lambdas[0](self.it):.4f})"))
 
-  def _load_sampler_state(self, ck: dict, rel: str, path: str) -> None:
+  def _load_sampler_state(self, ck: dict, rel: str, path: str, rollback: bool = False) -> None:
     """Reset-sampler statistics (bin_G / bin_visits) of a checkpoint: all bins for the same clip list; for a library
     extended by appending clips (rel "prefix", master c1c94be) into its first bins, which keep their indices (checked:
     the first files of this list must have exactly the checkpoint's bin count here); otherwise not at all (they would
     land on other clips). Then clamped when clamp_returns is on (5bb8c0d / 5f020a9). Every rank runs this on the same
-    file and library -> identical state (Trainer._dist_start re-checks)."""
+    file and library -> identical state (Trainer._dist_start re-checks). Rollback: bins not taken from the checkpoint
+    keep their current statistics (as master's load does)."""
     c = self.cmd
     G, V = ck["bin_G"], ck["bin_visits"]
     nb, NB = G.shape[0], c.bin_G.shape[0]
@@ -740,7 +751,7 @@ class Trainer:
         c.bin_visits[:nb].copy_(V)
         restored = True
         self._print(f"[Trainer] sampler statistics of {nb} bins restored into the extended library ({NB} bins; "
-                    f"{NB - nb} new bins start unvisited)")
+                    + (f"the {NB - nb} appended bins keep their current statistics)" if rollback else f"{NB - nb} new bins start unvisited)"))
       else:
         why = f"extended library, but its first {n_old} files have {have} bins here, {nb} in the checkpoint"
     if restored:
@@ -750,7 +761,8 @@ class Trainer:
       return
     if rel != "prefix" or nb >= NB:
       why = f"{nb} bins in the checkpoint, {NB} here" if G.shape != c.bin_G.shape else "same bin count, other clip list"
-    self._print(f"[Trainer] WARNING reset-sampler state (bin_G / bin_visits) of {path} not loaded ({why}): the return-based sampler starts from scratch")
+    self._print(f"[Trainer] WARNING reset-sampler state (bin_G / bin_visits) of {path} not loaded ({why}): the return-based sampler "
+                + ("kept the current statistics (rollback)" if rollback else "starts from scratch"))
 
   # ---------------------------------------------------------------------------
   # Watchdog: G1 full-atlas run 2026-10-22 collapsed at ~41k iterations (imagined reward 0.91 -> 0.4 in
@@ -919,6 +931,7 @@ class Trainer:
       with open(os.path.join(cfg.log_dir, "watchdog.log"), "a") as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {reason} | {msg}\n")
       self.writer.add_scalar("guard/rollbacks", self.wd_rollbacks, it_before)
+    self._es_rollback()
     return True
 
   def evaluate(self) -> dict:
@@ -1059,6 +1072,14 @@ class Trainer:
     sync_every = cfg.sampler_sync_interval or cfg.log_interval
     if dctx.enabled:
       self._dist_start()
+    if self._es_on and self.it > 0 and self.it % cfg.eval_interval == 0:
+      # Resumed at an eval slot (warm start): evaluate the loaded weights before the first update, so the early-stop
+      # history and the best eval start from them (else the first evals after the resume are the baseline, and
+      # model_best_eval.pt only ever competes among those). Depends on cfg / the iteration only -> every rank joins.
+      ev = self._run_eval() if cfg.eval_enabled and self.main else None
+      if dctx.enabled:
+        dctx.barrier()
+      self._early_stop_step(ev, False)  # first eval of the history: never a stop
     while self.it < cfg.iterations:
       t0 = time.time()
       if cfg.hard_term_schedule:
@@ -1150,24 +1171,7 @@ class Trainer:
         p_ck = self.save(str(self.it)) if self.main else self._ckpt_path(str(self.it))  # all ranks track the path
         if self._healthy():
           self.wd_healthy_ckpt = p_ck
-      ev = None  # rank 0's eval summary (early stop)
-      if cfg.eval_enabled and eval_slot and self.main:
-        te = time.time()
-        try:
-          res = self.evaluate()
-          for k, v in res["scalars"].items():
-            self.writer.add_scalar(f"eval/{k}", v, self.it)
-          self.writer.add_scalar("time/eval", time.time() - te, self.it)
-          print(f"[eval it {self.it}] return {res['scalars']['return_mean']:.4f} min {res['scalars']['return_min']:.3f} failed {int(res['scalars']['failed'])}/{res['num_clips']} ({time.time()-te:.0f}s)", flush=True)
-          with open(os.path.join(cfg.log_dir, "eval.jsonl"), "a") as f:
-            f.write(json.dumps({"it": self.it, "env_steps": self.env_steps, "wall_s": time.time() - self._t_start, **res["scalars"], "failed_clips": res["failed_clips"]}) + "\n")
-          ev = {"failed": float(res["scalars"]["failed"]), "return_mean": float(res["scalars"]["return_mean"]), "num_clips": int(res["num_clips"])}
-        except Exception as e:  # noqa: BLE001
-          import traceback
-
-          traceback.print_exc()
-          print(f"[eval] failed: {e!r}", flush=True)
-          cfg.eval_enabled = False
+      ev = self._run_eval() if cfg.eval_enabled and eval_slot and self.main else None  # rank 0's summary (early stop)
       if dctx.enabled and (ckpt_slot or eval_slot):
         dctx.barrier()  # the other ranks wait (CPU barrier) while rank 0 saves / evaluates
       # Early stop (opt-in): _es_on and eval_slot depend on cfg / the iteration only -> every rank takes part.
@@ -1181,9 +1185,54 @@ class Trainer:
     if dctx.enabled:
       dctx.barrier()
 
+  def _run_eval(self) -> dict | None:
+    """Rank 0: one in-training eval (TB eval/*, the [eval] line, eval.jsonl) -> its summary for the early stop, or
+    None after an error (eval switched off for the rest of the run)."""
+    cfg = self.cfg
+    te = time.time()
+    try:
+      res = self.evaluate()
+      for k, v in res["scalars"].items():
+        self.writer.add_scalar(f"eval/{k}", v, self.it)
+      self.writer.add_scalar("time/eval", time.time() - te, self.it)
+      print(f"[eval it {self.it}] return {res['scalars']['return_mean']:.4f} min {res['scalars']['return_min']:.3f} failed {int(res['scalars']['failed'])}/{res['num_clips']} ({time.time()-te:.0f}s)", flush=True)
+      with open(os.path.join(cfg.log_dir, "eval.jsonl"), "a") as f:
+        f.write(json.dumps({"it": self.it, "env_steps": self.env_steps, "wall_s": time.time() - self._t_start, **res["scalars"], "failed_clips": res["failed_clips"]}) + "\n")
+      return {"failed": float(res["scalars"]["failed"]), "return_mean": float(res["scalars"]["return_mean"]), "num_clips": int(res["num_clips"])}
+    except Exception as e:  # noqa: BLE001
+      import traceback
+
+      traceback.print_exc()
+      print(f"[eval] failed: {e!r}", flush=True)
+      cfg.eval_enabled = False
+      return None
+
   # ---------------------------------------------------------------------------
   # Early stop on the in-training benchmark (opt-in, cfg.es_eval_fail_ratio)
   # ---------------------------------------------------------------------------
+
+  def _es_rollback(self) -> None:
+    """After a watchdog rollback to self.it: the evals of the abandoned branch (it > self.it) leave the early-stop
+    history -- they would carry their streak into the restored branch (one bad eval there would then stop the run) and
+    raise the median of later verdicts; the streak is the one of the last kept eval. A best eval of that branch stays
+    the best (model_best_eval.pt holds its weights) but no longer names model_<it>.pt, which the restored branch
+    rewrites when it gets there again. Rank-identical inputs -> the same state on every rank; no-op with es off."""
+    if not self._es_on:
+      return
+    dropped = [h["it"] for h in self.es_hist if h["it"] > self.it]
+    if not dropped:
+      return
+    self.es_hist = [h for h in self.es_hist if h["it"] <= self.it]
+    self.es_streak = self.es_hist[-1]["streak"] if self.es_hist else 0
+    b = self.es_best
+    if b is not None and b["it"] > self.it and b["regular_ckpt"] is not None:
+      b["regular_ckpt"] = None
+      if self.main:
+        with open(os.path.join(self.cfg.log_dir, "best_eval.json"), "w") as f:
+          json.dump(b, f, indent=1)
+    if self.main:
+      print(f"[es] rollback to it {self.it}: eval(s) at {dropped} of the abandoned branch left out of the early-stop history; "
+            f"streak {self.es_streak}/{self.cfg.es_patience}", flush=True)
 
   def _early_stop_step(self, ev_local: dict | None, ckpt_saved: bool) -> bool:
     """After an eval slot: rank 0's eval summary (None if it did not evaluate: eval switched off after an error) goes

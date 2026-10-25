@@ -189,6 +189,7 @@ def make_trainer(log_dir: str, NB: int, clamp: bool, dist: DistCtx | None = None
   t.buffer = types.SimpleNamespace(size=123)  # replay stand-in (the watchdog rollback empties it)
   t.wd_healthy_ckpt, t.wd_quiet_until, t.wd_rollbacks, t.wd_reward_ema, t.wd_nf_streak = None, 0, 0, None, 0
   t.wd_hist, t.wd_vloss = deque(), deque(maxlen=2000)
+  t._resume_from, t._es_on = None, False  # Trainer.__init__: no --resume yet, early stop off
   return t
 
 

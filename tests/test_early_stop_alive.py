@@ -20,11 +20,14 @@ Checks:
       es on: stops at the closed-form iteration with patience 2, writes earlystop.json (iteration, history, best-eval
       checkpoint) and best_eval.json, saves model_final and leaves the loop; the best eval has its own checkpoint
       (model_best_eval.pt, rewritten at every new best only: a watchdog rollback that re-reaches and overwrites
-      model_<it>.pt leaves it alone); a failing evaluator just ends the verdicts; es on but never triggered = es off
-      apart from its own lines / files;
+      model_<it>.pt leaves it alone, and best_eval.json then no longer names model_<it>.pt); a rollback drops the
+      evals of the abandoned branch from the history (no streak carried over, no inflated median); resumed at an eval
+      slot, the loaded weights are evaluated before the first update and start the history / best; a failing evaluator
+      just ends the verdicts; es on but never triggered = es off apart from its own lines / files;
   (c) the loop on 3 gloo processes: only rank 0 evaluates; every rank takes the same verdicts and leaves the loop at the
-      same iteration (same history / best / stop record), only rank 0 writes; the curriculum multiplier is the same on
-      every rank at every iteration (incl. after a rollback); es off == the loop before on every rank;
+      same iteration (same history / best / stop record, incl. the rollback's dropped evals and the start eval of a
+      resume), only rank 0 writes; the curriculum multiplier is the same on every rank at every iteration (incl. after a
+      rollback); es off == the loop before on every rank;
   (d) pi/imagined_reward_alive: closed form sum c_t r_t / sum c_t on a toy imagined rollout (post-death rewards of 1e3
       do not reach it, they do reach imagined_reward_norm); update_policy is otherwise the code before, bitwise
       (parameters, metrics, RNG); default watchdog signal == the watchdog before with the new key present; with the
@@ -464,7 +467,10 @@ def test_es_stops():
 
 def test_best_eval_checkpoint_survives_a_rollback():
   """Best eval at 16 (model_16.pt + model_best_eval.pt); a rollback to 8 re-reaches 16 and overwrites model_16.pt with
-  other weights; model_best_eval.pt still holds the evaluated ones (it is written at a new best only)."""
+  other weights; model_best_eval.pt still holds the evaluated ones (it is written at a new best only), and the best
+  eval no longer names model_16.pt (best_eval.json rewritten at the rollback). The evals at 12 / 16 of the abandoned
+  branch leave the history: the restored branch's 12 is the 3rd eval (warming up), 16 / 20 (300 >= 1.5 x median 100 /
+  200) stop it at 20 -- with them kept, it stopped at 16."""
   with tempfile.TemporaryDirectory() as d:
     t = loop_trainer(d, fails=[100, 100, 100, 50, 300, 300, 300], es_eval_fail_ratio=1.5, es_patience=2, wd_force_at=18)
     t._healthy = lambda: t.it == 8  # rollback target 8 (not 16)
@@ -479,13 +485,68 @@ def test_best_eval_checkpoint_survives_a_rollback():
 
     t.save = save
     r = run_loop(t)
-    assert r["rollbacks"] == 1 and r["evals"] == [4, 8, 12, 16, 12, 16] and r["it"] == 16
-    assert [x[:2] for x in stamp] == [(4, "best_eval"), (8, "8"), (16, "16"), (16, "best_eval"), (16, "16"), (16, "final")]
+    assert r["rollbacks"] == 1 and r["evals"] == [4, 8, 12, 16, 12, 16, 20] and r["it"] == 20
+    assert [x[:2] for x in stamp] == [(4, "best_eval"), (8, "8"), (16, "16"), (16, "best_eval"), (16, "16"), (20, "final")]
+    assert [(h["it"], h["failed"], h["bad"], h["streak"]) for h in t.es_hist] == [
+      (4, 100, False, 0), (8, 100, False, 0), (12, 300, False, 0), (16, 300, True, 1), (20, 300, True, 2)]
+    (rb,) = [l for l in r["stdout"].split("\n") if l.startswith("[es] rollback")]
+    assert rb == "[es] rollback to it 8: eval(s) at [12, 16] of the abandoned branch left out of the early-stop history; streak 0/2", rb
     first16 = next(w for it, tag, w in stamp if tag == "best_eval" and it == 16)
-    assert t.es_best["it"] == 16 and t.es_best["failed"] == 50 and t.es_best["regular_ckpt"] == os.path.join(d, "model_16.pt")
+    assert t.es_best["it"] == 16 and t.es_best["failed"] == 50 and t.es_best["regular_ckpt"] is None
+    assert json.loads(r["files"]["best_eval.json"]) == json.loads(json.dumps(t.es_best)) and t.es_stop["best_eval"] == t.es_best
     w_best = float(next(iter(torch.load(t.es_best["ckpt"], weights_only=False)["policy"].values())).flatten()[0])
     w_16 = float(next(iter(torch.load(os.path.join(d, "model_16.pt"), weights_only=False)["policy"].values())).flatten()[0])
     assert w_best == first16 and w_16 != first16, "model_16.pt was overwritten, model_best_eval.pt was not"
+
+
+FAILS_RB = [100, 90, 95, 92, 200, 150, 160]  # eval k; the 5th (it 20) is on the branch the rollback at 21 abandons
+
+
+def test_es_rollback_drops_the_abandoned_branch():
+  """Reviewer 10-25 (a)/(b): bad eval at 20 (streak 1), the watchdog rolls back at 21 to 16; the restored branch's 20
+  (150) is bad once. Kept, the abandoned 200 made it streak 2 = a stop after ONE bad eval on the restored branch, and
+  raised the median (threshold 142.5 instead of 140.25). Dropped: streak 1 there, the stop needs 24 too."""
+  with tempfile.TemporaryDirectory() as d:
+    t = loop_trainer(d, fails=FAILS_RB, es_eval_fail_ratio=1.5, es_patience=2, wd_force_at=21)
+    r = run_loop(t)
+    assert r["rollbacks"] == 1 and r["evals"] == [4, 8, 12, 16, 20, 20, 24] and r["it"] == 24 == t.es_stop["iteration"]
+    hist = [(h["it"], h["failed"], h["threshold"], h["bad"], h["streak"]) for h in t.es_hist]
+    assert hist == [(4, 100, None, False, 0), (8, 90, None, False, 0), (12, 95, None, False, 0), (16, 92, 142.5, False, 0),
+                    (20, 150, 140.25, True, 1), (24, 160, 142.5, True, 2)], hist
+    assert json.loads(r["files"]["earlystop.json"])["history"] == json.loads(json.dumps(t.es_hist))
+    assert "[es] rollback to it 16: eval(s) at [20] of the abandoned branch left out of the early-stop history; streak 0/2" in r["stdout"]
+    assert t.es_best["it"] == 8 and t.es_best["regular_ckpt"] == os.path.join(d, "model_8.pt"), "best before the rollback point: untouched"
+    with tempfile.TemporaryDirectory() as d2, mock.patch.object(Trainer, "_es_rollback", lambda self: None):  # the code before
+      t2 = loop_trainer(d2, fails=FAILS_RB, es_eval_fail_ratio=1.5, es_patience=2, wd_force_at=21)
+      r2 = run_loop(t2)
+    assert r2["it"] == 20 and [h["it"] for h in t2.es_hist] == [4, 8, 12, 16, 20, 20] and t2.es_hist[-1]["threshold"] == 142.5
+    print(f"  rollback 21 -> 16: stop at {r['it']} (abandoned eval kept, the code before: stop at {r2['it']})")
+  # the eval at the rollback point itself (same weights as the checkpoint) stays: rollback at 17 -> 16 drops nothing
+  with tempfile.TemporaryDirectory() as d:
+    t = loop_trainer(d, fails=FAILS_RB, es_eval_fail_ratio=1.5, es_patience=2, wd_force_at=17)
+    r = run_loop(t)
+    assert [h["it"] for h in t.es_hist][:4] == [4, 8, 12, 16] and r["evals"][:5] == [4, 8, 12, 16, 20]
+    assert "[es] rollback" not in r["stdout"]
+
+
+def test_resume_at_an_eval_slot_evaluates_the_start():
+  """--resume at an eval slot (r15ws: 136000): the loaded weights are evaluated before the first update and are the
+  first entry of the history and the first best (model_best_eval.pt = the start); off the slot / es off: no extra eval."""
+  with tempfile.TemporaryDirectory() as d:
+    t = loop_trainer(d, es_eval_fail_ratio=1.5, es_patience=2)
+    t.it = 8  # Trainer.load of a model_8.pt
+    r = run_loop(t)
+    assert r["evals"][:3] == [8, 12, 16] and r["collect"][0][0] == 8 and r["saves"][0] == (8, "best_eval")
+    assert r["stdout"].split("\n")[0].startswith("[eval it 8] return 0.8900") and r["stdout"].split("\n")[1].startswith("[es] it 8: eval failed 100 (warming up)")
+    assert [h["it"] for h in t.es_hist] == list(range(8, 37, 4)) and [h["failed"] for h in t.es_hist] == FAILS[:8]
+    assert r["it"] == 36 and t.es_best["it"] == 12, "the FAILS sequence shifted by one slot: stops 4 later"
+    assert json.loads(r["files"]["eval.jsonl"].split("\n")[0])["it"] == 8
+  for kw, it0, first in (({"es_eval_fail_ratio": 1.5}, 9, 12), ({}, 8, 12)):
+    with tempfile.TemporaryDirectory() as d:
+      t = loop_trainer(d, **kw)
+      t.it = it0
+      r = run_loop(t)
+      assert r["evals"][0] == first and not any(tag == "best_eval" and it == it0 for it, tag in r["saves"]), (kw, it0)
 
 
 def test_es_survives_a_failing_evaluator():
@@ -516,21 +577,31 @@ def _loop_worker(rank: int, world: int, port: int, tmp: str):
   d = os.path.join(tmp, "es")  # one log dir for every rank (train.py broadcasts it)
   os.makedirs(d, exist_ok=True)
   ctx.barrier()
-  t = loop_trainer(d, dist=ctx, es_eval_fail_ratio=1.5, es_patience=2, wd_force_at=13, **cur)
+  t = loop_trainer(d, dist=ctx, fails=FAILS_RB, es_eval_fail_ratio=1.5, es_patience=2, wd_force_at=21, **cur)
   r = run_loop(t)
   same((r["it"], t.es_hist, t.es_best, t.es_stop, t.es_streak), "early-stop state")
   same(r["collect"], "collect trace (iteration, curriculum multiplier)")
-  # the forced rollback at 13 (-> 8) repeats the eval at 12: evals 4, 8, 12, 12, 16, 20, 24, 28 -> the 8th stops (it 28)
-  assert r["rollbacks"] == 1 and r["it"] == 28, r["it"]
+  # the forced rollback at 21 (-> 16) drops the bad eval at 20 on every rank: the restored 20 is streak 1, 24 stops
+  assert r["rollbacks"] == 1 and r["it"] == 24, r["it"]
   assert [m for _, m in r["collect"]] == [hard_mult_at_master(cur["hard_term_schedule"], i) for i, _ in r["collect"]]
-  assert [h["it"] for h in t.es_hist] == [4, 8, 12, 12, 16, 20, 24, 28] and [h["bad"] for h in t.es_hist][-4:] == [True, False, True, True]
-  assert t.es_best["it"] == 8 and t.es_stop["iteration"] == 28 and t.es_best["ckpt"] == os.path.join(d, "model_best_eval.pt")
+  assert [h["it"] for h in t.es_hist] == [4, 8, 12, 16, 20, 24] and [h["bad"] for h in t.es_hist] == [False] * 4 + [True, True]
+  assert t.es_best["it"] == 8 and t.es_stop["iteration"] == 24 and t.es_best["ckpt"] == os.path.join(d, "model_best_eval.pt")
   if rank == 0:
-    assert r["evals"] == [h["it"] for h in t.es_hist]
-    assert r["saves"][-1] == (28, "final") and os.path.exists(os.path.join(d, "earlystop.json"))
+    assert r["evals"] == [4, 8, 12, 16, 20, 20, 24]
+    assert r["saves"][-1] == (24, "final") and os.path.exists(os.path.join(d, "earlystop.json"))
     print(f"  rank 0: {[l for l in r['stdout'].split(chr(10)) if l.startswith('[earlystop]')][0]}")
   else:
     assert r["evals"] == [] and r["saves"] == [] and r["stdout"] == ""
+  ctx.barrier()
+  # ---- resumed at an eval slot: rank 0 evaluates the start, every rank joins the verdict ----
+  d = os.path.join(tmp, "start")
+  os.makedirs(d, exist_ok=True)
+  ctx.barrier()
+  t = loop_trainer(d, dist=ctx, es_eval_fail_ratio=1.5, es_patience=2)
+  t.it = 8
+  r = run_loop(t)
+  same((r["it"], t.es_hist, t.es_best, t.es_stop), "early-stop state after a resume")
+  assert t.es_hist[0]["it"] == 8 and r["it"] == 36 and r["evals"] == ([h["it"] for h in t.es_hist] if rank == 0 else [])
   ctx.barrier()
   # ---- es off == the loop before, on every rank ----
   da, db = os.path.join(tmp, "new"), os.path.join(tmp, "old")

@@ -717,6 +717,64 @@ def test_resume_into_extended_library_keeps_sampler_stats():
         assert why in w, w
 
 
+def test_rollback_to_the_resume_checkpoint_keeps_its_clip_relation():
+  """Reviewer 10-25: until this run writes a healthy checkpoint, the watchdog rolls back to the --resume one (r15: twice
+  to r14's model_128000). That reload must use the relation the resume found, not "same": an extended library gets the
+  checkpoint's first bins back (before: none restored, collapse-time statistics kept, "starts from scratch" logged); a
+  checkpoint of the same clips in another order loads nothing (before: its bins were copied onto the other clips).
+  Bins not taken from the checkpoint keep their current statistics (master's load). A rollback to this run's own
+  checkpoint (another path) is "same" as before."""
+  with tempfile.TemporaryDirectory() as tmp:
+    old, extra, root, old_lib, new_dir = _extended(tmp)
+    ext = _lib(old + extra, root)
+    nb, NB = old_lib.num_bins, ext.num_bins
+    G, V = torch.linspace(1, 9, nb), torch.full((nb,), 7.0)
+    with tempfile.TemporaryDirectory() as ck_dir:
+      base = tsc.make_trainer(ck_dir, nb, False)
+      path = os.path.join(ck_dir, "model_128000.pt")
+      _save_ck(path, base, G, V, _master_train_cfg([f"/bj27/{os.path.basename(f)}" for f in old], sampler_clamp_returns=True), it=128000, lr_scale=1.0)
+      t = tsc.make_trainer(ck_dir, NB, True)
+      t.lib = ext
+      t.cfg = dataclasses.replace(t.cfg, motion_files=old + extra)
+      Trainer.load(t, path)
+      assert t._resume_from == (path, "prefix") and torch.equal(t.cmd.bin_G[:nb], G) and t.wd_healthy_ckpt == path
+      t.cmd.bin_G.fill_(3.0)  # training moved the statistics
+      t.cmd.bin_visits.fill_(99.0)
+      t.prints.clear()
+      t.it = 129769
+      assert Trainer._rollback(t, "test") is True and t.it == 128000
+      assert torch.equal(t.cmd.bin_G[:nb], G) and torch.equal(t.cmd.bin_visits[:nb], V), "first nb bins = the checkpoint"
+      assert float(t.cmd.bin_G[nb:].sub(3.0).abs().max()) == 0.0 and float(t.cmd.bin_visits[nb:].sub(99.0).abs().max()) == 0.0
+      (msg,) = [s_ for s_ in t.prints if "restored into the extended library" in s_]
+      assert f"the {NB - nb} appended bins keep their current statistics" in msg, msg
+      assert not any("WARNING" in s_ for s_ in t.prints), "a rollback reports no settings diff"
+      # rollback to this run's own checkpoint: "same" (its bin_G covers every bin)
+      own = os.path.join(ck_dir, "model_130000.pt")
+      _save_ck(own, t, torch.full((NB,), 4.0), torch.full((NB,), 5.0), dataclasses.asdict(t.cfg), it=130000, lr_scale=0.5)
+      t.wd_healthy_ckpt, t.it = own, 130338
+      assert Trainer._rollback(t, "test") is True and t.it == 130000
+      assert float(t.cmd.bin_G.sub(4.0).abs().max()) == 0.0 and float(t.cmd.bin_visits.sub(5.0).abs().max()) == 0.0
+  # same clips, other order (same bin count): refused at the resume, and at the rollback
+  NB = 64
+  files = [f"/x/g1__lafan1_{i}.npz" for i in range(4)]
+  with tempfile.TemporaryDirectory() as d:
+    base = tsc.make_trainer(d, NB, False)
+    G = torch.linspace(1, 9, NB)
+    path = os.path.join(d, "ck.pt")
+    _save_ck(path, base, G, torch.full((NB,), 7.0), _master_train_cfg(files[::-1]), it=1000, lr_scale=1.0)
+    t = tsc.make_trainer(d, NB, False)
+    _r15_here(t, files)
+    Trainer.load(t, path)
+    assert t._resume_from == (path, "other") and float(t.cmd.bin_visits.sum()) == 0.0
+    t.cmd.bin_G.fill_(-3.0)
+    t.prints.clear()
+    t.it = 1500
+    assert Trainer._rollback(t, "test") is True and t.it == 1000
+    assert float(t.cmd.bin_G.add(3.0).abs().max()) == 0.0, "not copied onto the other clips"
+    (w,) = [s_ for s_ in t.prints if "not loaded" in s_]
+    assert "same bin count, other clip list" in w and "kept the current statistics (rollback)" in w, w
+
+
 def _ext_worker(rank: int, world: int, port: int, tmp: str, root: str, files: list, ck: str):
   os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE=str(world))
   torch.set_num_threads(1)
@@ -800,6 +858,7 @@ def _example_args(tmp: str) -> tuple[list[str], dict]:
   body = body.split("ARGS=(", 1)[1].rsplit(")", 1)[0]
   vars_ = dict(re.findall(r'^([A-Z_]+)=([^\s"$][^\s]*)$', text, flags=re.M))  # plain NAME=value lines
   vars_["ITERS"] = re.search(r'ITERS="\$\{ITERS:-(\d+)\}"', text).group(1)
+  vars_["LR"] = re.search(r'^LR="\$\{LR:-([0-9.e+-]+)\}"', text, flags=re.M).group(1)
   files = [os.path.join(tmp, f"g1__lafan1_{i}.npz") for i in range(3)]
   for f in files:
     open(f, "w").close()

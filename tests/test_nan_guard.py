@@ -48,6 +48,7 @@ def stand_in(patience: int = 5, healthy_ckpt: str | None = None) -> Trainer:
   t.wd_quiet_until = t.cfg.wd_warmup
   t.wd_forced = False
   t.wd_nf_streak = 0
+  t._es_on = False  # early stop off (Trainer._rollback -> _es_rollback)
   t.loads = []
   t.load = lambda path, rollback=False: t.loads.append((path, rollback))  # instance attr shadows the method
   t._set_lr_scale = lambda s: None

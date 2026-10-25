@@ -4,11 +4,14 @@
 # 89.06%), with r15's recipe per rank, plus the 10-24 fixes:
 #   * in-training eval every 2000 its on the fixed 1024-name subset (r15: --no_eval) + early stop when its failures
 #     reach 1.5 x the median of the earlier evals twice in a row (--es_eval_fail_ratio 1.5 --es_patience 2); the
-#     checkpoint with the fewest eval failures is kept as model_best_eval.pt (best_eval.json; earlystop.json at a stop);
+#     checkpoint with the fewest eval failures is kept as model_best_eval.pt (best_eval.json; earlystop.json at a stop).
+#     136000 is an eval slot, so the loaded r15 weights are evaluated before the first update: they are the first entry
+#     of the history and the first best (model_best_eval.pt is never worse than the start on this set);
 #   * watchdog on the survival-weighted imagined reward (--wd_signal imagined_reward_alive) with the per-rank floor
 #     (--wd_reward_floor -1.0): bj27 r16 rolled back 6x on the unweighted monitor (LR 2e-8, gave up);
-#   * effective LR at the start 2.5e-5 = r15's own start (5e-5 x cosine(128000) = 2.48e-5) instead of the 1.4e-6 the
-#     checkpoint carries (lr_scale 0.0625 after r15's four rollbacks), see LR below.
+#   * effective LR at the start 2.5e-5 (default; LR=... overrides) instead of the 1.4e-6 the checkpoint carries
+#     (lr_scale 0.0625 after r15's four rollbacks): DELIBERATELY 4-17x the LRs that produced model_136000, NOT shown to
+#     be stable -- see LR below.
 # Needs branch ddp-bj31-v2 (this commit or later) deployed on bj31 (REPO below, with a COMMIT file) and free GPUs.
 #
 #   bash scripts/launch_bj31_r15ws.example.sh prep            # once: checks + extended cache (~11 min on 64 workers)
@@ -40,6 +43,20 @@
 #   is --lr x 0.0625 x cosine(136000) = --lr x 0.0625 x 0.448172 -> --lr 8.9252e-4 gives 2.5000e-5 (policy, critic and
 #   world model alike; the log prints "policy lr 2.500e-05 = lr x lr_scale 0.0625 x cosine 0.4482" at resume). A
 #   watchdog rollback halves it from there. At 250000 it reaches 8.9252e-4 x 0.0625 x 0.03 = 1.7e-6.
+#   What r15 did (bj27 watchdog.log + TB, read 10-25): it STARTED at 2.48e-5 but rolled back after 1769 its
+#   (129769 -> 128000), then after 655 its at 1.24e-5 (128655 -> 128000); model_136000 was trained at 6.21e-6
+#   (128000 -> 130000), 3.03e-6 (130000 -> 132000) and 1.48e-6 (132000 -> 136000). So this start is 4-17x the LRs of
+#   the checkpoint (and the watchdog that stopped r15 there now watches the less sensitive alive signal), with an 8x
+#   global batch on top. Not proof that 2.5e-5 is unstable either: every rollback was on the UNWEIGHTED imagined reward
+#   (the 10-24 false-alarm signal; master logs no alive one), whose dips (< 0.85 at a 50-it log) came at every level
+#   (31 / 8 / 37 / 26 / 25 % of the logs from 2.48e-5 down to 1.48e-6), the deepest dip (0.682, it 135900) at the lowest
+#   LR, the deepest rollback (#4, EMA 0.218) at 3.03e-6; train fail did not rise at 2.48e-5 (0.21 -> 0.20) but at the
+#   low levels (0.17 -> 0.22 -> 0.26 -> 0.32). Against it: wm e8 rose fastest at 2.48e-5 (0.17 -> 0.31 in 1.7k its;
+#   +0.01..0.04 per later level, 0.48 at the end) -- the policy moving faster than the world model follows. v4 went
+#   89.06 -> 89.85 % over the low-LR part. Unresolved -> accepted risk, bounded by the start eval above: compare the
+#   [es] lines of 138000 / 140000 with the one of 136000 and stop by hand if they are clearly worse (a step change
+#   right after the start sets the median and the ratio rule does not see it). Conservative arm: LR=2.2126e-4 (start
+#   6.2e-6 = r15's first level that held 2000 its); a short A/B (both arms ~4k its, compare eval/failed) settles it.
 set -euo pipefail
 STEP="${1:?prep | launch [run_name]}"
 RUN="${2:-g1v2_r15ws_ddp8}"
@@ -60,6 +77,7 @@ CKPT_MD5=aa46502442505f0536fc6204ab08cd13  # 303,347,240 bytes
 SOURCES=noetix_kungfu=10,noetix_kungfu_dance_show=15,sportsmeeting=10,lafan1=15,g1_all=10,mixamo_cn=2,virtual_point=3
 NAMES=tengkong=200,kongfan=200,shoufan=200,erqijiao=200,danpaijiao=200,xuanfeng=200,waibailian=100,lihetui=100,saotang=100,ceti=100,houti=100,zhengti=100
 ITERS="${ITERS:-250000}"  # the cosine's end; the early stop is expected to end the run before
+LR="${LR:-8.9252e-4}"  # x lr_scale 0.0625 x cosine(136000) 0.4482 = start LR 2.5e-5 (see LR above; 2.2126e-4 -> 6.2e-6)
 
 export PYTHONPATH="$REPO"
 check_list() {
@@ -112,7 +130,7 @@ ARGS=(
   --name_weights "$NAMES"
   --sampler_clamp_returns
   --num_envs 4096 --rollouts 4096 --H 48 --wm_batches 10 --wm_windows 2048 --wm_k 8
-  --lr 8.9252e-4 --lr_decay_iters 250000 --iterations "$ITERS" --seed 0
+  --lr "$LR" --lr_decay_iters 250000 --iterations "$ITERS" --seed 0
   --wd_drop 0.2 --wd_reward_floor -1.0 --wd_signal imagined_reward_alive
   --num_workers 64
   --eval_clip_names "$EVAL_NAMES" --eval_interval 2000 --eval_envs 1024
@@ -126,7 +144,11 @@ ARGS=(
 #   --log_root /data2/supermimic/logs --cache_dir /data2/supermimic/cache --run_name $RUN --num_threads 24).
 # After the start, the log must show: no "WARNING resume from another setup" line; "clamp_returns: 0 of 5428418 loaded
 # bin returns clamped" (r15 stored them clamped); "resumed from ... at iteration 136000 (policy lr 2.500e-05 = lr x
-# lr_scale 0.0625 x cosine 0.4482)"; "watchdog signal: pi/imagined_reward_alive"; "early stop: eval failed >= 1.5 x
-# median"; "[dist] start: learned state identical on all 8 ranks". First eval at 138000, first early-stop verdict at
-# 144000 (needs 3 earlier evals); "[es] it ..." after every eval, "[earlystop] ..." + earlystop.json when it fires.
+# lr_scale 0.0625 x cosine 0.4482)" (with the default LR); "watchdog signal: pi/imagined_reward_alive"; "early stop:
+# eval failed >= 1.5 x median"; "[dist] start: learned state identical on all 8 ranks"; then, before the first
+# iteration line, "[eval it 136000] ..." + "[es] it 136000: ... (warming up)" (r15's own failed count on this set,
+# unknown so far). Then evals at 138000, 140000; first early-stop verdict at 142000 (needs 3 earlier evals); "[es] it
+# ..." after every eval, "[es] rollback to it ..." when a watchdog rollback drops evals of the abandoned branch,
+# "[earlystop] ..." + earlystop.json when it fires. If r15 fails only a handful of the 1024 (bj31 ws86k_b plateau:
+# 6-13), 1.5 x median is a few clips: two noisy evals in a row can stop the run -- check model_best_eval.pt then.
 NPROC=8 THREADS=24 bash "$REPO/scripts/launch_bj31_ddp.sh" "$RUN" "${ARGS[@]}"

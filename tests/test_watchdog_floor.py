@@ -142,6 +142,7 @@ def stand_in(floor: float | None, dist: DistCtx | None = None, ckpt: str | None 
   t.wd_quiet_until = t.cfg.wd_warmup
   t.wd_forced = False
   t.wd_nf_streak = 0
+  t._es_on = False  # early stop off (Trainer._rollback -> _es_rollback)
   if before:  # the old code had no floor counters
     t._watchdog = types.MethodType(_watchdog_before, t)
   else:

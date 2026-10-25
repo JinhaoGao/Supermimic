@@ -160,7 +160,9 @@ def main():
   p.add_argument("--es_eval_fail_ratio", type=float, default=None,
                  help="stop when an in-training eval fails >= R x median(failed of all previous evals of this run, >= 3 of "
                       "them) for --es_patience consecutive evals (writes <log_dir>/earlystop.json, saves model_final); "
-                      "also keeps the checkpoint with the fewest eval failures (model_best_eval.pt, best_eval.json). Default off")
+                      "also keeps the checkpoint with the fewest eval failures (model_best_eval.pt, best_eval.json). A watchdog "
+                      "rollback drops the evals of the abandoned branch; a --resume at an eval slot evaluates the loaded "
+                      "weights first. Default off")
   p.add_argument("--es_patience", type=int, default=2, help="consecutive bad evals before the early stop (default 2)")
   p.add_argument("--no_compile", action="store_true")
   p.add_argument("--compile_mode", type=str, default=None, help="e.g. reduce-overhead or max-autotune")
