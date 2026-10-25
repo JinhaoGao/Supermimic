@@ -65,6 +65,22 @@ def motion_files_from_args(args) -> list[str]:
   return files
 
 
+def parse_hard_schedule(spec: str) -> tuple:
+  """'it:mult,it:mult,...' -> ((it, mult), ...) (master 4314a50's format; empty -> ())."""
+  out = []
+  for kv in spec.split(","):
+    if not kv.strip():
+      continue
+    a, sep, b = kv.partition(":")
+    if not sep:
+      raise ValueError(f"{kv!r} is not it:mult")
+    m = float(b)
+    if not m > 0:
+      raise ValueError(f"multiplier {m} must be > 0")
+    out.append((int(a), m))
+  return tuple(out)
+
+
 def main():
   _die_with_torchrun_agent()
   p = argparse.ArgumentParser()
@@ -82,6 +98,12 @@ def main():
                  help="reset-sampler prior per data source, e.g. noetix_kungfu=6,sportsmeeting=10 (clip '<robot>__<source>_...')")
   p.add_argument("--name_weights", type=str, default="",
                  help="reset-sampler weight per clip-name keyword (case-insensitive substring), e.g. crawl=4,getup=4")
+  # Hard-clip termination curriculum (master 4314a50; bj27 r13 / r14 used it, r15 did not): every termination threshold
+  # (env + soft head) of the clips matching --hard_names is multiplied by the schedule's value at the iteration.
+  p.add_argument("--hard_names", type=str, default="",
+                 help="clip-name keywords (comma-separated, case-insensitive) of the hard set for --hard_term_schedule")
+  p.add_argument("--hard_term_schedule", type=str, default="",
+                 help="termination multiplier of the hard set, piecewise linear over absolute iterations, e.g. 104000:2,108000:2,114000:1")
   p.add_argument("--ee_term_z", type=float, default=None,
                  help="master's v2 spelling of the end-effector height termination [m] (env + soft head): 0 = off as in "
                       "the paper, 0.25 = BeyondMimic / team benchmark; same as --ee_termination --ee_threshold Z / --no_ee_termination")
@@ -143,6 +165,13 @@ def main():
     p.error("--motion_list replaces --motion_dirs / --blacklist / --name_exclude / --max_motions (give one or the other)")
   if not args.motion_list and not args.motion_dirs:
     p.error("--motion_dirs or --motion_list is required")
+  hard_names = tuple(k for k in args.hard_names.split(",") if k)
+  try:
+    hard_schedule = parse_hard_schedule(args.hard_term_schedule)
+  except ValueError as e:
+    p.error(f"--hard_term_schedule {args.hard_term_schedule!r}: {e}")
+  if hard_schedule and not hard_names:
+    p.error("--hard_term_schedule needs --hard_names (the hard set it applies to)")
 
   if args.num_threads > 0:
     # Before torch / numpy spin up their pools (they are imported below). Pool workers inherit the env.
@@ -189,6 +218,8 @@ def main():
     robot_variant=args.robot_variant,
     source_weights=tuple((kv.split("=")[0], float(kv.split("=")[1])) for kv in args.source_weights.split(",") if kv),
     name_weights=tuple((kv.split("=")[0], float(kv.split("=")[1])) for kv in args.name_weights.split(",") if kv),
+    hard_names=hard_names,
+    hard_term_schedule=hard_schedule,
     num_envs=args.num_envs,
     device=args.device,
     seed=args.seed,

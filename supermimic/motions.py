@@ -193,6 +193,75 @@ def build_cache(files, joint_names, body_names, cache_dir, expected_fps=50.0, nu
   log(f"[cache] done in {time.time() - t0:.0f}s")
 
 
+def library_cache_dir(cache_root: str, files, joint_names, body_names, expected_fps: float) -> str:
+  """Cache directory of a file list: lib_<n>_<key>, key = sha1 of the exact ordered paths + TARGET joint / body names
+  (entity order, tracked bodies) + fps. The source body order (npz body_names or the fallback) is not part of it: both
+  yield the same cache contents. MotionLibrary and extend_cache use this one function."""
+  files = list(files)
+  key = hashlib.sha1(("\n".join(files) + "|" + ",".join(joint_names) + "|" + ",".join(body_names) + f"|{expected_fps}").encode()).hexdigest()[:10]
+  return os.path.join(cache_root, f"lib_{len(files)}_{key}")
+
+
+def extend_cache(old_dir: str, old_files, extra_files, new_dir: str, num_workers: int = 32, chunk_frames: int = 2_000_000, log=print) -> dict:
+  """Cache of old_files + extra_files (in that order) from the cache of old_files without re-reading it (master c1c94be):
+  the old arrays are copied row by row (bitwise), only the extra npz files are read, through the same per-file writer as
+  build_cache (_worker_fill: joint / body remap by name, body_names fallback for npz files without the key, fps and
+  frame-count checks; a failing file keeps zero frames and ok=false, exactly as in a full build). clips.json = the old
+  one (same ok flags -> the old clips keep their bins and bin indices) + the extra clips; meta.json is written last
+  (MotionLibrary treats it as "cache complete"). Returns the new meta."""
+  old_files, extra_files = list(old_files), list(extra_files)
+  meta = json.load(open(os.path.join(old_dir, "meta.json")))
+  J, B, fps = meta["joint_names"], meta["body_names"], float(meta["fps"])
+  assert int(meta.get("files", len(old_files))) == len(old_files), f"{old_dir}: {meta.get('files')} files, list has {len(old_files)}"
+  clips = json.load(open(os.path.join(old_dir, "clips.json")))
+  assert len(clips) == len(old_files) and [c["name"] for c in clips] == [os.path.basename(f) for f in old_files], \
+    f"{old_dir}/clips.json does not match the old list"
+  assert not os.path.exists(os.path.join(new_dir, "meta.json")), f"{new_dir} exists"
+  t0 = time.time()
+  with Pool(num_workers) as pool:
+    lengths = pool.map(_npz_frames, extra_files, chunksize=16)
+  T_old = int(meta["frames"])
+  T = T_old + int(sum(lengths))
+  os.makedirs(new_dir, exist_ok=True)
+  shapes = {}
+  for k in FIELD_DTYPES:
+    old = np.load(os.path.join(old_dir, f"{k}.npy"), mmap_mode="r")
+    assert old.shape[0] == T_old and old.dtype == FIELD_DTYPES[k], (k, old.shape, old.dtype)
+    shapes[k] = (T,) + old.shape[1:]
+    new = np.lib.format.open_memmap(os.path.join(new_dir, f"{k}.npy"), mode="w+", dtype=FIELD_DTYPES[k], shape=shapes[k])
+    for i in range(0, T_old, chunk_frames):
+      j = min(i + chunk_frames, T_old)
+      new[i:j] = old[i:j]
+    new.flush()
+    del new, old
+    log(f"[extend] copied {k} ({time.time() - t0:.0f}s)")
+  starts = (T_old + np.cumsum([0] + lengths[:-1])).tolist()
+  jobs = [(f, int(s), int(n), fps) for f, s, n in zip(extra_files, starts, lengths)]
+  bad, n_fallback = [], 0
+  with Pool(num_workers, initializer=_worker_init, initargs=(new_dir, J, B, shapes)) as pool:
+    for path, err, fallback in pool.imap_unordered(_worker_fill, jobs, chunksize=8):
+      if err is not None:
+        bad.append((path, err))
+      elif fallback:
+        n_fallback += 1
+  if n_fallback:
+    log(f"[extend] {n_fallback}/{len(extra_files)} extra files have no body_names key -> fixed fallback body order used")
+  if bad:
+    log(f"[extend] WARNING: {len(bad)} extra files failed (first: {bad[:3]}); their frames stay zero -> excluded")
+  bad_set = {b[0] for b in bad}
+  clips += [{"name": os.path.basename(f), "start": int(s), "end": int(s) + int(n), "ok": f not in bad_set} for f, s, n in zip(extra_files, starts, lengths)]
+  with open(os.path.join(new_dir, "clips.json"), "w") as f:
+    json.dump(clips, f)
+  m2 = {"joint_names": J, "body_names": B, "fps": fps, "frames": T, "files": len(old_files) + len(extra_files),
+        "failed_files": int(meta.get("failed_files", 0)) + len(bad),
+        "body_names_fallback_files": int(meta.get("body_names_fallback_files", 0)) + n_fallback,
+        "build_seconds": time.time() - t0, "extended_from": old_dir, "extra_files": len(extra_files), "extra_failed": len(bad)}
+  with open(os.path.join(new_dir, "meta.json"), "w") as f:  # last: MotionLibrary treats meta.json as "cache complete"
+    json.dump(m2, f, indent=2)
+  log(f"[extend] done in {time.time() - t0:.0f}s: {m2['files']} files, {T} frames -> {new_dir}")
+  return m2
+
+
 # ---------------------------------------------------------------------------
 # Library
 # ---------------------------------------------------------------------------
@@ -217,15 +286,19 @@ class MotionLibrary:
     self.fps = expected_fps
     self.dt = 1.0 / expected_fps
     files = list(files)
-    # Key = file paths + TARGET joint/body names (entity order, tracked bodies) + fps. The source body
-    # order (npz body_names or the fallback) is not part of it: both yield the same cache contents.
-    key = hashlib.sha1(("\n".join(files) + "|" + ",".join(self.joint_names) + "|" + ",".join(self.body_names) + f"|{expected_fps}").encode()).hexdigest()[:10]
     cache_root = cache_dir or os.path.join(os.path.expanduser("~"), ".cache", "supermimic_motions")
-    cdir = os.path.join(cache_root, f"lib_{len(files)}_{key}")
+    cdir = library_cache_dir(cache_root, files, self.joint_names, self.body_names, expected_fps)
     if not os.path.exists(os.path.join(cdir, "meta.json")):
       build_cache(files, self.joint_names, self.body_names, cdir, expected_fps, num_workers, log)
     meta = json.load(open(os.path.join(cdir, "meta.json")))
-    clips_all = json.load(open(os.path.join(cdir, "clips.json")))
+    with open(os.path.join(cdir, "clips.json"), "rb") as f:
+      clips_raw = f.read()
+    clips_all = json.loads(clips_raw)
+    # Content fingerprint of the library this process mapped (cache dir, frame count, clips.json incl. ok flags):
+    # data-parallel ranks compare it in their state check (one library everywhere, an extended cache included).
+    self.fingerprint = hashlib.blake2b(os.path.basename(cdir).encode() + f"|{meta['frames']}|".encode() + clips_raw, digest_size=12).hexdigest()
+    # End frame of each input file (file order = clips.json order): bins of a prefix of the list (bins_of_first_files).
+    self.file_frame_end = [int(c["end"]) for c in clips_all]
     self.cache_dir = cdir
     t0 = time.time()
     self.fields: dict[str, torch.Tensor] = {}
@@ -275,6 +348,15 @@ class MotionLibrary:
       f"MotionLibrary: {self.num_clips} clips, {self.time_step_total} frames ({self.total_seconds / 3600:.2f} h), "
       f"{self.num_bins} bins, {self.nb} tracked bodies, {self.nj} joints, {gb:.1f} GB in RAM"
     )
+
+  def bins_of_first_files(self, n: int) -> int:
+    """Number of bins of the clips of the first n files of the list (they come first: bins are laid out in file
+    order). A library extended by appending files keeps the old files' bins at the same indices."""
+    if n <= 0:
+      return 0
+    if n > len(self.file_frame_end):
+      return -1
+    return int((self.bin_start < self.file_frame_end[n - 1]).sum())
 
   def clip_of_frame(self, frames: torch.Tensor) -> torch.Tensor:
     """Clip index for global frame indices (GPU), via searchsorted on clip ends."""

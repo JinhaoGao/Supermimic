@@ -19,7 +19,7 @@ import torch
 
 from mjlab.managers import CommandTerm
 from mjlab.tasks.tracking.mdp.commands import MotionCommand, MotionCommandCfg
-from mjlab.utils.lab_api.math import quat_from_euler_xyz, quat_mul, sample_uniform
+from mjlab.utils.lab_api.math import quat_apply_inverse, quat_from_euler_xyz, quat_mul, sample_uniform
 
 from .motions import MotionLibrary
 
@@ -66,6 +66,13 @@ def reset_prior(clip_names, bin_clip: torch.Tensor, source_weights=(), name_weig
     log(f"[LibraryMotionCommand] name keywords {nws}: {int(sum(nw > 1.0 for nw in name_w))} clips, "
         f"{hit.float().mean().item() * 100:.2f}% of bins -> {bin_prior[hit].sum().item() * 100:.2f}% of the uniform share")
   return bin_prior
+
+
+def hard_clip_mask(clip_names, hard_names=(), device=None) -> torch.Tensor:
+  """Hard set of the termination curriculum (master 4314a50): clip name contains any hard_names keyword
+  (case-insensitive substring) -> bool [num_clips]. All False without keywords."""
+  hn = [str(k).lower() for k in hard_names]
+  return torch.tensor([any(k in n.lower() for k in hn) for n in clip_names], dtype=torch.bool, device=device)
 
 
 class LibraryMotionCommand(MotionCommand):
@@ -118,6 +125,19 @@ class LibraryMotionCommand(MotionCommand):
     self.bin_prior: torch.Tensor | None = reset_prior(
       [c.name for c in lib.clips], lib.bin_clip, cfg.source_weights, cfg.name_weights, self.device
     )
+    # Hard-clip termination curriculum (master 4314a50, v2 r13): clips whose name contains a hard_names keyword get
+    # every termination threshold (env terms + the trainer's soft head) multiplied by hard_mult, which the trainer
+    # sets from cfg.hard_term_schedule at the iteration (identical on every DDP rank); other clips keep 1. Episodes keep
+    # the factor of the clip they reset into. clip_hard is a pure function of the clip list and cfg (rank-identical,
+    # checked by the Trainer's state check); env_hard / term_scale_env are per env (each rank's own envs).
+    self.clip_hard = hard_clip_mask([c.name for c in lib.clips], cfg.hard_names, self.device)
+    self.env_hard = torch.zeros(E, dtype=torch.bool, device=self.device)
+    self.term_scale_env = torch.ones(E, device=self.device)
+    self.hard_mult = 1.0
+    if cfg.hard_names:
+      hb = self.clip_hard[lib.bin_clip]
+      print(f"[LibraryMotionCommand] hard set {[str(k).lower() for k in cfg.hard_names]}: {int(self.clip_hard.sum())} clips, "
+            f"{hb.float().mean().item() * 100:.2f}% of bins")
     # Sequential clip assignment for "start" (evaluation) mode.
     ec = cfg.eval_clips if cfg.eval_clips else tuple(range(lib.num_clips))
     self.eval_clips = torch.tensor(ec, dtype=torch.long, device=self.device)
@@ -190,6 +210,10 @@ class LibraryMotionCommand(MotionCommand):
   @property
   def anchor_ang_vel_w(self) -> torch.Tensor:
     return self._cur["body_ang_vel"][:, self.motion_anchor_body_index]
+
+  def set_hard_mult(self, m: float) -> None:
+    self.hard_mult = float(m)
+    self.term_scale_env = 1.0 + (self.hard_mult - 1.0) * self.env_hard.float()
 
   # ---- return-based reset sampling -----------------------------------------
 
@@ -270,6 +294,9 @@ class LibraryMotionCommand(MotionCommand):
   def _resample_command(self, env_ids: torch.Tensor):
     frames = self.sample_frames(env_ids)
     self.time_steps[env_ids] = frames
+    hard = self.clip_hard[self.library.clip_of_frame(frames)]
+    self.env_hard[env_ids] = hard
+    self.term_scale_env[env_ids] = 1.0 + (self.hard_mult - 1.0) * hard.float()
     self.clip_end_env[env_ids] = self.library.clip_end_of_frame[frames].long()
     rs = self.library.root_state(frames)
     origins = self._env.scene.env_origins[env_ids]
@@ -314,6 +341,32 @@ def motion_clip_end(env: "ManagerBasedRlEnv", command_name: str) -> torch.Tensor
   return cmd.time_steps >= cmd.clip_end_env - 1  # type: ignore[attr-defined]
 
 
+# mjlab's anchor / end-effector terminations (bad_anchor_pos_z_only / bad_anchor_ori / bad_motion_body_pos_z_only, same
+# signatures and tests) with the per-env threshold multiplier of the hard-clip curriculum (LibraryMotionCommand.
+# term_scale_env, 1 outside the hard set); swapped in by make_env_cfg only when hard_names is set.
+
+
+def scaled_anchor_pos_z(env: "ManagerBasedRlEnv", command_name: str, threshold: float) -> torch.Tensor:
+  cmd = env.command_manager.get_term(command_name)
+  return (cmd.anchor_pos_w[:, -1] - cmd.robot_anchor_pos_w[:, -1]).abs() > threshold * cmd.term_scale_env  # type: ignore[attr-defined]
+
+
+def scaled_anchor_ori(env: "ManagerBasedRlEnv", asset_cfg, command_name: str, threshold: float) -> torch.Tensor:
+  g = env.scene[asset_cfg.name].data.gravity_vec_w
+  cmd = env.command_manager.get_term(command_name)
+  dz = quat_apply_inverse(cmd.anchor_quat_w, g)[:, 2] - quat_apply_inverse(cmd.robot_anchor_quat_w, g)[:, 2]  # type: ignore[attr-defined]
+  return dz.abs() > threshold * cmd.term_scale_env  # type: ignore[attr-defined]
+
+
+def scaled_body_pos_z(env: "ManagerBasedRlEnv", command_name: str, threshold: float, body_names=None) -> torch.Tensor:
+  from mjlab.tasks.tracking.mdp.rewards import _get_body_indexes
+
+  cmd = env.command_manager.get_term(command_name)
+  idx = _get_body_indexes(cmd, body_names)
+  err = (cmd.body_pos_relative_w[:, idx, -1] - cmd.robot_body_pos_w[:, idx, -1]).abs()  # type: ignore[attr-defined]
+  return (err > (threshold * cmd.term_scale_env)[:, None]).any(-1)  # type: ignore[attr-defined]
+
+
 @dataclass(kw_only=True)
 class LibraryMotionCommandCfg(MotionCommandCfg):
   motion_files: tuple[str, ...] = ()
@@ -325,10 +378,14 @@ class LibraryMotionCommandCfg(MotionCommandCfg):
   softmax_temp: float = 25.0
   g_max: float = 10.0
   return_ema: float = 0.05
-  clamp_returns: bool = False  # bin returns (EMA input, sampled G, loaded bin_G) clamped to [0, g_max]; off = paper
+  # Clamp bin returns (EMA input, sampled G, bin_G loaded on resume / rollback) to [0, g_max]. Off = paper: a clip-end
+  # bin whose last reward is negative (joint-limit penalty) gets G << 0 through the time-out bootstrap r_last / (1 - gamma)
+  # and takes the whole softmax + history share (sampler/top1_prob 0.5). ddp-bj31 5bb8c0d == master 5f020a9: one switch.
+  clamp_returns: bool = False
   weight_ema: float = 0.01
   source_weights: tuple = ()  # ((source prefix, weight), ...): prior of the uniform share, see LibraryMotionCommand
   name_weights: tuple = ()  # ((name keyword, weight), ...): max with the source weight (case-insensitive substring)
+  hard_names: tuple = ()  # clip-name keywords of the hard set (termination curriculum, case-insensitive substring)
   sampling_mode: Literal["return", "uniform", "start"] = "return"  # type: ignore[assignment]
   cache_dir: str = ""
   num_workers: int = 32

@@ -184,6 +184,7 @@ def make_trainer(log_dir: str, NB: int, clamp: bool, dist: DistCtx | None = None
   t.lr_scale = 1.0
   t.it, t.env_steps = 0, 0
   t.cmd = make_cmd(NB, clamp)
+  t.lib = types.SimpleNamespace(fingerprint=f"stand-in library, {NB} bins")  # the state check's "library" group
   t.writer = types.SimpleNamespace(add_scalar=lambda *a, **k: None)
   t.buffer = types.SimpleNamespace(size=123)  # replay stand-in (the watchdog rollback empties it)
   t.wd_healthy_ckpt, t.wd_quiet_until, t.wd_rollbacks, t.wd_reward_ema, t.wd_nf_streak = None, 0, 0, None, 0

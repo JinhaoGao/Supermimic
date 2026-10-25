@@ -282,7 +282,8 @@ class AnalyticHeads:
 
   # ---- termination ---------------------------------------------------------
 
-  def termination(self, kin_next: dict, ref_ap: torch.Tensor, ref_aq: torch.Tensor, ref_bp: torch.Tensor | None = None):
+  def termination(self, kin_next: dict, ref_ap: torch.Tensor, ref_aq: torch.Tensor, ref_bp: torch.Tensor | None = None,
+                  scale: torch.Tensor | None = None):
     """Hard (simulator) and soft (imagination) termination at the target frame.
 
     ref_ap [B,3] / ref_aq [B,4]: reference anchor pose; ref_bp [B,Bt,3]: reference positions of all tracked
@@ -293,22 +294,28 @@ class AnalyticHeads:
     every end-effector height error, and the hard one is the OR of the tests (= the soft one as temp -> 0).
     The end-effector height error |ref_z - z| equals mjlab's ``bad_motion_body_pos_z_only``: its re-anchored
     reference (``body_pos_relative_w``) only shifts xy and rotates about z, so its z is the raw reference z.
-    (master's v2 version of this function takes (kin_next, ref_bp, ref_bq) and slices the anchor itself; the
+
+    scale [B] (optional, master 4314a50): per-sample multiplier of every threshold AND sigmoid temperature (the
+    hard-clip termination curriculum, LibraryMotionCommand.term_scale_env; the env terms use the same factor).
+    None = the code before the curriculum, bitwise (python factor 1.0, same graph); a tensor of ones gives the
+    same numbers. (master's version takes (kin_next, ref_bp, ref_bq, scale) and slices the anchor itself; the
     numbers are the same.)"""
     c = self.cfg
     B = ref_ap.shape[0]
     g = self.gravity.expand(B, 3)
+    k = 1.0 if scale is None else scale  # [B]
     dz = (ref_ap[:, 2] - kin_next["anchor_pos"][:, 2]).abs()
     tilt = (quat_apply_inverse(ref_aq, g)[:, 2] - quat_apply_inverse(kin_next["anchor_quat"], g)[:, 2]).abs()
-    hard = (dz > c.term_z) | (tilt > c.term_tilt)
-    pz = torch.sigmoid((dz - c.term_z) / c.term_z_temp)
-    pt = torch.sigmoid((tilt - c.term_tilt) / c.term_tilt_temp)
+    hard = (dz > c.term_z * k) | (tilt > c.term_tilt * k)
+    pz = torch.sigmoid((dz - c.term_z * k) / (c.term_z_temp * k))
+    pt = torch.sigmoid((tilt - c.term_tilt * k) / (c.term_tilt_temp * k))
     alive = (1.0 - pz) * (1.0 - pt)
     if c.ee_termination:
       assert ref_bp is not None, "ee_termination needs the reference body positions"
+      ke = 1.0 if scale is None else scale[:, None]  # [B, 1] against [B, n_ee]
       dz_ee = (ref_bp[:, self.ee, 2] - kin_next["body_pos"][:, self.ee, 2]).abs()  # [B, n_ee]
-      hard = hard | (dz_ee > c.ee_term_z).any(-1)
-      p_ee = torch.sigmoid((dz_ee - c.ee_term_z) / c.ee_term_z_temp)
+      hard = hard | (dz_ee > c.ee_term_z * ke).any(-1)
+      p_ee = torch.sigmoid((dz_ee - c.ee_term_z * ke) / (c.ee_term_z_temp * ke))
       alive = alive * torch.prod(1.0 - p_ee, dim=-1)
     soft = 1.0 - alive
     return hard, soft

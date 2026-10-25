@@ -25,6 +25,12 @@ rollback targets. With wd_reward_floor set, each rank's finite imagined reward
 is clamped from below first (one rank's spike must not roll everyone back).
 Simulator states that come back non-finite end their episode as a failure (the
 replay keeps the finite pre-step state).
+
+master 4314a50 / c1c94be / 5f020a9 (merged): hard-clip termination curriculum
+(hard_names / hard_term_schedule; the multiplier is a function of the iteration
+only, so every rank applies the same one), resume into a library extended by
+appending clips (scripts/extend_cache.py; the old bins keep their sampler
+statistics), and the sampler return clamp, which is this branch's switch already.
 """
 
 from __future__ import annotations
@@ -60,6 +66,11 @@ class TrainCfg:
   robot_variant: str = ""  # see env_cfg.base_tracking_cfg (g1: eval; e2: nodamp)
   source_weights: tuple = ()  # ((source prefix, weight), ...) prior of the reset sampler's uniform share
   name_weights: tuple = ()  # ((name keyword, weight), ...) max with it (skill quotas, e.g. crawl / getup)
+  # Hard-clip termination curriculum: clips matching hard_names (name keywords) get every termination threshold
+  # (env + soft head, sigmoid temperatures too) multiplied by a piecewise-linear schedule over absolute
+  # iterations ((it, mult), ...), constant outside; e.g. ((104000, 2.0), (108000, 2.0), (114000, 1.0)).
+  hard_names: tuple = ()
+  hard_term_schedule: tuple = ()  # master 4314a50 (bj27 r13 / r14); off = mjlab's terminations, untouched
   num_envs: int = 4096
   device: str = "cuda:0"
   seed: int = 0
@@ -71,7 +82,9 @@ class TrainCfg:
   action_noise_std: float = 0.1
   replay_capacity: int = 1000
   episode_length_s: float = 10.0
-  sampler_clamp_returns: bool = False  # reset sampler: bin returns clamped to [0, g_max] (LibraryMotionCommandCfg.clamp_returns)
+  # Reset sampler: bin returns clamped to [0, g_max] (LibraryMotionCommandCfg.clamp_returns). One switch for ddp-bj31
+  # 5bb8c0d and master 5f020a9 (same name in both branches' TrainCfg, so either checkpoint cfg compares / loads).
+  sampler_clamp_returns: bool = False
   compile: bool = True
   compile_mode: str | None = None
   num_threads: int = 0  # torch intra-op CPU threads (0 = torch default); scripts/train.py also sets OMP_NUM_THREADS
@@ -149,6 +162,11 @@ def finite_mean(v) -> float:
   return float(a[f].mean()) if f.any() else float("nan")
 
 
+def _check_cfg(cfg: TrainCfg) -> None:
+  if cfg.hard_term_schedule and not cfg.hard_names:
+    raise ValueError("hard_term_schedule needs hard_names (the hard set it applies to)")
+
+
 def clip_grads(params, norm: float, elem: float | None) -> float:
   total = torch.nn.utils.clip_grad_norm_(params, norm).item()
   if elem is not None:
@@ -163,6 +181,7 @@ class Trainer:
 
   def __init__(self, cfg: TrainCfg, dist: DistCtx | None = None):
     self.cfg = cfg
+    _check_cfg(cfg)
     self.dist = dist if dist is not None else DistCtx(device=cfg.device)
     dctx = self.dist
     self.main = dctx.is_main
@@ -188,6 +207,7 @@ class Trainer:
       library_key=self.LIB_KEY, cache_dir=cfg.cache_dir, num_workers=cfg.num_workers,
       ee_termination=cfg.heads.ee_termination, ee_threshold=cfg.heads.ee_term_z, clamp_returns=cfg.sampler_clamp_returns,
       robot_variant=cfg.robot_variant, source_weights=cfg.source_weights, name_weights=cfg.name_weights,
+      hard_names=cfg.hard_names,
     )
     env_cfg.seed = seed
     # Rank 0 builds the env first (and the packed motion cache if it is missing); the others wait so that
@@ -251,6 +271,10 @@ class Trainer:
     if mc.source_weights or mc.name_weights:
       self._print(f"[Trainer] reset sampler prior: source_weights {list(mc.source_weights)} name_weights {list(mc.name_weights)}")
     self._print("[Trainer] reset sampler: bin returns " + (f"clamped to [0, {mc.g_max:g}]" if mc.clamp_returns else "unclamped (paper recipe)"))
+    if cfg.hard_names:
+      self._print(f"[Trainer] hard-clip termination curriculum: {int(self.cmd.clip_hard.sum())} clips match {list(cfg.hard_names)}, "
+                  f"schedule {list(cfg.hard_term_schedule) or 'none (x1)'}")
+    self._print(f"[Trainer] library fingerprint {self.lib.fingerprint} ({os.path.basename(self.lib.cache_dir)})")
     if dctx.enabled:
       self._print(
         f"[Trainer] data parallel: {dctx.world} ranks x {self.E} envs / {cfg.rollouts_per_update} rollouts "
@@ -276,8 +300,10 @@ class Trainer:
     self.ep_ret = torch.zeros(E, device=self.device)
     self._gamma_pow = cfg.gamma ** torch.arange(L, device=self.device, dtype=torch.float32)
     self._ar = torch.arange(E, device=self.device)
-    self.stats = {"ep_return_norm": [], "ep_len": [], "ep_failed": [], "ep_failed_ee": [], "term_mismatch": [], "sim_nonfinite": []}
+    self.stats = {"ep_return_norm": [], "ep_len": [], "ep_failed": [], "ep_failed_ee": [], "term_mismatch": [], "sim_nonfinite": [],
+                  "hard_ep_failed": [], "hard_ep_len": []}
     self._ee_on = hc.ee_termination
+    self._hard_on = bool(cfg.hard_names)  # curriculum off: term_scale None everywhere (the code path before it)
     # ---- NaN guard ----
     self.guard_skips = {"wm": 0, "pi": 0, "critic": 0}  # skipped (non-finite) updates since start, same on every rank
     self.guard_nf_iters = 0  # iterations with a skipped update or a non-finite imagined reward
@@ -308,7 +334,7 @@ class Trainer:
 
     self.env.step(a_exec)
     next_state = self.sim.state()
-    r, term_hard = self.fns.post(next_state, self.kin, a_exec, self.prev_action, *ref_cur)
+    r, term_hard = self.fns.post(next_state, self.kin, a_exec, self.prev_action, *ref_cur, self.cmd.term_scale_env if self._hard_on else None)
     terminated = self.env.reset_terminated.bool()
     timeouts = self.env.reset_time_outs.bool()
     # A non-finite simulator state never trips the (NaN-blind) termination tests: end it as a failure and keep the
@@ -377,6 +403,11 @@ class Trainer:
     self.stats["ep_failed"].extend(failed.float().tolist())
     if failed_ee is not None:
       self.stats["ep_failed_ee"].extend((failed_ee & failed).float().tolist())
+    if self._hard_on:  # hard-clip curriculum: episodes of the hard set (the clip they reset into)
+      hard = self.cmd.env_hard[ids]
+      if bool(hard.any()):
+        self.stats["hard_ep_failed"].extend(failed[hard].float().tolist())
+        self.stats["hard_ep_len"].extend(L[hard].tolist())
 
   # ---------------------------------------------------------------------------
   # 2. World model
@@ -414,6 +445,11 @@ class Trainer:
     bias = self.sim.bias_from_xi(xi, self.nj)
     t_g0 = time.time()
     with torch.no_grad():
+      # Termination multiplier of the hard-clip curriculum for the clip each rollout starts in (1 elsewhere); None
+      # without the curriculum (the code path before it).
+      term_scale = None
+      if self._hard_on:
+        term_scale = 1.0 + (self.cmd.hard_mult - 1.0) * self.cmd.clip_hard[self.lib.clip_of_frame(st["frame"])].float()
       hs, hp = st["hist_states"], st["hist_prev_action"]
       hist_n = hs.shape[1]
       obs_hist = heads.proprio(
@@ -433,7 +469,7 @@ class Trainer:
     feats_n, goals_n, rews, dsoft = [], [], [], []
     p = (pack["joint_pos"], pack["joint_vel"], pack["body_pos"], pack["body_quat"], pack["body_lin_vel"], pack["body_ang_vel"])
     for t in range(H):
-      s, obs_hist, prev_a, f_loc, kin, r, d, fn, gn = self.fns.imagine_step(s, obs_hist, prev_a, f_loc, clip_end_loc, xi, bias, kin, *p)
+      s, obs_hist, prev_a, f_loc, kin, r, d, fn, gn = self.fns.imagine_step(s, obs_hist, prev_a, f_loc, clip_end_loc, xi, bias, kin, *p, term_scale)
       J = J + (g**t) * c * r
       c = c * (1.0 - d)
       feats_n.append(fn.detach())
@@ -545,15 +581,19 @@ class Trainer:
     )
     return path
 
-  def _resume_diffs(self, ck_cfg: dict) -> tuple[list[str], bool]:
-    """(training settings of the checkpoint's run that differ from this run, same clip list). Resume only: a rollback
-    reloads this run's own checkpoint. Keys missing in master / v1 checkpoints take their defaults there (no variant,
-    no prior, no clamp; EE via HeadsCfg.from_dict). Clip lists compare by basename (bj27 vs bj31 roots); no list in
-    the checkpoint = unknown = same."""
+  def _resume_diffs(self, ck_cfg: dict) -> tuple[list[str], str]:
+    """(training settings of the checkpoint's run that differ from this run, clip-list relation). Resume only: a
+    rollback reloads this run's own checkpoint. Keys missing in master / v1 checkpoints take their defaults there (no
+    variant, no prior, no clamp, no curriculum; EE via HeadsCfg.from_dict). Clip lists compare by basename (bj27 vs
+    bj31 roots): "same" (or no list in the checkpoint = unknown = same), "prefix" (this list = the checkpoint's +
+    clips appended, scripts/extend_cache.py; master c1c94be) or "other"."""
     cur = self.cfg
 
     def w(x) -> tuple:
       return tuple((str(k), float(v)) for k, v in (x or ()))
+
+    def sched(x) -> tuple:
+      return tuple((int(a), float(b)) for a, b in (x or ()))
 
     pairs = [
       ("robot", ck_cfg.get("robot", "g1"), cur.robot),
@@ -561,7 +601,11 @@ class Trainer:
       ("source_weights", w(ck_cfg.get("source_weights")), w(cur.source_weights)),
       ("name_weights", w(ck_cfg.get("name_weights")), w(cur.name_weights)),
       ("sampler_clamp_returns", bool(ck_cfg.get("sampler_clamp_returns", False)), bool(cur.sampler_clamp_returns)),
+      ("hard_names", tuple(str(k) for k in ck_cfg.get("hard_names", ()) or ()), tuple(str(k) for k in cur.hard_names)),
+      ("hard_term_schedule", sched(ck_cfg.get("hard_term_schedule")), sched(cur.hard_term_schedule)),
     ]
+    if "H" in ck_cfg:
+      pairs.append(("H", int(ck_cfg["H"]), int(cur.H)))
     diffs = [f"{k} = {a!r} in the checkpoint, {b!r} here" for k, a, b in pairs if a != b]
     try:
       hk = HeadsCfg.from_dict(ck_cfg["heads"])
@@ -573,22 +617,29 @@ class Trainer:
       diffs += [f"heads.{k} = {a.get(k)!r} in the checkpoint, {b[k]!r} here" for k in b if a.get(k) != b[k]]
     except Exception as e:  # noqa: BLE001 -- a warning helper must never stop a resume
       diffs.append(f"heads cfg not comparable ({type(e).__name__}: {e})")
-    same_clips = True
+    rel = "same"
     ck_files = ck_cfg.get("motion_files")
     if ck_files is not None:
-      if len(ck_files) != len(cur.motion_files):
-        same_clips = False
-        diffs.append(f"motion files: {len(ck_files)} in the checkpoint, {len(cur.motion_files)} here")
-      elif [os.path.basename(f) for f in ck_files] != [os.path.basename(f) for f in cur.motion_files]:
-        same_clips = False
-        diffs.append(f"motion files: {len(ck_files)} on both, but other basenames / order")
-    return diffs, same_clips
+      old = [os.path.basename(f) for f in ck_files]
+      new = [os.path.basename(f) for f in cur.motion_files]
+      if old == new:
+        rel = "same"
+      elif 0 < len(old) < len(new) and new[: len(old)] == old:
+        rel = "prefix"
+        diffs.append(f"motion files: the checkpoint's {len(old)} + {len(new) - len(old)} appended here (extended library)")
+      elif len(old) != len(new):
+        rel = "other"
+        diffs.append(f"motion files: {len(old)} in the checkpoint, {len(new)} here")
+      else:
+        rel = "other"
+        diffs.append(f"motion files: {len(old)} on both, but other basenames / order")
+    return diffs, rel
 
   def load(self, path: str, rollback: bool = False) -> None:
     ck = torch.load(path, map_location=self.device, weights_only=False)
-    same_clips = True
+    rel = "same"  # rollback: this run's own checkpoint
     if not rollback:  # resume: v2 options / EE / data are silent dimensions -> say what differs (identical on every rank)
-      diffs, same_clips = self._resume_diffs(ck.get("cfg") or {})
+      diffs, rel = self._resume_diffs(ck.get("cfg") or {})
       for d in diffs:
         self._print(f"[Trainer] WARNING resume from another setup: {d}")
     self.policy.load_state_dict(ck["policy"])
@@ -597,16 +648,7 @@ class Trainer:
     self.opt_wm.load_state_dict(ck["opt_wm"])
     self.opt_pi.load_state_dict(ck["opt_pi"])
     self.opt_v.load_state_dict(ck["opt_v"])
-    if ck["bin_G"].shape == self.cmd.bin_G.shape and same_clips:
-      self.cmd.bin_G.copy_(ck["bin_G"])
-      self.cmd.bin_visits.copy_(ck["bin_visits"])
-      if self.cmd.cfg.clamp_returns:  # resume / rollback: the EMA restarts from bounded values (same on every rank)
-        n, g_min = self.cmd.clamp_bin_returns_()
-        self._print(f"[Trainer] clamp_returns: {n} of {self.cmd.bin_G.numel()} loaded bin returns clamped to [0, {self.cmd.cfg.g_max:g}] (min before {g_min:.3f})")
-    else:  # bins of another library: they would land on the wrong clips
-      why = (f"{ck['bin_G'].numel()} bins in the checkpoint, {self.cmd.bin_G.numel()} here" if ck["bin_G"].shape != self.cmd.bin_G.shape
-             else "same bin count, other clip list")
-      self._print(f"[Trainer] WARNING reset-sampler state (bin_G / bin_visits) of {path} not loaded ({why}): the return-based sampler starts from scratch")
+    self._load_sampler_state(ck, rel, path)
     self.it = ck["it"]
     self.env_steps = ck["env_steps"]
     for s in self.sched:
@@ -616,7 +658,42 @@ class Trainer:
       self._print(f"[Trainer] lr_scale {self.lr_scale} restored from checkpoint")
     self.wd_healthy_ckpt = path
     self.wd_quiet_until = self.it + self.cfg.wd_warmup
-    self._print(f"[Trainer] resumed from {path} at iteration {self.it}")
+    self._print(f"[Trainer] resumed from {path} at iteration {self.it}" + ("" if rollback else
+                f" (policy lr {self.opt_pi.param_groups[0]['lr']:.3e} = lr x lr_scale {self.lr_scale:g} x cosine {self.sched[1].lr_lambdas[0](self.it):.4f})"))
+
+  def _load_sampler_state(self, ck: dict, rel: str, path: str) -> None:
+    """Reset-sampler statistics (bin_G / bin_visits) of a checkpoint: all bins for the same clip list; for a library
+    extended by appending clips (rel "prefix", master c1c94be) into its first bins, which keep their indices (checked:
+    the first files of this list must have exactly the checkpoint's bin count here); otherwise not at all (they would
+    land on other clips). Then clamped when clamp_returns is on (5bb8c0d / 5f020a9). Every rank runs this on the same
+    file and library -> identical state (Trainer._dist_start re-checks)."""
+    c = self.cmd
+    G, V = ck["bin_G"], ck["bin_visits"]
+    nb, NB = G.shape[0], c.bin_G.shape[0]
+    restored = False
+    if G.shape == c.bin_G.shape and rel == "same":
+      c.bin_G.copy_(G)
+      c.bin_visits.copy_(V)
+      restored = True
+    elif rel == "prefix" and nb < NB:
+      n_old = len((ck.get("cfg") or {}).get("motion_files") or ())
+      have = self.lib.bins_of_first_files(n_old)
+      if have == nb:
+        c.bin_G[:nb].copy_(G)
+        c.bin_visits[:nb].copy_(V)
+        restored = True
+        self._print(f"[Trainer] sampler statistics of {nb} bins restored into the extended library ({NB} bins; "
+                    f"{NB - nb} new bins start unvisited)")
+      else:
+        why = f"extended library, but its first {n_old} files have {have} bins here, {nb} in the checkpoint"
+    if restored:
+      if c.cfg.clamp_returns:  # resume / rollback: the EMA restarts from bounded values (same on every rank)
+        n, g_min = c.clamp_bin_returns_()
+        self._print(f"[Trainer] clamp_returns: {n} of {c.bin_G.numel()} loaded bin returns clamped to [0, {c.cfg.g_max:g}] (min before {g_min:.3f})")
+      return
+    if rel != "prefix" or nb >= NB:
+      why = f"{nb} bins in the checkpoint, {NB} here" if G.shape != c.bin_G.shape else "same bin count, other clip list"
+    self._print(f"[Trainer] WARNING reset-sampler state (bin_G / bin_visits) of {path} not loaded ({why}): the return-based sampler starts from scratch")
 
   # ---------------------------------------------------------------------------
   # Watchdog: G1 full-atlas run 2026-10-22 collapsed at ~41k iterations (imagined reward 0.91 -> 0.4 in
@@ -703,6 +780,33 @@ class Trainer:
     scal["guard/nonfinite_iters"] = self.guard_nf_iters
     if self.cfg.wd_reward_floor is not None:  # key depends on cfg only
       scal["guard/reward_floored"] = self.guard_floored  # cumulative floored rank values
+    return scal
+
+  def hard_mult_at(self, it: int) -> float:
+    """Termination multiplier of the hard set at iteration ``it`` (master 4314a50): piecewise linear through
+    cfg.hard_term_schedule ((it, mult), ...), constant outside; 1 without a schedule. A pure function of cfg and the
+    iteration counter, so every DDP rank (and a resumed / rolled-back run at the same iteration) gets the same value."""
+    pts = sorted((int(a), float(b)) for a, b in self.cfg.hard_term_schedule)
+    if not pts:
+      return 1.0
+    if it <= pts[0][0]:
+      return pts[0][1]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+      if it <= x1:
+        return y0 + (y1 - y0) * (it - x0) / max(x1 - x0, 1)
+    return pts[-1][1]
+
+  def _hard_scalars(self) -> dict:
+    """Curriculum scalars (master 4314a50): multiplier and the hard-set episodes since the last log, pooled over ranks
+    (data parallel: the sums of _dist_log_scalars) or this process's episodes."""
+    scal = {"hard/term_mult": float(self.cmd.hard_mult)}
+    if self.dist.enabled:
+      fail, ln, n = self._hard_pooled
+    else:
+      fail, ln, n = float(np.sum(self.stats["hard_ep_failed"])), float(np.sum(self.stats["hard_ep_len"])), float(len(self.stats["hard_ep_failed"]))
+    if n > 0:
+      scal["hard/ep_failed_frac"] = fail / n
+      scal["hard/ep_len"] = ln / n
     return scal
 
   def _healthy(self) -> bool:
@@ -819,7 +923,7 @@ class Trainer:
       return out
 
     c = self.cmd
-    return {
+    groups = {
       "policy": named(self.policy.state_dict()),  # incl. obs/goal normalizers
       "critic": named(self.critic.state_dict()),
       "wm": named(self.wm.state_dict()),  # incl. in/tgt/err normalizers
@@ -830,7 +934,12 @@ class Trainer:
       # Reset-sampler prior (--source_weights / --name_weights; constant): built per rank from the broadcast file list.
       "sampler_prior": [c.bin_prior if c.bin_prior is not None else "uniform"],
       "counters": [self.it, self.env_steps],
+      # The packed library every rank mapped (cache dir + clips.json + bin layout; an extended cache included).
+      "library": [self.lib.fingerprint],
     }
+    if self.cfg.hard_names:  # curriculum (cfg-dependent key): hard set (from the clip list) + current multiplier
+      groups["curriculum"] = [c.clip_hard, float(c.hard_mult)]
+    return groups
 
   def _check_consistency(self, tag: str) -> None:
     t0 = time.time()
@@ -849,9 +958,12 @@ class Trainer:
         "ret": float(np.sum(st["ep_return_norm"])), "len": float(np.sum(st["ep_len"])), "fail": float(np.sum(st["ep_failed"])),
         "n": float(len(st["ep_return_norm"])), "tm": float(np.sum(st["term_mismatch"])), "tm_n": float(len(st["term_mismatch"])),
         "steps": float(dsteps * self.E), "fail_ee": float(np.sum(st["ep_failed_ee"])), "nonfin": float(np.sum(st["sim_nonfinite"])),
+        **({"hard_fail": float(np.sum(st["hard_ep_failed"])), "hard_len": float(np.sum(st["hard_ep_len"])),
+            "hard_n": float(len(st["hard_ep_failed"]))} if self._hard_on else {}),
       },
       "sum",
     )
+    self._hard_pooled = (sums["hard_fail"], sums["hard_len"], sums["hard_n"]) if self._hard_on else None
     mx = dctx.reduce_scalars({k: local.get(k, 0.0) for k in ("time/iter", "time/collect", "time/wm", "time/policy")}, "max")
     scal["time/env_fps"] = sums["steps"] / max(dt, 1e-6)  # all ranks together
     scal["time/iter_per_s"] = cfg.log_interval / max(dt, 1e-6)
@@ -889,6 +1001,8 @@ class Trainer:
       self._dist_start()
     while self.it < cfg.iterations:
       t0 = time.time()
+      if cfg.hard_term_schedule:
+        self.cmd.set_hard_mult(self.hard_mult_at(self.it))
       self._step_carry += cfg.env_steps_per_iter
       n_steps = int(self._step_carry)
       self._step_carry -= n_steps
@@ -947,6 +1061,11 @@ class Trainer:
           scal["sampler/top1_prob"] = self.cmd.metrics["sampling_top1_prob"][0].item()
           scal["sampler/bins_visited_frac"] = (self.cmd.bin_visits > 0).float().mean().item()
         scal.update(self._guard_scalars())
+        hard_txt = ""
+        if self._hard_on:  # hard-clip curriculum (master 4314a50); keys depend on cfg only
+          scal.update(self._hard_scalars())
+          hard_txt = (f" | hard x{self.cmd.hard_mult:.2f} fail {scal.get('hard/ep_failed_frac', float('nan')):.2f} "
+                      f"len {scal.get('hard/ep_len', float('nan')):.0f}")
         if self.main:
           for k, v in scal.items():
             self.writer.add_scalar(k, v, self.it)
@@ -954,7 +1073,7 @@ class Trainer:
             f"[it {self.it:7d} | {scal['train/wall_h']:5.2f} h] wm {scal.get('wm/loss', 0):.4f} (e1 {scal.get('wm/err_step1', 0):.3f}, e{cfg.wm.k} {scal.get(f'wm/err_step{cfg.wm.k}', 0):.3f}) "
             f"| imag_ret {scal.get('pi/imagined_return', 0):.4f} rew {scal.get('pi/imagined_reward_norm', 0):.3f} surv {scal.get('pi/survival_H', 0):.3f} | "
             f"ep_ret {scal.get('train/ep_return_norm', 0):.3f} len {scal.get('train/ep_len', 0):.0f} fail {scal.get('train/ep_failed_frac', 0):.2f}"
-            + (f" (ee {scal.get('train/ep_failed_ee_frac', 0):.2f})" if self._ee_on else "") + " | "
+            + (f" (ee {scal.get('train/ep_failed_ee_frac', 0):.2f})" if self._ee_on else "") + hard_txt + " | "
             f"{scal['time/iter']*1000:.0f} ms/it (c {scal['time/collect']*1000:.0f} wm {scal['time/wm']*1000:.0f} pi {scal['time/policy']*1000:.0f} ref {scal.get('time/ref_gather', 0)*1000:.0f}) fps {fps:.0f}"
             + (f" | max/rank {scal['dist/iter_max']*1000:.0f} ms" if dctx.enabled else "")
             + (f" | guard skips {sum(self.guard_skips.values())} nonfinite its {self.guard_nf_iters}" if self.guard_nf_iters else ""),

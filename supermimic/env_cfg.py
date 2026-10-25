@@ -11,6 +11,7 @@ calls ``reset(env_ids)`` itself.
 v2 options (master e57be5b..b131dc0): the end-effector height termination (master's ``ee_term_z``, here
 ``ee_termination`` / ``ee_threshold``), ``robot_variant`` swaps the robot model (see base_tracking_cfg),
 ``source_weights`` / ``name_weights`` reshape the uniform share of the reset sampler.
+master 4314a50: ``hard_names`` (hard-clip termination curriculum, per-env threshold multiplier).
 """
 
 from __future__ import annotations
@@ -94,6 +95,7 @@ def make_env_cfg(
   robot_variant: str = "",
   source_weights: tuple = (),
   name_weights: tuple = (),
+  hard_names: tuple = (),
 ) -> ManagerBasedRlEnvCfg:
   """ee_termination: keep BeyondMimic's end-effector height termination (``ee_body_pos``: any end-effector body
   z error > ee_threshold; bodies per robot cfg). Must match ``HeadsCfg.ee_termination`` / ``ee_term_z`` of the
@@ -101,7 +103,10 @@ def make_env_cfg(
   ``ee_termination=Z > 0, ee_threshold=Z`` here (heads.ee_flags).
   clamp_returns: reset sampler bin returns clamped to [0, g_max] (LibraryMotionCommandCfg.clamp_returns).
   robot_variant: robot model ("+"-joined, see base_tracking_cfg). source_weights / name_weights: prior of the reset
-  sampler's uniform share (train mode only; LibraryMotionCommand.bin_prior)."""
+  sampler's uniform share (train mode only; LibraryMotionCommand.bin_prior).
+  hard_names: hard set of the termination curriculum (master 4314a50; train mode only): the anchor / end-effector
+  termination terms are swapped for the scaled versions (library_command.scaled_*, threshold x term_scale_env);
+  empty = mjlab's terms, untouched."""
   assert mode in ("train", "eval")
   cfg = base_tracking_cfg(robot, robot_variant)
   cfg.scene.num_envs = num_envs
@@ -128,6 +133,7 @@ def make_env_cfg(
     clamp_returns=clamp_returns,
     source_weights=tuple(tuple(kv) for kv in source_weights) if mode == "train" else (),
     name_weights=tuple(tuple(kv) for kv in name_weights) if mode == "train" else (),
+    hard_names=tuple(hard_names) if mode == "train" else (),
   )
 
   # Minimal observation group (the trainer builds policy inputs itself).
@@ -161,6 +167,13 @@ def make_env_cfg(
     ee.params["threshold"] = float(ee_threshold)
   else:
     cfg.terminations.pop("ee_body_pos", None)
+  if hard_names and mode == "train":  # hard-clip curriculum: per-env threshold multiplier (library_command)
+    from .library_command import scaled_anchor_ori, scaled_anchor_pos_z, scaled_body_pos_z
+
+    cfg.terminations["anchor_pos"].func = scaled_anchor_pos_z
+    cfg.terminations["anchor_ori"].func = scaled_anchor_ori
+    if "ee_body_pos" in cfg.terminations:
+      cfg.terminations["ee_body_pos"].func = scaled_body_pos_z
   cfg.terminations["clip_end"] = TerminationTermCfg(
     func=motion_clip_end, params={"command_name": "motion"}, time_out=True
   )
