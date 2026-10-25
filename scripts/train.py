@@ -16,6 +16,9 @@ Examples:
   # scripts/launch_bj31_v2.example.sh for the 8-GPU version)
   python scripts/train.py --motion_list <motion_files.txt> --robot g1 --robot_variant eval+evalcontact --ee_term_z 0.25 \
       --source_weights noetix_kungfu=10,noetix_kungfu_dance_show=15,sportsmeeting=10,lafan1=15,g1_all=10,mixamo_cn=2,virtual_point=3
+  # Root-orientation termination (pelvis full angle incl. yaw > 1.0 rad, the eval site's root_ori test) on top
+  # (A/B on bj31: scripts/launch_bj31_oriterm.example.sh)
+  python scripts/train.py ... --root_ori_term 1.0 --root_ori_term_temp 0.05
   # Warm start with early stop on the in-training eval + watchdog on the survival-weighted imagined reward (8-GPU
   # version: scripts/launch_bj31_r15ws.example.sh)
   python scripts/train.py ... --resume model_136000.pt --eval_interval 2000 --es_eval_fail_ratio 1.5 --es_patience 2 \
@@ -25,6 +28,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 from datetime import datetime
@@ -130,6 +134,15 @@ def main():
                  help="end-effector height termination in the simulator + matching soft term in imagination (default on)")
   p.add_argument("--no_ee_termination", dest="ee_termination", action="store_false", help="paper recipe: no end-effector termination")
   p.add_argument("--ee_threshold", type=float, default=None, help="end-effector z error threshold [m] (default 0.25 = eval site)")
+  # Root-orientation termination (2026-10-25, off by default): 101 of 129 eval-site failures of r15ws model_148000 were its
+  # root_ori test (pelvis full rotation angle incl. yaw > 1.0 rad), which no training termination saw.
+  p.add_argument("--root_ori_term", type=float, default=0.0,
+                 help="terminate when the pelvis' (robot root's) full rotation angle vs the reference, yaw included, exceeds "
+                      "this [rad] in the simulator, + matching soft term in imagination; 1.0 = the eval site; 0 = off (default)")
+  p.add_argument("--root_ori_term_temp", type=float, default=0.05,
+                 help="sigmoid temperature [rad] of the imagined root-orientation term (0.5 at the threshold)")
+  p.add_argument("--root_ori_body", type=str, default="",
+                 help="tracked body of the root-orientation test (default: the robot's root body, G1 pelvis / E2 base_link)")
   p.add_argument("--wm_batches", type=int, default=10)
   p.add_argument("--wm_windows", type=int, default=2048)
   p.add_argument("--wm_k", type=int, default=8)
@@ -188,6 +201,10 @@ def main():
     p.error(f"--hard_term_schedule {args.hard_term_schedule!r}: {e}")
   if hard_schedule and not hard_names:
     p.error("--hard_term_schedule needs --hard_names (the hard set it applies to)")
+  if not (0.0 <= args.root_ori_term < math.pi):
+    p.error(f"--root_ori_term must be in [0, pi) rad (0 = off; the angle never exceeds pi), got {args.root_ori_term}")
+  if args.root_ori_term > 0 and not args.root_ori_term_temp > 0:
+    p.error(f"--root_ori_term_temp must be > 0, got {args.root_ori_term_temp}")
   if args.es_eval_fail_ratio is not None:
     if not args.es_eval_fail_ratio > 0 or args.es_patience < 1:
       p.error("--es_eval_fail_ratio must be > 0 and --es_patience >= 1")
@@ -281,7 +298,8 @@ def main():
     param_check_interval=args.param_check_interval,
     dist_timeout_min=args.dist_timeout_min,
     wm=WorldModelCfg(k=args.wm_k, lr=lr, batches_per_update=args.wm_batches, windows_per_batch=args.wm_windows),
-    heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos, ee_termination=ee_on, ee_term_z=ee_thr),
+    heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos, ee_termination=ee_on, ee_term_z=ee_thr, root_ori_term=args.root_ori_term,
+                   root_ori_term_temp=args.root_ori_term_temp, root_ori_body=args.root_ori_body),
   )
   os.makedirs(log_dir, exist_ok=True)
   if dctx.is_main:

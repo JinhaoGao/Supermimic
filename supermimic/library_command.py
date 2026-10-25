@@ -21,6 +21,7 @@ from mjlab.managers import CommandTerm
 from mjlab.tasks.tracking.mdp.commands import MotionCommand, MotionCommandCfg
 from mjlab.utils.lab_api.math import quat_apply_inverse, quat_from_euler_xyz, quat_mul, sample_uniform
 
+from .math_utils import quat_angle
 from .motions import MotionLibrary
 
 if TYPE_CHECKING:
@@ -365,6 +366,18 @@ def scaled_body_pos_z(env: "ManagerBasedRlEnv", command_name: str, threshold: fl
   idx = _get_body_indexes(cmd, body_names)
   err = (cmd.body_pos_relative_w[:, idx, -1] - cmd.robot_body_pos_w[:, idx, -1]).abs()  # type: ignore[attr-defined]
   return (err > (threshold * cmd.term_scale_env)[:, None]).any(-1)  # type: ignore[attr-defined]
+
+
+def bad_root_ori_full(env: "ManagerBasedRlEnv", command_name: str, threshold: float, body_name: str) -> torch.Tensor:
+  """Root-orientation termination (2026-10-25, HeadsCfg.root_ori_term; added by make_env_cfg only when switched on): the
+  full rotation angle (yaw included) between the reference and the robot's ``body_name`` (the robot root: G1 pelvis) >
+  threshold x term_scale_env (1 outside the hard-clip curriculum's hard set). The team eval site's root_ori test
+  (quat_error_angle(reference root quat, qpos[3:7]) > 1.0); the same math (math_utils.quat_angle) as the heads' hard
+  test on the state's root quaternion (MuJoCo xquat of the root body, = body_link_quat_w)."""
+  cmd = env.command_manager.get_term(command_name)
+  ref_q = cmd.body_quat_w[:, cmd.cfg.body_names.index(body_name)]  # type: ignore[attr-defined]
+  rob_q = cmd.robot.data.body_link_quat_w[:, cmd.robot.body_names.index(body_name)]  # type: ignore[attr-defined]
+  return quat_angle(ref_q, rob_q) > threshold * cmd.term_scale_env  # type: ignore[attr-defined]
 
 
 @dataclass(kw_only=True)

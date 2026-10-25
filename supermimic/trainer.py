@@ -39,6 +39,12 @@ stop (es_eval_fail_ratio / es_patience) on the in-training eval's failures, with
 rank 0's result broadcast so every rank stops at the same iteration; a watchdog
 rollback drops the evals of the abandoned branch from its history, and a resume
 at an eval slot evaluates the loaded weights first.
+
+Root orientation (2026-10-25): opt-in heads.root_ori_term (simulator term + soft
+term in imagination, pelvis full angle incl. yaw, the eval site's root_ori test)
+and the always-on FailureWatch (supermimic/watch.py): train/would_fail_ori and
+the floor / spin watch groups, counted on the device, summed over ranks at the
+log; off == the code before (the counters never reach the learner).
 """
 
 from __future__ import annotations
@@ -64,6 +70,7 @@ from .motions import read_name_list, resolve_clip_names
 from .policy import Critic, Policy
 from .replay import ReplayBuffer
 from .sim_interface import ObsHistory, SimInterface
+from .watch import FailureWatch
 from .world_model import DynamicsModel, WorldModelCfg
 
 
@@ -248,7 +255,7 @@ class Trainer:
       library_key=self.LIB_KEY, cache_dir=cfg.cache_dir, num_workers=cfg.num_workers,
       ee_termination=cfg.heads.ee_termination, ee_threshold=cfg.heads.ee_term_z, clamp_returns=cfg.sampler_clamp_returns,
       robot_variant=cfg.robot_variant, source_weights=cfg.source_weights, name_weights=cfg.name_weights,
-      hard_names=cfg.hard_names,
+      hard_names=cfg.hard_names, root_ori_term=cfg.heads.root_ori_term, root_ori_body=cfg.heads.root_ori_body,
     )
     env_cfg.seed = seed
     # Rank 0 builds the env first (and the packed motion cache if it is missing); the others wait so that
@@ -303,6 +310,15 @@ class Trainer:
       "[Trainer] end-effector termination: "
       +(f"on, z error > {hc.ee_term_z} on {list(self.sim.ee_body_names)} (soft temp {hc.ee_term_z_temp})" if hc.ee_termination else "off (paper recipe)")
     )
+    self._print(
+      "[Trainer] root-orientation termination: "
+      + (f"on, {self.sim.root_ori_body} full rotation angle (incl. yaw) > {hc.root_ori_term:g} rad (soft temp {hc.root_ori_term_temp:g})"
+         if hc.root_ori_on else f"off ({self.sim.root_ori_body} angle logged only: train/would_fail_ori)")
+    )
+    # Always-on failure logging (no effect on training): pelvis angle vs the eval site's 1.0 rad + floor / spin groups.
+    self.watch = FailureWatch([c.name for c in self.lib.clips], self.E, self.device)
+    self._print(f"[Trainer] failure watch: {self.watch.summary(self.lib.bin_clip)}"
+                + ("" if self.heads.root_ori is not None else f" -- {self.sim.root_ori_body} not tracked: no pelvis-angle logging"))
     try:  # the robot variant actually built (G1 eval: 35.11 kg, mjlab's G1: 33.34 kg)
       mass = f"{float(self.env.sim.mj_model.body_mass.sum()):.2f} kg"
     except Exception:  # noqa: BLE001
@@ -349,6 +365,7 @@ class Trainer:
     self.stats = {"ep_return_norm": [], "ep_len": [], "ep_failed": [], "ep_failed_ee": [], "term_mismatch": [], "sim_nonfinite": [],
                   "hard_ep_failed": [], "hard_ep_len": []}
     self._ee_on = hc.ee_termination
+    self._ro_on = hc.root_ori_on  # root-orientation term in the env (its failures are not end-effector-only)
     self._hard_on = bool(cfg.hard_names)  # curriculum off: term_scale None everywhere (the code path before it)
     # ---- early stop (in-training benchmark; same state on every rank: rank 0's eval result is broadcast) ----
     self._es_on = cfg.es_eval_fail_ratio is not None and cfg.eval_enabled and cfg.eval_interval > 0
@@ -388,6 +405,7 @@ class Trainer:
     self.env.step(a_exec)
     next_state = self.sim.state()
     r, term_hard = self.fns.post(next_state, self.kin, a_exec, self.prev_action, *ref_cur, self.cmd.term_scale_env if self._hard_on else None)
+    self.watch.step(self.heads.root_ori_angle_state(next_state, ref_cur[1]))  # logging only: pelvis angle > 1.0 rad
     terminated = self.env.reset_terminated.bool()
     timeouts = self.env.reset_time_outs.bool()
     # A non-finite simulator state never trips the (NaN-blind) termination tests: end it as a failure and keep the
@@ -402,7 +420,10 @@ class Trainer:
     done = terminated | timeouts
     if self._ee_on:  # end-effector-only failures (the eval site's "body_pos" reason): logging only
       tm = self.env.termination_manager
-      ee_fail = tm.get_term("ee_body_pos") & ~(tm.get_term("anchor_pos") | tm.get_term("anchor_ori")) & ~bad
+      root = tm.get_term("anchor_pos") | tm.get_term("anchor_ori")
+      if self._ro_on:  # the eval site tests root_ori before the end effectors too
+        root = root | tm.get_term("root_ori")
+      ee_fail = tm.get_term("ee_body_pos") & ~root & ~bad
 
     self.buffer.add(
       state=self.state, next_state=next_state, action=a_exec, prev_action=self.prev_action, xi=self.xi, reward=r,
@@ -433,6 +454,7 @@ class Trainer:
     self.hist.push(obs)
     if done.any():
       self.hist.reset(ids, obs)
+      self.watch.resets(self.lib.clip_of_frame(self.frame[ids]))  # logging only: the clips the new episodes start in
 
   @torch.no_grad()
   def _finish_episodes(self, ids: torch.Tensor, failed: torch.Tensor, failed_ee: torch.Tensor | None = None) -> None:
@@ -461,6 +483,8 @@ class Trainer:
       if bool(hard.any()):
         self.stats["hard_ep_failed"].extend(failed[hard].float().tolist())
         self.stats["hard_ep_len"].extend(L[hard].tolist())
+    # Logging only: pelvis-angle flag + watch groups of the ended episodes (self.frame = their last frame, in their clip).
+    self.watch.episodes(ids, failed, self.lib.clip_of_frame(self.frame[ids]))
 
   # ---------------------------------------------------------------------------
   # 2. World model
@@ -676,6 +700,10 @@ class Trainer:
       if not (hk.ee_termination or cur.heads.ee_termination):  # threshold / temperature unused when off on both
         for d in (a, b):
           for k in ("ee_term_z", "ee_term_z_temp"):
+            d.pop(k)
+      if not (hk.root_ori_on or cur.heads.root_ori_on):  # root_ori_term 0 on both (checkpoints before it: 0)
+        for d in (a, b):
+          for k in ("root_ori_term_temp", "root_ori_body"):
             d.pop(k)
       diffs += [f"heads.{k} = {a.get(k)!r} in the checkpoint, {b[k]!r} here" for k in b if a.get(k) != b[k]]
     except Exception as e:  # noqa: BLE001 -- a warning helper must never stop a resume
@@ -1033,6 +1061,7 @@ class Trainer:
         "steps": float(dsteps * self.E), "fail_ee": float(np.sum(st["ep_failed_ee"])), "nonfin": float(np.sum(st["sim_nonfinite"])),
         **({"hard_fail": float(np.sum(st["hard_ep_failed"])), "hard_len": float(np.sum(st["hard_ep_len"])),
             "hard_n": float(len(st["hard_ep_failed"]))} if self._hard_on else {}),
+        **self.watch.sums(),  # always-on failure watch (fixed keys): counts of all ranks
       },
       "sum",
     )
@@ -1052,6 +1081,7 @@ class Trainer:
         scal["train/ep_failed_ee_frac"] = sums["fail_ee"] / sums["n"]
     scal["guard/sim_nonfinite"] = sums["nonfin"]
     scal["train/term_mismatch"] = sums["tm"] / sums["tm_n"] if sums["tm_n"] else 0.0
+    scal.update(self.watch.scalars(sums))  # pooled over ranks: the same values on every rank
     scal["sampler/bins_visited_frac"] = (self.cmd.bin_visits > 0).float().mean().item()  # merged state
     for k, v in mx.items():
       scal[f"dist/{k.split('/')[1]}_max"] = v  # slowest rank (stragglers)
@@ -1141,6 +1171,7 @@ class Trainer:
           scal["sampler/entropy"] = self.cmd.metrics["sampling_entropy"][0].item()
           scal["sampler/top1_prob"] = self.cmd.metrics["sampling_top1_prob"][0].item()
           scal["sampler/bins_visited_frac"] = (self.cmd.bin_visits > 0).float().mean().item()
+          scal.update(self.watch.scalars(self.watch.sums()))
         scal.update(self._guard_scalars())
         hard_txt = ""
         if self._hard_on:  # hard-clip curriculum (master 4314a50); keys depend on cfg only
@@ -1157,12 +1188,14 @@ class Trainer:
             + (f" (ee {scal.get('train/ep_failed_ee_frac', 0):.2f})" if self._ee_on else "") + hard_txt + " | "
             f"{scal['time/iter']*1000:.0f} ms/it (c {scal['time/collect']*1000:.0f} wm {scal['time/wm']*1000:.0f} pi {scal['time/policy']*1000:.0f} ref {scal.get('time/ref_gather', 0)*1000:.0f}) fps {fps:.0f}"
             + (f" | max/rank {scal['dist/iter_max']*1000:.0f} ms" if dctx.enabled else "")
-            + (f" | guard skips {sum(self.guard_skips.values())} nonfinite its {self.guard_nf_iters}" if self.guard_nf_iters else ""),
+            + (f" | guard skips {sum(self.guard_skips.values())} nonfinite its {self.guard_nf_iters}" if self.guard_nf_iters else "")
+            + (f" | ori>1 {scal['train/would_fail_ori']:.2f}" if "train/would_fail_ori" in scal else ""),
             flush=True,
           )
         agg = {}
         for k in self.stats:
           self.stats[k] = []
+        self.watch.clear()
         t_log, steps_at_log = now, self.env_steps
 
       if dctx.enabled and check_slot:
@@ -1195,7 +1228,9 @@ class Trainer:
       for k, v in res["scalars"].items():
         self.writer.add_scalar(f"eval/{k}", v, self.it)
       self.writer.add_scalar("time/eval", time.time() - te, self.it)
-      print(f"[eval it {self.it}] return {res['scalars']['return_mean']:.4f} min {res['scalars']['return_min']:.3f} failed {int(res['scalars']['failed'])}/{res['num_clips']} ({time.time()-te:.0f}s)", flush=True)
+      sc = res["scalars"]
+      ori = f" (pelvis angle > 1 rad: {int(sc['failed_ori'])}, failed or that: {int(sc['failed_with_ori'])})" if "failed_ori" in sc else ""
+      print(f"[eval it {self.it}] return {sc['return_mean']:.4f} min {sc['return_min']:.3f} failed {int(sc['failed'])}/{res['num_clips']}{ori} ({time.time()-te:.0f}s)", flush=True)
       with open(os.path.join(cfg.log_dir, "eval.jsonl"), "a") as f:
         f.write(json.dumps({"it": self.it, "env_steps": self.env_steps, "wall_s": time.time() - self._t_start, **res["scalars"], "failed_clips": res["failed_clips"]}) + "\n")
       return {"failed": float(res["scalars"]["failed"]), "return_mean": float(res["scalars"]["return_mean"]), "num_clips": int(res["num_clips"])}

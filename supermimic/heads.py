@@ -22,6 +22,14 @@ also drops BeyondMimic's end-effector termination; ``HeadsCfg.ee_termination``
 master's v2 spelling of the same switch (``ee_term_z``, 0 = off, temperature
 ``ee_term_temp``) is accepted by ``ee_flags`` (CLI) and ``HeadsCfg.from_dict``
 (checkpoint cfgs); it is the same criterion, see ``HeadsCfg``.
+
+Root-orientation termination (opt-in, ``HeadsCfg.root_ori_term``, 2026-10-25): the team benchmark fails a clip when
+the pelvis' FULL rotation angle (yaw included) against the reference pelvis exceeds 1.0 rad (101 of 129 failures of
+r15ws model_148000), while the anchor tilt test above sees only the torso's gravity direction (no yaw, no pelvis /
+torso decoupling through the waist). With root_ori_term = A > 0 the simulator terminates at angle > A
+(env_cfg ``root_ori``) and the imagined soft termination gets sigmoid((angle - A) / root_ori_term_temp) in its
+noisy-OR. The pelvis is the robot's root body (free joint: G1 pelvis, E2 base_link), whose world-model state
+quaternion is s[3:7] (= its FK pose); the reference quaternion is the tracked-body quaternion of that body.
 """
 
 from __future__ import annotations
@@ -32,6 +40,7 @@ import torch
 
 from .fk import TorchFK
 from .math_utils import (
+  quat_angle,
   quat_apply,
   quat_apply_inverse,
   quat_error_magnitude,
@@ -84,11 +93,26 @@ class HeadsCfg:
   ee_termination: bool = True
   ee_term_z: float = 0.25
   ee_term_z_temp: float = 0.02  # same sigmoid temperature as the anchor-height term
+  # Root-orientation termination (2026-10-25, opt-in): fail when the full rotation angle (incl. yaw) between the robot's
+  # and the reference's root body exceeds root_ori_term [rad] (the eval site's root_ori test at 1.0); soft term
+  # sigmoid((angle - root_ori_term) / root_ori_term_temp). 0 = off = the code before, bitwise. root_ori_body: "" = the
+  # robot's root (free-joint) body, G1 pelvis / E2 base_link (env_cfg.ROOT_BODY), else a tracked body name.
+  root_ori_term: float = 0.0
+  root_ori_term_temp: float = 0.05
+  root_ori_body: str = ""
   extra: dict = field(default_factory=dict)
 
   def __post_init__(self):
     if self.ee_termination and not self.ee_term_z > 0:
       raise ValueError(f"ee_termination needs a threshold ee_term_z > 0 (got {self.ee_term_z}); off: ee_termination=False")
+    if not float(self.root_ori_term) >= 0.0:
+      raise ValueError(f"root_ori_term must be >= 0 rad (0 = off), got {self.root_ori_term}")
+    if self.root_ori_term > 0 and not self.root_ori_term_temp > 0:
+      raise ValueError(f"root_ori_term needs a temperature root_ori_term_temp > 0 (got {self.root_ori_term_temp})")
+
+  @property
+  def root_ori_on(self) -> bool:
+    return float(self.root_ori_term) > 0.0
 
   @classmethod
   def from_dict(cls, d: dict) -> "HeadsCfg":
@@ -155,6 +179,8 @@ class AnalyticHeads:
     soft_joint_limits: torch.Tensor,
     cfg: HeadsCfg,
     ee_indices: list[int] | None = None,
+    root_ori_index: int | None = None,
+    root_ori_is_root: bool = True,
   ):
     self.fk = fk
     self.cfg = cfg
@@ -166,6 +192,13 @@ class AnalyticHeads:
     self.ee = torch.as_tensor(list(ee_indices or ()), dtype=torch.long, device=self.device)
     if cfg.ee_termination and self.ee.numel() == 0:
       raise ValueError("HeadsCfg.ee_termination is on but no end-effector bodies were given")
+    # Root-orientation body (pelvis) as an index into the tracked-body list (SimInterface.root_ori_body_of); None = not
+    # tracked (no root-orientation term, no pelvis-angle logging). root_ori_is_root: it is the free-joint body, whose
+    # quaternion is the state's s[3:7] (bitwise equal to its FK quaternion).
+    self.root_ori = None if root_ori_index is None else int(root_ori_index)
+    self.root_ori_is_root = bool(root_ori_is_root)
+    if cfg.root_ori_on and self.root_ori is None:
+      raise ValueError("HeadsCfg.root_ori_term is on but no root-orientation body (tracked) was given")
     self.nj = default_joint_pos.shape[-1]
     self.q0 = default_joint_pos.to(self.device).reshape(-1)
     self.soft_lim = soft_joint_limits.to(self.device).reshape(self.nj, 2)
@@ -282,16 +315,33 @@ class AnalyticHeads:
 
   # ---- termination ---------------------------------------------------------
 
+  def root_ori_angle(self, kin: dict, ref_rq: torch.Tensor) -> torch.Tensor:
+    """Full rotation angle [B] (incl. yaw, the eval site's root_ori error) between the robot's root-orientation body
+    (kin, from the state) and its reference quaternion ref_rq [B,4]."""
+    return quat_angle(ref_rq, kin["body_quat"][:, self.root_ori])
+
+  @torch.no_grad()
+  def root_ori_angle_state(self, s: torch.Tensor, ref_bq: torch.Tensor) -> torch.Tensor | None:
+    """Logging (no grad): root_ori_angle of the states s [B,D] against the tracked-body reference quaternions ref_bq
+    [B,Bt,4]; the root body reads s[3:7] directly (= its FK quaternion, no FK pass). None when the body is not tracked.
+    Non-finite states give NaN (> any threshold is False)."""
+    if self.root_ori is None:
+      return None
+    q = s[:, 3:7] if self.root_ori_is_root else self.kin(s)["body_quat"][:, self.root_ori]
+    return quat_angle(ref_bq[:, self.root_ori], q)
+
   def termination(self, kin_next: dict, ref_ap: torch.Tensor, ref_aq: torch.Tensor, ref_bp: torch.Tensor | None = None,
-                  scale: torch.Tensor | None = None):
+                  scale: torch.Tensor | None = None, ref_rq: torch.Tensor | None = None):
     """Hard (simulator) and soft (imagination) termination at the target frame.
 
     ref_ap [B,3] / ref_aq [B,4]: reference anchor pose; ref_bp [B,Bt,3]: reference positions of all tracked
-    bodies (needed only with ``ee_termination``). Returns (hard_bool [B], soft_prob [B]).
+    bodies (needed only with ``ee_termination``); ref_rq [B,4] (keyword, needed only with ``root_ori_term``): reference
+    quaternion of the root-orientation body (the pelvis). Returns (hard_bool [B], soft_prob [B]).
 
     Each criterion i has a hard test x_i > thr_i and a soft probability p_i = sigmoid((x_i - thr_i) / temp_i);
-    the soft termination is the noisy-OR 1 - prod_i (1 - p_i) over anchor height, anchor tilt and (optional)
-    every end-effector height error, and the hard one is the OR of the tests (= the soft one as temp -> 0).
+    the soft termination is the noisy-OR 1 - prod_i (1 - p_i) over anchor height, anchor tilt, (optional) every
+    end-effector height error and (optional) the root body's full rotation angle (kin_next's quaternion of that body,
+    = the state's root quaternion for the pelvis), and the hard one is the OR of the tests (= the soft one as temp -> 0).
     The end-effector height error |ref_z - z| equals mjlab's ``bad_motion_body_pos_z_only``: its re-anchored
     reference (``body_pos_relative_w``) only shifts xy and rotates about z, so its z is the raw reference z.
 
@@ -317,5 +367,11 @@ class AnalyticHeads:
       hard = hard | (dz_ee > c.ee_term_z * ke).any(-1)
       p_ee = torch.sigmoid((dz_ee - c.ee_term_z * ke) / (c.ee_term_z_temp * ke))
       alive = alive * torch.prod(1.0 - p_ee, dim=-1)
+    if c.root_ori_on:
+      assert ref_rq is not None, "root_ori_term needs the reference root-orientation quaternion (ref_rq)"
+      ang = self.root_ori_angle(kin_next, ref_rq)  # [B]
+      hard = hard | (ang > c.root_ori_term * k)
+      p_ro = torch.sigmoid((ang - c.root_ori_term * k) / (c.root_ori_term_temp * k))
+      alive = alive * (1.0 - p_ro)
     soft = 1.0 - alive
     return hard, soft

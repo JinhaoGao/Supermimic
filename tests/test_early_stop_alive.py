@@ -66,6 +66,7 @@ from supermimic.distributed import DistCtx  # noqa: E402
 from supermimic.heads import HeadsCfg  # noqa: E402
 from supermimic.library_command import LibraryMotionCommand, hard_clip_mask  # noqa: E402
 from supermimic.trainer import TrainCfg, Trainer, early_stop_verdict, finite_mean  # noqa: E402
+from supermimic.watch import FailureWatch  # noqa: E402
 
 THIS = sys.modules[__name__]
 FAILS = [100, 90, 95, 92, 200, 130, 150, 160, 300, 180]  # failed count of the k-th eval (it 4, 8, ...; see test_es_stops)
@@ -322,6 +323,7 @@ def loop_trainer(log_dir: str, dist: DistCtx | None = None, fails=FAILS, eval_ra
   t.stats = {"ep_return_norm": [], "ep_len": [], "ep_failed": [], "ep_failed_ee": [], "term_mismatch": [], "sim_nonfinite": [],
              "hard_ep_failed": [], "hard_ep_len": []}
   t._ee_on, t._hard_on = False, bool(t.cfg.hard_names)
+  t.watch = FailureWatch(names, E, "cpu")  # Trainer.__init__ (always-on failure logging; the stub collect feeds it nothing)
   t._es_on = t.cfg.es_eval_fail_ratio is not None and t.cfg.eval_enabled and t.cfg.eval_interval > 0
   t.es_hist, t.es_streak, t.es_best, t.es_stop = [], 0, None, None
   t.guard_skips, t.guard_nf_iters = {"wm": 0, "pi": 0, "critic": 0}, 0

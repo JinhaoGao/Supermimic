@@ -95,6 +95,9 @@ bash scripts/launch_bj31_ddp.sh g1_full_ddp8 --motion_dirs ~/motion_dataset/g1_a
     --blacklist /data2/supermimic/lists/atlas_full_blacklist_motion50_1010.json \
     --eval_clip_names /data2/supermimic/lists/eval_1024.txt --eval_interval 4000
 bash scripts/stop_bj31_ddp.sh g1_full_ddp8       # kill -9 all ranks + the torchrun agent
+# two 4-GPU jobs on one host: own GPU subset + own rendezvous port each (default = --standalone on all 8 GPUs)
+CUDA_VISIBLE_DEVICES=0,1,2,3 PORT=29511 bash scripts/launch_bj31_ddp.sh runA ...
+CUDA_VISIBLE_DEVICES=4,5,6,7 PORT=29512 bash scripts/launch_bj31_ddp.sh runB ...
 ```
 
 ## Deploy on the G1 (unitree_mujoco `State_SuperMimic`)
@@ -268,6 +271,9 @@ on|off` / `--ee_term_z`).
 | `scripts/extend_cache.py`, `scripts/wm_diag.py` | append clips to a packed cache (master c1c94be) / world-model diagnostic (master 4314a50) |
 | `scripts/launch_bj31_r15ws.example.sh` | example (not run): r15 warm start on bj31, 8 GPUs + early stop / alive watchdog signal |
 | `tests/test_merge_master_1025.py`, `tests/test_early_stop_alive.py` | master 5f020a9 merge (clamp / curriculum / extend under DDP); early stop + alive signal (real loop, 3 gloo ranks) |
+| `supermimic/watch.py` | always-on failure logging: `train/would_fail_ori` (pelvis angle > 1 rad, the eval site's root_ori), floor / spin watch groups; `eval/failed_ori` in the evaluator |
+| `scripts/launch_bj31_oriterm.example.sh` | example (not run): A/B of `--root_ori_term 1.0` vs control from r15ws model_148000, two 4-GPU jobs on bj31 |
+| `tests/test_root_ori_term.py` | root-orientation termination (off == 55e0eaf bitwise, on: threshold / soft / gradients / env term), watch (closed form, 3 gloo ranks), launcher ports / GPU subsets |
 
 ## Setup and run
 
@@ -297,7 +303,9 @@ mirror. TensorBoard for the runs: `ssh -N -L 6107:127.0.0.1:6107 tencent_bj27`.
 * Goal per future frame = ref joint pos/vel + ref anchor (torso) pose relative to
   the robot anchor (BeyondMimic's `motion_anchor_pos_b/ori_b`), K=10 frames.
 * Termination in imagination is a soft sigmoid version of the hard thresholds
-  (noisy-OR over anchor height, anchor tilt and, by default, end-effector heights).
+  (noisy-OR over anchor height, anchor tilt and, by default, end-effector heights; opt-in `--root_ori_term A`:
+  the pelvis' full rotation angle incl. yaw > A rad, the team benchmark's root_ori test at A = 1.0, which the anchor
+  tilt test cannot see -- 101 of 129 benchmark failures of r15ws model_148000).
 * "Update-to-data ratio 0.4" is ambiguous; `--env_steps_per_iter` controls how
   many simulator steps are collected per (WM + policy) update, default 1.
 * Returns-to-go of time-outs are bootstrapped with r_last/(1−γ) for the sampler.
