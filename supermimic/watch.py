@@ -13,8 +13,14 @@ visible in the training logs, so the trainer always counts, per log window:
   train/watch_<g>_reset_share  share of the resets (new episodes) that went into clips of group g
   train/watch_<g>_episodes     finished episodes of group g (all ranks)
 
-Groups: floor work (floor / getup / lie / crawl / kneel) and spins (spin / turn / zhuanti / xuanzi), the two kinds of
-clips the root_ori failures concentrate on. Counts live on the device (no host sync per step) and are read once per log
+Groups (name keywords, case-insensitive substrings): floor work and spins, two kinds of clips with root_ori failures. The
+spec's bare "lie" and "turn" are replaced by tokens that do not match ordinary clips (scan of the 255,008-clip r15ws list
+on bj31, 10-25): "lie" hit 1,598 clips incl. fitness "Plie" squats and "willie" (a bare "lying" would add "Flying"); "turn" 11,342 (sonic
+turn_walk / turn_jog, motiondecode direction transitions, valve turning) of the spin group's 11,647 (~97 % walking turns).
+Now: floor 6,208 clips (sonic crawl / kneeling, motiondecode ground recovery, kimodo robot_lie_getup, ...), spin 446
+(kung-fu zhuanti / xuanzi / xuanfeng / pingzhuan, pirouettes, ballet chain turns, ...). Of the 101 root_ori failures of
+model_148000 (eval-site names) 31 fall in floor, 11 in spin, 59 in neither (kung-fu flips / sweeps, street dance) -- the
+groups track these two kinds, not the failure list. Counts live on the device (no host sync per step) and are read once per log
 interval; under data parallel the trainer sums them over ranks (``sums`` has the same keys on every rank) before
 ``scalars`` turns them into rates, so every rank computes the same values and rank 0 logs them. Nothing here draws
 random numbers or feeds back into the learner.
@@ -26,8 +32,8 @@ import torch
 
 ORI_FAIL_THRESHOLD = 1.0  # rad: the eval site's root_ori threshold (evaluate_mujoco.py, --root-ori-threshold 1.0)
 WATCH_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
-  ("floor", ("floor", "getup", "lie", "crawl", "kneel")),
-  ("spin", ("spin", "turn", "zhuanti", "xuanzi")),
+  ("floor", ("floor", "ground_", "getup", "get_up", "_lie", "-lie", "_lying", "crawl", "kneel", "prone", "倒地", "躺", "跪", "匍匐")),
+  ("spin", ("spin", "zhuanti", "xuanzi", "xuanfeng", "pingzhuan", "pirouette", "chain_turn", "转体", "端腿转")),
 )
 
 

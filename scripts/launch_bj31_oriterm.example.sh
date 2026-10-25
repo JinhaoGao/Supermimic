@@ -37,6 +37,13 @@
 # Compare (TB / eval.jsonl): eval/failed_with_ori (clips failed by the training terminations or with pelvis angle
 # > 1 rad: the comparable count; arm T's eval/failed already contains its root_ori terminations, arm C's does not),
 # eval/failed_ori, train/would_fail_ori, train/watch_{floor,spin}_{fail,would_fail_ori,reset_share}; then the v4 site.
+# Imagination vs simulator (both arms): pi/root_ori_angle_{t0,tH}, pi/root_ori_over_frac vs train/ori_over_step_frac,
+# and the world model's root drift wm/root_{ang,yaw}_err_step{1,8} (its yaw is integrated, not observed); arm T also
+# pi/root_ori_hazard_mean / pi/root_ori_death_share (the share of the imagined soft deaths from this term).
+# Temperature 0.05 (the tilt term's): the soft term is a per-step hazard, so over --H 48 imagined steps a rollout
+# holding a constant pelvis angle survives 50 % at 1.0 - 4.23 x 0.05 = 0.79 rad (10 % at 0.85, 0.2 % at 0.90): arm
+# T's imagination treats ~0.8-0.98 rad as dying while its simulator and the eval site (> 1.0) do not. Deliberate here
+# (the spec's arm, same pattern as the tilt term); --root_ori_term_temp 0.02 would put that point at 0.92 rad.
 # The early stop (--es_eval_fail_ratio 1.5 x the median of the earlier evals) judges each arm against its own start
 # eval at 148000; arm T's start count includes the root_ori failures of the old weights.
 set -euo pipefail

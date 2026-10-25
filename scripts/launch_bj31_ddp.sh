@@ -7,12 +7,16 @@
 #        ROOT    run data root (default /data2/supermimic): logs/ (TB, ckpt), cache/, runs/<run>.log
 #        CUDA_VISIBLE_DEVICES  GPU subset of this job, e.g. 4,5,6,7 (ranks use cuda:0..NPROC-1 of it); unset = all
 #        PORT    rendezvous port of this job (aliases RDZV_PORT, MASTER_PORT): set -> torchrun --nnodes 1
-#                --rdzv-backend c10d --rdzv-endpoint localhost:$PORT --rdzv-id <run> instead of --standalone. Give every
-#                job on one host its own PORT (and its own GPUs) to run several at once; e.g. two 4-GPU jobs:
-#                  CUDA_VISIBLE_DEVICES=0,1,2,3 PORT=29511 NPROC=4 bash scripts/launch_bj31_ddp.sh runA ...
-#                  CUDA_VISIBLE_DEVICES=4,5,6,7 PORT=29512 NPROC=4 bash scripts/launch_bj31_ddp.sh runB ...
-#                (--standalone binds localhost:0, an OS-chosen port, on torch 2.14; the explicit port makes the
-#                endpoint known and a clash fail loudly.) Neither set = the command as before (--standalone, 8 ranks).
+#                --rdzv-backend c10d --rdzv-endpoint localhost:$PORT --rdzv-id <run> --rdzv-conf is_host=1 instead of
+#                --standalone. Every job on one host needs its OWN PORT (and its own GPUs) to run several at once, e.g.
+#                two 4-GPU jobs:
+#                  CUDA_VISIBLE_DEVICES=0,1,2,3 PORT=29521 NPROC=4 bash scripts/launch_bj31_ddp.sh runA ...
+#                  CUDA_VISIBLE_DEVICES=4,5,6,7 PORT=29522 NPROC=4 bash scripts/launch_bj31_ddp.sh runB ...
+#                is_host=1: this agent must host the rendezvous store on PORT; if the port is taken the job exits at
+#                once (RendezvousConnectionError / EADDRINUSE). Without it torch's c10d backend silently falls back
+#                to joining the store already on that port as a client (c10d_rendezvous_backend._create_tcp_store),
+#                which couples the two jobs: stopping one kills the other. (--standalone binds localhost:0, an
+#                OS-chosen port.) Neither set = the command as before (--standalone, 8 ranks).
 #        DRY_RUN=1  print the torchrun command and exit (nothing started, no log written)
 #
 # Every rank keeps the per-GPU paper config (4096 envs, 4096 rollouts, LR 2e-4) -> global 8x batch.
@@ -45,7 +49,7 @@ if [ -n "$PORT" ]; then
     echo "[launch] PORT=$PORT is not a port number in 1024..65535" >&2
     exit 1
   fi
-  RDZV=(--nnodes 1 --rdzv-backend c10d --rdzv-endpoint "localhost:$PORT" --rdzv-id "$RUN")
+  RDZV=(--nnodes 1 --rdzv-backend c10d --rdzv-endpoint "localhost:$PORT" --rdzv-id "$RUN" --rdzv-conf is_host=1)
 else
   RDZV=(--standalone)
 fi

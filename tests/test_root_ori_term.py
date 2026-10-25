@@ -24,7 +24,12 @@ test_sampler_clamp.py). Checks:
   (e) wiring: CLI -> TrainCfg -> train_cfg.json / make_env_cfg kwargs -> env term (train / eval, curriculum, robots);
       SimInterface consistency checks; resume diffs; scripts/launch_bj31_ddp.sh (default command == 55e0eaf's, PORT /
       CUDA_VISIBLE_DEVICES / errors) and scripts/launch_bj31_oriterm.example.sh (ARGS = the live run's except --iterations /
-      --resume, restored LR = the live run's at 148000, 4 ranks per arm).
+      --resume, restored LR = the live run's at 148000, 4 ranks per arm);
+  (f) review fixes (10-25 evening): term off -> train_cfg.json / checkpoint cfg without the root_ori_* keys, loadable by
+      55e0eaf's HeadsCfg (its module source, git show); imagined root-orientation logging (pi/root_ori_*: closed form on a
+      scripted yawing rollout, training bitwise unchanged with / without it, term on / off); the world model's k-step root
+      drift (wm/root_*_err_step*: closed form, update_world_model otherwise == 55e0eaf bitwise); a reused rendezvous port
+      makes the second torchrun job exit at start (real torchrun, CPU; SKIP_TORCHRUN=1 skips it).
 """
 
 from __future__ import annotations
@@ -41,6 +46,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import types
 from unittest import mock
 
@@ -67,12 +73,12 @@ from supermimic.fk import TorchFK  # noqa: E402
 from supermimic.fns import StepFns  # noqa: E402
 from supermimic.heads import AnalyticHeads, HeadsCfg, window_frames  # noqa: E402
 from supermimic.library_command import LibraryMotionCommand, bad_root_ori_full  # noqa: E402
-from supermimic.math_utils import quat_angle, quat_apply_inverse, quat_from_angle_axis, quat_mul  # noqa: E402
+from supermimic.math_utils import quat_angle, quat_apply_inverse, quat_from_angle_axis, quat_mul, yaw_quat  # noqa: E402
 from supermimic.motions import MotionLibrary  # noqa: E402
 from supermimic.policy import Policy  # noqa: E402
 from supermimic.replay import ReplayBuffer  # noqa: E402
 from supermimic.sim_interface import ObsHistory, SimInterface  # noqa: E402
-from supermimic.trainer import TrainCfg, Trainer  # noqa: E402
+from supermimic.trainer import ROOT_ORI_KEYS, TrainCfg, Trainer, cfg_dict  # noqa: E402
 from supermimic.watch import ORI_FAIL_THRESHOLD, WATCH_GROUPS, FailureWatch  # noqa: E402
 from supermimic.world_model import DynamicsModel, WorldModelCfg  # noqa: E402
 
@@ -1280,7 +1286,10 @@ def test_cli_cfg_and_env_wiring():
         except tsc._Probe:
           pass
       hj = json.load(open(os.path.join(log_dir, "train_cfg.json")))["heads"]
-      assert (hj["root_ori_term"], hj["root_ori_term_temp"], hj["root_ori_body"]) == (h.root_ori_term, h.root_ori_term_temp, "")
+      if h.root_ori_on:
+        assert (hj["root_ori_term"], hj["root_ori_term_temp"], hj["root_ori_body"]) == (h.root_ori_term, h.root_ori_term_temp, "")
+      else:  # off: 55e0eaf's keys (test_saved_cfg_loads_in_55e0eaf)
+        assert not set(ROOT_ORI_KEYS) & set(hj) and HeadsCfg.from_dict(hj) == h
     assert [(k["root_ori_term"], k["root_ori_body"]) for k in calls] == [(0.0, ""), (1.0, "")]
   # make_env_cfg -> env term (train / eval, curriculum, robot default body / override)
   with mock.patch.object(env_cfg_mod, "base_tracking_cfg", tmm._fake_base_full):
@@ -1391,14 +1400,14 @@ def test_launcher_ports_and_gpu_subsets():
     for gpus, port, alias in (("0,1,2,3", "29511", "PORT"), ("4,5,6,7", "29512", "MASTER_PORT"), ("4,5,6,7", "29513", "RDZV_PORT")):
       c, out = dry("runA", {"CUDA_VISIBLE_DEVICES": gpus, alias: port})
       want = [base[0], "--nnodes", "1", "--rdzv-backend", "c10d", "--rdzv-endpoint", f"localhost:{port}", "--rdzv-id", "runA",
-              "--nproc_per_node", "4"] + base[4:]
+              "--rdzv-conf", "is_host=1", "--nproc_per_node", "4"] + base[4:]
       assert c == want, (c, want)
       assert f"CUDA_VISIBLE_DEVICES={gpus} NPROC=4 PORT={port}" in out
     # GPU subset without a port: standalone, NPROC = the number of GPUs listed (or fewer when NPROC says so)
     assert dry("runB", {"CUDA_VISIBLE_DEVICES": "2,3"})[0][1:4] == ["--standalone", "--nproc_per_node", "2"]
     assert dry("runB", {"CUDA_VISIBLE_DEVICES": "2,3,4", "NPROC": "2"})[0][1:4] == ["--standalone", "--nproc_per_node", "2"]
-    assert dry("runB", {"PORT": "29600"})[0][1:12] == ["--nnodes", "1", "--rdzv-backend", "c10d", "--rdzv-endpoint", "localhost:29600",
-                                                      "--rdzv-id", "runB", "--nproc_per_node", "8", "--log-dir"]
+    assert dry("runB", {"PORT": "29600"})[0][1:14] == ["--nnodes", "1", "--rdzv-backend", "c10d", "--rdzv-endpoint", "localhost:29600",
+                                                      "--rdzv-id", "runB", "--rdzv-conf", "is_host=1", "--nproc_per_node", "8", "--log-dir"]
     for env in ({"CUDA_VISIBLE_DEVICES": "0,1", "NPROC": "4"}, {"PORT": "29x"}, {"PORT": "80"}):
       p = _launch(new, os.path.join(tmp, "bad"), "runC", {**env, "DRY_RUN": "1"})
       assert p.returncode == 1 and p.stderr.strip(), (env, p.stdout)
@@ -1502,6 +1511,300 @@ def test_oriterm_example():
   print(f"  arms: live ARGS + --iterations 160000 (+ --root_ori_term 1.0 on T); restored LR {LIVE_LR_148000:.6e}")
   # the script itself: bash syntax, and it refuses busy GPUs / a short stagger before launching anything
   assert subprocess.run(["bash", "-n", os.path.join(ROOT, "scripts", "launch_bj31_oriterm.example.sh")]).returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# (f) review fixes
+# ---------------------------------------------------------------------------
+
+
+def _heads_55e0eaf():
+  """55e0eaf's supermimic/heads.py (git show) as a module: the HeadsCfg the live run's code dir / master's tools build."""
+  name = "supermimic._heads_55e0eaf"
+  if name not in sys.modules:
+    src = subprocess.run(["git", "-C", ROOT, "show", "55e0eaf:supermimic/heads.py"], capture_output=True, text=True, check=True).stdout
+    mod = types.ModuleType(name)
+    mod.__package__ = "supermimic"
+    sys.modules[name] = mod  # dataclasses look the module up
+    exec(compile(src, "55e0eaf:supermimic/heads.py", "exec"), mod.__dict__)
+  return sys.modules[name]
+
+
+def test_saved_cfg_loads_in_55e0eaf():
+  old = _heads_55e0eaf()
+  assert "root_ori_term" not in {f.name for f in dataclasses.fields(old.HeadsCfg)}
+  for h in (HeadsCfg(), HeadsCfg(ee_termination=False), HeadsCfg(root_ori_term=1.0, root_ori_term_temp=0.05)):
+    c = TrainCfg(log_dir="/nonexistent", heads=h)
+    d = cfg_dict(c)
+    full = dataclasses.asdict(c)
+    if h.root_ori_on:
+      assert d == full
+    else:  # exactly the three keys less, nothing else changed
+      assert {k: v for k, v in full["heads"].items() if k not in ROOT_ORI_KEYS} == d["heads"]
+      assert {k: v for k, v in full.items() if k != "heads"} == {k: v for k, v in d.items() if k != "heads"}
+  with tempfile.TemporaryDirectory() as tmp:
+    for h in (HeadsCfg(), HeadsCfg(root_ori_term=1.0, root_ori_term_temp=0.05)):
+      # train_cfg.json (Trainer.__init__) and the checkpoint (real Trainer.save on the loop stand-in)
+      log_dir = os.path.join(tmp, f"ro{h.root_ori_term}")
+      with mock.patch.object(trainer_mod, "make_env_cfg", mock.Mock(side_effect=tsc._Probe)):
+        try:
+          Trainer(TrainCfg(log_dir=log_dir, device="cpu", heads=h))
+        except tsc._Probe:
+          pass
+      hj = json.load(open(os.path.join(log_dir, "train_cfg.json")))["heads"]
+      t = tes.loop_trainer(log_dir)
+      t.cfg = dataclasses.replace(t.cfg, heads=h)
+      hk = torch.load(Trainer.save(t, "1"), weights_only=False)["cfg"]["heads"]
+      assert hk == json.loads(json.dumps(hk)) and hk == hj, "checkpoint and train_cfg.json carry the same heads dict"
+      assert HeadsCfg.from_dict(hk) == h and HeadsCfg.from_dict(hj) == h
+      if h.root_ori_on:  # older code refuses a run that has the term (expected)
+        for f in (lambda: old.HeadsCfg(**hk), lambda: old.HeadsCfg.from_dict(hk)):
+          try:
+            f()
+          except TypeError:
+            continue
+          raise AssertionError("55e0eaf's HeadsCfg cannot know root_ori_term")
+      else:  # 55e0eaf's HeadsCfg(**d) (master's eval_ckpt.py) and from_dict (its Trainer / wm_diag.py) load it
+        a, b = old.HeadsCfg(**hk), old.HeadsCfg.from_dict(hj)
+        assert dataclasses.asdict(a) == dataclasses.asdict(b) == hk
+  print("  off: train_cfg.json / checkpoint heads = 55e0eaf's keys (its HeadsCfg loads them); on: + root_ori_*")
+
+
+YAW_RATE = (0.0, 0.03, 0.3)  # imagined root yaw per step of the 3 toy rollouts
+REF_YAW = 0.05  # reference root yaw per frame
+
+
+def ro_policy_trainer(on: bool, track: bool = True) -> Trainer:
+  """tes.policy_trainer (toy policy / critic, scripted rewards and soft dones) with a root quaternion in the state: the
+  imagined root yaws by YAW_RATE per step, the reference by REF_YAW per frame, imagine_step advances f_loc (as the real
+  one); the heads' real root_ori_angle_state / root_ori_hazard on a stand-in."""
+  t = tes.policy_trainer()
+  N = tes.N_TOY
+  hc = HeadsCfg(root_ori_term=1.0 if on else 0.0, root_ori_term_temp=0.05)
+  t.cfg = dataclasses.replace(t.cfg, heads=hc)
+  h = types.SimpleNamespace(proprio=lambda s, pa, b, noise: s[..., :2], kin=lambda s: {"s": s}, root_ori=0 if track else None,
+                            root_ori_is_root=True, cfg=hc)
+  h.root_ori_angle_state = types.MethodType(AnalyticHeads.root_ori_angle_state, h)
+  h.root_ori_hazard = types.MethodType(AnalyticHeads.root_ori_hazard, h)
+  t.heads = h
+  st = t.buffer.sample_starts(N, 10)
+  st = dict(st, state=torch.cat([st["state"], torch.zeros(N, 1), yaw_q(torch.zeros(N))], -1),
+            hist_states=torch.cat([st["hist_states"], torch.zeros(N, 10, 5)], -1))
+  t.buffer = types.SimpleNamespace(sample_starts=lambda n, hist: st)
+
+  def gather(frame, L):
+    w = {k: torch.zeros(N, L, 1) for k in ("joint_pos", "joint_vel", "body_pos", "body_lin_vel", "body_ang_vel")}
+    w["body_quat"] = yaw_q(REF_YAW * torch.arange(L, dtype=torch.float32)).expand(N, L, 4)[:, :, None, :].contiguous()
+    return w
+
+  t.lib = types.SimpleNamespace(gather_windows=gather)
+  toy = t.fns.imagine_step
+  rate = torch.tensor(YAW_RATE)
+
+  def imagine_step(s, obs_hist, prev_a, f_loc, *rest):
+    s2, oh, a, _, kin, r, d, fn, gn = toy(s[:, :2], obs_hist, prev_a, f_loc, *rest)
+    s_next = torch.cat([s2, torch.zeros(N, 1), yaw_q(rate * (f_loc + 1).float())], -1)
+    return s_next, oh, a, f_loc + 1, kin, r, d, fn, gn
+
+  t.fns = types.SimpleNamespace(imagine_step=imagine_step, goal_from_pack=t.fns.goal_from_pack,
+                                critic_inputs=lambda s, goal: (s[:, :2], goal))
+  return t
+
+
+def test_imagined_root_ori_logging():
+  H, N = tes.H_TOY, tes.N_TOY
+  tt = torch.arange(H, dtype=torch.float64)[:, None]
+  ang = (torch.tensor(YAW_RATE, dtype=torch.float64)[None] * (tt + 1) - REF_YAW * tt).abs()  # [H, N]: step t vs frame t
+  C = torch.ones(H, N, dtype=torch.float64)
+  for k in range(1, H):
+    C[k] = C[k - 1] * (1.0 - tes.D_TAB[:, k - 1].double())
+  hz = torch.sigmoid((ang - 1.0) / 0.05)
+  want = {"pi/root_ori_angle_t0": float(ang[0].mean()), "pi/root_ori_angle_tH": float(ang[-1].mean()),
+          "pi/root_ori_over_frac": float((ang > 1.0).double().mean())}
+  want_on = {**want, "pi/root_ori_hazard_mean": float(hz.mean()),
+             "pi/root_ori_death_share": float((C * hz).sum() / (C * tes.D_TAB.T.double()).sum())}
+  assert want["pi/root_ori_over_frac"] == 1.0 / 12, "one imagined step (rollout 2, t = 3: 1.05 rad) over 1 rad"
+  runs = {}
+  for on, track in ((False, False), (False, True), (True, False), (True, True)):
+    t = ro_policy_trainer(on, track)
+    torch.manual_seed(7)
+    m = Trainer.update_policy(t)
+    runs[(on, track)] = (m, [p.detach().clone() for p in list(t.policy.parameters()) + list(t.critic_net.parameters())], torch.get_rng_state())
+    ro = {k: v for k, v in m.items() if k.startswith("pi/root_ori")}
+    if not track:
+      assert not ro, "body not tracked: no root-orientation keys"
+      continue
+    w = want_on if on else want
+    assert set(ro) == set(w), (sorted(ro), sorted(w))
+    for k in w:
+      assert math.isclose(ro[k], w[k], rel_tol=1e-5, abs_tol=1e-7), (k, ro[k], w[k])
+  # logging only: everything else (metrics, policy / critic update, RNG) the same with and without it, on and off
+  m0, p0, r0 = runs[(False, False)]
+  for key, (m, ps, r) in runs.items():
+    assert {k: v for k, v in m.items() if not k.startswith("pi/root_ori") and k != "time/ref_gather"} == \
+           {k: v for k, v in m0.items() if k != "time/ref_gather"}, key
+    assert all(torch.equal(a, b) for a, b in zip(ps, p0)) and torch.equal(r, r0), key
+  m = runs[(True, True)][0]
+  print(f"  imagined: angle t0 {m['pi/root_ori_angle_t0']:.3f} tH {m['pi/root_ori_angle_tH']:.3f} over {m['pi/root_ori_over_frac']:.3f} "
+        f"hazard {m['pi/root_ori_hazard_mean']:.4f} death share {m['pi/root_ori_death_share']:.4f} (closed form)")
+
+
+def update_world_model_55e0eaf(self) -> dict:
+  """trainer.Trainer.update_world_model at 55e0eaf, verbatim."""
+  cfg = self.cfg.wm
+  self.wm.train()
+  agg: dict[str, float] = {}
+  for _ in range(cfg.batches_per_update):
+    batch = self.buffer.sample_windows(cfg.windows_per_batch, cfg.k)
+    self.dist.rms_update(self.wm.stats_pairs(batch))
+    loss, e1, ek = self.fns.wm_loss(batch["s0"], batch["actions"], batch["next_states"], batch["xi"], batch["mask"])
+    self.opt_wm.zero_grad(set_to_none=True)
+    loss.backward()
+    gn = self._apply_grads("wm", self.opt_wm, list(self.wm.parameters()), cfg.grad_clip, None)
+    m = {"wm/loss": loss.item(), "wm/err_step1": e1.item(), f"wm/err_step{cfg.k}": ek.item(), "wm/grad_norm": gn, "wm/valid_frac": batch["mask"].float().mean().item()}
+    for k, v in m.items():
+      agg[k] = agg.get(k, 0.0) + v / cfg.batches_per_update
+  return agg
+
+
+def wm_trainer(k: int = 4) -> Trainer:
+  """Trainer for update_world_model: small real world model, replay windows of random states (sampled with the RNG,
+  as the real buffer), real _apply_grads / DistCtx.rms_update; a quarter of the windows invalid (mask False)."""
+  t = object.__new__(Trainer)
+  t.cfg = TrainCfg(log_dir="/nonexistent", wm=WorldModelCfg(hidden=(16,), k=k, batches_per_update=3, windows_per_batch=24))
+  t.dist = DistCtx(device="cpu")
+  t.wm = _wm()
+  t.opt_wm = torch.optim.Adam(t.wm.parameters(), lr=1e-3)
+  t.fns = StepFns(None, None, t.wm, None, compile_=False)
+  t.guard_skips = {"wm": 0, "pi": 0, "critic": 0}
+  NW = 64
+  g = torch.Generator().manual_seed(31)
+  W = {"s0": random_states(NW, 32), "actions": torch.randn(NW, k, J, generator=g) * 0.2,
+       "next_states": random_states(NW * k, 33).view(NW, k, -1), "xi": torch.randn(NW, XI, generator=g) * 0.3,
+       "mask": torch.arange(NW) % 4 != 0}
+  t.rec = []
+
+  def sample_windows(n, k_):
+    assert k_ == k
+    idx = torch.randint(0, NW, (n,))
+    b = {key: v[idx] for key, v in W.items()}
+    t.rec.append(b)
+    return b
+
+  t.buffer = types.SimpleNamespace(sample_windows=sample_windows)
+  return t
+
+
+def test_wm_root_drift():
+  k = 4
+  new, old = wm_trainer(k), wm_trainer(k)
+  torch.manual_seed(3)
+  m_new = Trainer.update_world_model(new)
+  rng_new = torch.get_rng_state()
+  torch.manual_seed(3)
+  m_old = update_world_model_55e0eaf(old)
+  rng_old = torch.get_rng_state()
+  extra = {f"wm/root_{n}_err_step{j}" for n in ("ang", "yaw") for j in (1, k)}
+  assert set(m_new) - set(m_old) == extra and all(m_new[x] == m_old[x] for x in m_old), "logging only: the old metrics unchanged"
+  sd_new, sd_old = new.wm.state_dict(), old.wm.state_dict()
+  assert all(torch.equal(sd_new[x], sd_old[x]) for x in sd_old) and torch.equal(rng_new, rng_old), "weights / normalizers / RNG"
+  assert all(math.isfinite(m_new[x]) and m_new[x] > 0 for x in extra)
+  # closed form on the last batch with the final weights
+  b = new.rec[-1]
+  with torch.no_grad():
+    s, errs = b["s0"], {}
+    for j in range(k):
+      s = new.wm.step(s, b["actions"][:, j], b["xi"])
+      q, qt = s[b["mask"], 3:7].double(), b["next_states"][b["mask"], j, 3:7].double()
+      errs[j + 1] = (quat_angle(qt, q), quat_angle(yaw_quat(qt), yaw_quat(q)))
+  for j in (1, k):
+    for n, e in zip(("ang", "yaw"), errs[j]):
+      assert math.isclose(m_new[f"wm/root_{n}_err_step{j}"], float(e.mean()), rel_tol=1e-5), (n, j)
+  # invalid windows are left out even when their states are not finite
+  nan_b = dict(b, next_states=b["next_states"].masked_fill(~b["mask"][:, None, None], float("nan")))
+  assert Trainer._wm_root_drift(new, nan_b) == Trainer._wm_root_drift(new, b)
+  # a world model exactly right but for a known yaw drift d_j: both errors = |d_j|
+  with torch.no_grad():
+    s, nxt = b["s0"], []
+    for j in range(k):
+      s = new.wm.step(s, b["actions"][:, j], b["xi"])
+      drift = s.clone()
+      drift[:, 3:7] = quat_mul(yaw_q(torch.full((s.shape[0],), 0.1 * (j + 1))), s[:, 3:7])
+      nxt.append(drift)
+  m = Trainer._wm_root_drift(new, dict(b, next_states=torch.stack(nxt, 1)))
+  for j in (1, k):
+    for n in ("ang", "yaw"):
+      assert abs(m[f"wm/root_{n}_err_step{j}"] - 0.1 * j) < 1e-4, (n, j, m)
+  print(f"  wm root drift step{k}: angle {m_new[f'wm/root_ang_err_step{k}']:.3f} yaw {m_new[f'wm/root_yaw_err_step{k}']:.3f} "
+        f"(closed form; scripted yaw drift recovered)")
+
+
+SLEEPER = """
+import os, sys, time
+import torch.distributed as dist
+dist.init_process_group("gloo")
+print("up", os.environ["TORCHELASTIC_RUN_ID"], flush=True)
+time.sleep(float(sys.argv[1]))
+dist.barrier()
+dist.destroy_process_group()
+print("done", flush=True)
+"""
+
+
+def test_launcher_port_clash_fails():
+  """The rendezvous flags the launcher writes for PORT (real torchrun, CPU, 1 rank each): a second job on a port that
+  a running job holds exits at start (is_host=1) and the first one finishes unharmed; another port runs alongside."""
+  if os.environ.get("SKIP_TORCHRUN"):
+    print("  (skipped: SKIP_TORCHRUN)")
+    return
+  with tempfile.TemporaryDirectory() as tmp:
+    port, port2 = tsc._free_port(), tsc._free_port()
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"}
+
+    def rdzv(run: str, p: int) -> list[str]:
+      e = {k: v for k, v in os.environ.items() if k not in ("CUDA_VISIBLE_DEVICES", "PORT", "RDZV_PORT", "MASTER_PORT", "NPROC")}
+      out = subprocess.run(["bash", os.path.join(ROOT, "scripts", "launch_bj31_ddp.sh"), run], env={**e, "PORT": str(p), "DRY_RUN": "1",
+                           "ROOT": tmp, "VENV": "/nonexistent_venv_for_test"}, capture_output=True, text=True, check=True).stdout
+      cmd = _cmd_of(out)
+      return cmd[1 : cmd.index("--nproc_per_node")]
+
+    sleeper = os.path.join(tmp, "sleeper.py")
+    with open(sleeper, "w") as f:
+      f.write(SLEEPER)
+
+    def start(run: str, p: int, secs: float) -> subprocess.Popen:
+      log = open(os.path.join(tmp, f"{run}.log"), "w")
+      return subprocess.Popen([sys.executable, "-m", "torch.distributed.run", *rdzv(run, p), "--nproc_per_node", "1", sleeper, str(secs)],
+                              env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+
+    procs = []
+    try:
+      a = start("jobA", port, 25)
+      procs.append(a)
+      for _ in range(300):  # until A's rank is up (its agent holds the port)
+        if "up jobA" in open(os.path.join(tmp, "jobA.log")).read():
+          break
+        assert a.poll() is None, open(os.path.join(tmp, "jobA.log")).read()
+        time.sleep(0.1)
+      else:
+        raise AssertionError("job A did not start")
+      c = start("jobC", port2, 1)  # its own port: runs alongside
+      procs.append(c)
+      b = start("jobB", port, 1)  # A's port
+      procs.append(b)
+      rc_b = b.wait(timeout=120)
+      log_b = open(os.path.join(tmp, "jobB.log")).read()
+      assert rc_b != 0 and "up jobB" not in log_b, log_b[-2000:]
+      assert "EADDRINUSE" in log_b or "RendezvousConnectionError" in log_b, log_b[-2000:]
+      assert a.poll() is None, "job A must survive job B's failed start"
+      assert c.wait(timeout=120) == 0 and "done" in open(os.path.join(tmp, "jobC.log")).read()
+      assert a.wait(timeout=120) == 0 and "done" in open(os.path.join(tmp, "jobA.log")).read()
+    finally:
+      for pr in procs:
+        if pr.poll() is None:
+          os.killpg(pr.pid, 9)
+          pr.wait()
+  print(f"  torchrun: second job on port {port} exits at start (EADDRINUSE), the first and a job on port {port2} finish")
 
 
 if __name__ == "__main__":

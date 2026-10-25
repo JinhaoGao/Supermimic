@@ -679,7 +679,7 @@ def policy_trainer(seed: int = 0) -> Trainer:
   t.wm = torch.nn.Linear(1, 1)
   t.opt_pi = torch.optim.Adam(t.policy.parameters(), lr=1e-2)
   t.opt_v = torch.optim.Adam(t.critic_net.parameters(), lr=1e-2)
-  t.heads = types.SimpleNamespace(proprio=lambda s, pa, b, noise: s, kin=lambda s: {"s": s})
+  t.heads = types.SimpleNamespace(proprio=lambda s, pa, b, noise: s, kin=lambda s: {"s": s}, root_ori=None)  # no pelvis logging
   t.sim = types.SimpleNamespace(bias_from_xi=lambda xi, nj: torch.zeros(xi.shape[0], nj))
   g = torch.Generator().manual_seed(seed + 1)
   st = dict(xi=torch.zeros(N_TOY, 1), hist_states=torch.randn(N_TOY, 10, 2, generator=g), hist_prev_action=torch.zeros(N_TOY, 10, 1),

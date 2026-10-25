@@ -30,6 +30,11 @@ torso decoupling through the waist). With root_ori_term = A > 0 the simulator te
 (env_cfg ``root_ori``) and the imagined soft termination gets sigmoid((angle - A) / root_ori_term_temp) in its
 noisy-OR. The pelvis is the robot's root body (free joint: G1 pelvis, E2 base_link), whose world-model state
 quaternion is s[3:7] (= its FK pose); the reference quaternion is the tracked-body quaternion of that body.
+The soft term is a per-STEP hazard (0.5 at A for one step): a rollout that holds a constant angle x for the H imagined
+steps survives with (1 - sigmoid((x - A) / T))^H, 50 % at x = A - 4.23 T for H = 48 (A = 1.0: 0.79 rad at T = 0.05,
+0.92 rad at T = 0.02), so imagination (and the critic targets through the soft dones) treats rollouts at ~0.8-0.98 rad
+as dying while the simulator keeps them -- as the anchor tilt term does below its 0.8 (same T). The trainer logs the
+imagined side (pi/root_ori_*) and the world model's k-step root-orientation drift (wm/root_*_err_step<k>).
 """
 
 from __future__ import annotations
@@ -97,6 +102,8 @@ class HeadsCfg:
   # and the reference's root body exceeds root_ori_term [rad] (the eval site's root_ori test at 1.0); soft term
   # sigmoid((angle - root_ori_term) / root_ori_term_temp). 0 = off = the code before, bitwise. root_ori_body: "" = the
   # robot's root (free-joint) body, G1 pelvis / E2 base_link (env_cfg.ROOT_BODY), else a tracked body name.
+  # The temperature acts per imagined step: over H = 48 steps the 50 %-survival angle is root_ori_term - 4.23 x temp
+  # (0.79 rad at 1.0 / 0.05, the tilt term's temperature; 0.92 rad at 0.02) -- see the module docstring.
   root_ori_term: float = 0.0
   root_ori_term_temp: float = 0.05
   root_ori_body: str = ""
@@ -320,6 +327,12 @@ class AnalyticHeads:
     (kin, from the state) and its reference quaternion ref_rq [B,4]."""
     return quat_angle(ref_rq, kin["body_quat"][:, self.root_ori])
 
+  def root_ori_hazard(self, ang: torch.Tensor, scale: torch.Tensor | None = None) -> torch.Tensor:
+    """Soft root-orientation term [B] of termination: sigmoid((angle - A k) / (T k)), k = the curriculum scale (or 1)."""
+    c = self.cfg
+    k = 1.0 if scale is None else scale
+    return torch.sigmoid((ang - c.root_ori_term * k) / (c.root_ori_term_temp * k))
+
   @torch.no_grad()
   def root_ori_angle_state(self, s: torch.Tensor, ref_bq: torch.Tensor) -> torch.Tensor | None:
     """Logging (no grad): root_ori_angle of the states s [B,D] against the tracked-body reference quaternions ref_bq
@@ -371,7 +384,7 @@ class AnalyticHeads:
       assert ref_rq is not None, "root_ori_term needs the reference root-orientation quaternion (ref_rq)"
       ang = self.root_ori_angle(kin_next, ref_rq)  # [B]
       hard = hard | (ang > c.root_ori_term * k)
-      p_ro = torch.sigmoid((ang - c.root_ori_term * k) / (c.root_ori_term_temp * k))
+      p_ro = self.root_ori_hazard(ang, scale)
       alive = alive * (1.0 - p_ro)
     soft = 1.0 - alive
     return hard, soft

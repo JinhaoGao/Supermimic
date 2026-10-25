@@ -44,7 +44,10 @@ Root orientation (2026-10-25): opt-in heads.root_ori_term (simulator term + soft
 term in imagination, pelvis full angle incl. yaw, the eval site's root_ori test)
 and the always-on FailureWatch (supermimic/watch.py): train/would_fail_ori and
 the floor / spin watch groups, counted on the device, summed over ranks at the
-log; off == the code before (the counters never reach the learner).
+log; off == the code before (the counters never reach the learner). Logging
+only as well: the same angle in imagination (pi/root_ori_angle_t0 / _tH /
+over_frac, with the term on pi/root_ori_hazard_mean / death_share) and the
+world model's k-step root drift (wm/root_ang_err_step<k>, wm/root_yaw_err_*).
 """
 
 from __future__ import annotations
@@ -66,11 +69,12 @@ from .env_cfg import make_env_cfg
 from .evaluate import Evaluator
 from .fns import StepFns
 from .heads import HeadsCfg
+from .math_utils import quat_angle, yaw_quat
 from .motions import read_name_list, resolve_clip_names
 from .policy import Critic, Policy
 from .replay import ReplayBuffer
 from .sim_interface import ObsHistory, SimInterface
-from .watch import FailureWatch
+from .watch import ORI_FAIL_THRESHOLD, FailureWatch
 from .world_model import DynamicsModel, WorldModelCfg
 
 
@@ -192,6 +196,20 @@ def finite_mean(v) -> float:
   return float(a[f].mean()) if f.any() else float("nan")
 
 
+ROOT_ORI_KEYS = ("root_ori_term", "root_ori_term_temp", "root_ori_body")  # HeadsCfg fields added 2026-10-25
+
+
+def cfg_dict(cfg: "TrainCfg") -> dict:
+  """asdict(cfg) for train_cfg.json and the checkpoints. With the root-orientation term off the heads dict leaves out
+  its three keys, so the file has 55e0eaf's keys and older code (55e0eaf / master HeadsCfg(**d), HeadsCfg.from_dict)
+  still loads it; this code's from_dict fills the defaults back in. On: written as they are (older code refuses them)."""
+  d = asdict(cfg)
+  if not cfg.heads.root_ori_on:
+    for k in ROOT_ORI_KEYS:
+      d["heads"].pop(k)
+  return d
+
+
 WD_SIGNALS = {"imagined_reward_norm": "imagined reward", "imagined_reward_alive": "imagined alive reward"}  # -> log label
 ES_MIN_PREV = 3  # early stop: previous evals needed before the first verdict
 
@@ -245,7 +263,7 @@ class Trainer:
     os.makedirs(cfg.log_dir, exist_ok=True)
     if self.main:
       with open(os.path.join(cfg.log_dir, "train_cfg.json"), "w") as f:
-        json.dump(asdict(cfg), f, indent=2, default=str)
+        json.dump(cfg_dict(cfg), f, indent=2, default=str)
     self.writer = SummaryWriter(cfg.log_dir) if self.main else None
 
     from mjlab.envs import ManagerBasedRlEnv
@@ -504,7 +522,28 @@ class Trainer:
       m = {"wm/loss": loss.item(), "wm/err_step1": e1.item(), f"wm/err_step{cfg.k}": ek.item(), "wm/grad_norm": gn, "wm/valid_frac": batch["mask"].float().mean().item()}
       for k, v in m.items():
         agg[k] = agg.get(k, 0.0) + v / cfg.batches_per_update
+    agg.update(self._wm_root_drift(batch))  # logging only: last batch, updated weights
     return agg
+
+  @torch.no_grad()
+  def _wm_root_drift(self, batch: dict) -> dict:
+    """Logging only (2026-10-25; no grad, no RNG, nothing written): the root (free-joint body, G1 pelvis) orientation
+    error of the world model's open-loop k-step rollout on a replay batch, mean over valid windows -- the full rotation
+    angle (the eval site's root_ori, incl. yaw; the --root_ori_term quantity) and its yaw part, after 1 and after k steps.
+    The model is yaw-invariant: its root yaw only integrates predicted angular velocity, so imagined root yaw over the
+    H-step horizon drifts by more than this k-step value (compare with pi/root_ori_angle_* and the 1.0 rad threshold)."""
+    s = batch["s0"]
+    acts, nxt, m = batch["actions"], batch["next_states"], batch["mask"]
+    k = acts.shape[1]
+    n = m.float().sum().clamp(min=1.0)
+    out = {}
+    for j in range(k):
+      s = self.wm.step(s, acts[:, j], batch["xi"])
+      if j in (0, k - 1):
+        qt, qp = nxt[:, j, 3:7], s[:, 3:7]
+        for name, e in (("ang", quat_angle(qt, qp)), ("yaw", quat_angle(yaw_quat(qt), yaw_quat(qp)))):
+          out[f"wm/root_{name}_err_step{j + 1}"] = float(torch.where(m, e, torch.zeros_like(e)).sum() / n)
+    return out
 
   # ---------------------------------------------------------------------------
   # 3. Policy + critic through imagination
@@ -545,8 +584,13 @@ class Trainer:
     J = torch.zeros(N, device=self.device)
     feats_n, goals_n, rews, dsoft, alive = [], [], [], [], []
     p = (pack["joint_pos"], pack["joint_vel"], pack["body_pos"], pack["body_quat"], pack["body_lin_vel"], pack["body_ang_vel"])
+    ro_angles = [] if heads.root_ori is not None else None  # logging only (pi/root_ori_*; None: body not tracked)
+    ar_n = torch.arange(N, device=self.device)
     for t in range(H):
+      f_ref = f_loc  # target frame of this step's reward / termination (imagine_step advances f_loc)
       s, obs_hist, prev_a, f_loc, kin, r, d, fn, gn = self.fns.imagine_step(s, obs_hist, prev_a, f_loc, clip_end_loc, xi, bias, kin, *p, term_scale)
+      if ro_angles is not None:
+        ro_angles.append(heads.root_ori_angle_state(s.detach(), p[3][ar_n, f_ref]))
       J = J + (g**t) * c * r
       alive.append(c.detach())  # c_t: survival weight of r_t in J (product of 1 - d_s for s < t; c_0 = 1)
       c = c * (1.0 - d)
@@ -577,9 +621,33 @@ class Trainer:
       "pi/loss": loss_pi.item(),
       "time/ref_gather": self._t_gather,
     }
+    if ro_angles is not None:
+      metrics.update(self._imagined_root_ori(torch.stack(ro_angles), torch.stack(alive), torch.stack(dsoft), term_scale))
     if cfg.use_critic:
       metrics.update(self._fit_critic(feats_n, goals_n, fn_H.detach(), gn_H.detach(), xi, rews, dsoft))
     return metrics
+
+  @torch.no_grad()
+  def _imagined_root_ori(self, ang: torch.Tensor, c: torch.Tensor, d: torch.Tensor, term_scale: torch.Tensor | None) -> dict:
+    """Logging only (2026-10-25): the root-orientation body's full angle vs the reference in imagination, ang [H, N] (the
+    quantity of --root_ori_term; logged with the term off too), with survival weights c [H, N] and soft dones d [H, N].
+      pi/root_ori_angle_t0 / _tH        mean angle after the first / the last imagined step (world-model yaw drift shows
+                                        as tH >> t0 when the real episodes stay below, train/ori_over_step_frac)
+      pi/root_ori_over_frac             imagined steps with angle > 1.0 rad (the eval site; real side: train/ori_over_step_frac)
+      pi/root_ori_hazard_mean           (term on) mean soft root-orientation term over all imagined steps
+      pi/root_ori_death_share           (term on) sum c p_ro / sum c d: the share of the imagined soft deaths that comes from
+                                        the root-orientation term (noisy-OR: an upper bound when several terms fire at once)"""
+    out = {
+      "pi/root_ori_angle_t0": float(ang[0].nanmean()),
+      "pi/root_ori_angle_tH": float(ang[-1].nanmean()),
+      "pi/root_ori_over_frac": float((ang > ORI_FAIL_THRESHOLD).float().mean()),
+    }
+    if self.cfg.heads.root_ori_on:
+      hz = self.heads.root_ori_hazard(ang, term_scale)  # [H, N] (scale [N] broadcasts)
+      out["pi/root_ori_hazard_mean"] = float(hz.nanmean())
+      dsum = (c * d).sum()
+      out["pi/root_ori_death_share"] = float((c * hz).nansum() / dsum) if float(dsum) > 0 else 0.0
+    return out
 
   def _alive_reward(self, c: torch.Tensor, r: torch.Tensor) -> float:
     """sum c_t r_t / sum c_t over [H, N] survival weights c and rewards r, normalized by reward_max_per_step (the same
@@ -660,7 +728,7 @@ class Trainer:
         "bin_G": self.cmd.bin_G,
         "bin_visits": self.cmd.bin_visits,
         "lr_scale": self.lr_scale,
-        "cfg": asdict(self.cfg),
+        "cfg": cfg_dict(self.cfg),
         "dims": dict(proprio=self.heads.proprio_dim, hist=self.cfg.heads.hist, goal_frame=self.heads.goal_frame_dim, K=self.cfg.heads.K, nj=self.nj, xi=self.xi_dim),
       },
       path,

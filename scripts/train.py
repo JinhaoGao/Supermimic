@@ -140,7 +140,9 @@ def main():
                  help="terminate when the pelvis' (robot root's) full rotation angle vs the reference, yaw included, exceeds "
                       "this [rad] in the simulator, + matching soft term in imagination; 1.0 = the eval site; 0 = off (default)")
   p.add_argument("--root_ori_term_temp", type=float, default=0.05,
-                 help="sigmoid temperature [rad] of the imagined root-orientation term (0.5 at the threshold)")
+                 help="sigmoid temperature [rad] of the imagined root-orientation term: a per-step hazard, 0.5 at the "
+                      "threshold for ONE step; over --H 48 imagined steps a constant angle survives 50%% at threshold - 4.23 x "
+                      "temp (0.79 rad at 1.0 / 0.05, 0.92 at 0.02), i.e. imagination already counts ~0.8-0.98 rad as dying")
   p.add_argument("--root_ori_body", type=str, default="",
                  help="tracked body of the root-orientation test (default: the robot's root body, G1 pelvis / E2 base_link)")
   p.add_argument("--wm_batches", type=int, default=10)

@@ -95,9 +95,10 @@ bash scripts/launch_bj31_ddp.sh g1_full_ddp8 --motion_dirs ~/motion_dataset/g1_a
     --blacklist /data2/supermimic/lists/atlas_full_blacklist_motion50_1010.json \
     --eval_clip_names /data2/supermimic/lists/eval_1024.txt --eval_interval 4000
 bash scripts/stop_bj31_ddp.sh g1_full_ddp8       # kill -9 all ranks + the torchrun agent
-# two 4-GPU jobs on one host: own GPU subset + own rendezvous port each (default = --standalone on all 8 GPUs)
-CUDA_VISIBLE_DEVICES=0,1,2,3 PORT=29511 bash scripts/launch_bj31_ddp.sh runA ...
-CUDA_VISIBLE_DEVICES=4,5,6,7 PORT=29512 bash scripts/launch_bj31_ddp.sh runB ...
+# two 4-GPU jobs on one host: own GPU subset + own rendezvous port each, unique on the host (a taken port makes the
+# second job exit at start: --rdzv-conf is_host=1); default = --standalone on all 8 GPUs
+CUDA_VISIBLE_DEVICES=0,1,2,3 PORT=29521 bash scripts/launch_bj31_ddp.sh runA ...
+CUDA_VISIBLE_DEVICES=4,5,6,7 PORT=29522 bash scripts/launch_bj31_ddp.sh runB ...
 ```
 
 ## Deploy on the G1 (unitree_mujoco `State_SuperMimic`)
@@ -305,7 +306,10 @@ mirror. TensorBoard for the runs: `ssh -N -L 6107:127.0.0.1:6107 tencent_bj27`.
 * Termination in imagination is a soft sigmoid version of the hard thresholds
   (noisy-OR over anchor height, anchor tilt and, by default, end-effector heights; opt-in `--root_ori_term A`:
   the pelvis' full rotation angle incl. yaw > A rad, the team benchmark's root_ori test at A = 1.0, which the anchor
-  tilt test cannot see -- 101 of 129 benchmark failures of r15ws model_148000).
+  tilt test cannot see -- 101 of 129 benchmark failures of r15ws model_148000). Each soft term is a per-step hazard:
+  over H = 48 imagined steps a constant error survives 50 % at threshold - 4.23 x temperature (pelvis: 0.79 rad at
+  A = 1.0, T = 0.05). Logged either way: `pi/root_ori_*` (imagined angle / hazard), `wm/root_{ang,yaw}_err_step*`
+  (the world model's integrated root yaw over its k-step fit).
 * "Update-to-data ratio 0.4" is ambiguous; `--env_steps_per_iter` controls how
   many simulator steps are collected per (WM + policy) update, default 1.
 * Returns-to-go of time-outs are bootstrapped with r_last/(1−γ) for the sampler.
