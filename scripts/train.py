@@ -54,6 +54,11 @@ def main():
   p.add_argument("--goal_ref_root", action="store_true",
                  help="goal frames + reference anchor height / body-frame lin & ang vel / projected gravity (no odometry needed)")
   p.add_argument("--critic_errors", action="store_true", help="privileged tracking-error features for the critic")
+  p.add_argument("--wm_body_frame", action="store_true",
+                 help="WM features / targets in the root frame (no ZYX heading, singular at pitch +-90 deg); resuming a "
+                      "heading-frame checkpoint starts a fresh WM -> use --policy_delay")
+  p.add_argument("--policy_delay", type=int, default=0, help="iterations of world-model-only fitting after start / resume")
+  p.add_argument("--policy_freeze", type=int, default=0, help="then iterations of critic fitting without policy steps")
   p.add_argument("--wm_batches", type=int, default=10)
   p.add_argument("--wm_windows", type=int, default=2048)
   p.add_argument("--wm_k", type=int, default=8)
@@ -137,7 +142,10 @@ def main():
     wm_prefix_mask=args.wm_prefix_mask or args.fixes,
     clean_prev_action=args.clean_prev_action or args.fixes,
     compile_mode=args.compile_mode,
-    wm=WorldModelCfg(k=args.wm_k, lr=args.lr, batches_per_update=args.wm_batches, windows_per_batch=args.wm_windows),
+    wm=WorldModelCfg(k=args.wm_k, lr=args.lr, batches_per_update=args.wm_batches, windows_per_batch=args.wm_windows,
+                     body_frame=args.wm_body_frame),
+    policy_delay=args.policy_delay,
+    policy_freeze=args.policy_freeze,
     heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos, goal_ref_root=args.goal_ref_root, critic_errors=args.critic_errors,
                    ee_term_z=args.ee_term_z),
   )

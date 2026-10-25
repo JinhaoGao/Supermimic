@@ -29,6 +29,7 @@ from .env_cfg import make_env_cfg
 from .evaluate import Evaluator
 from .fns import StepFns
 from .heads import HeadsCfg, window_frames
+from .math_utils import quat_apply_inverse
 from .policy import Critic, Policy
 from .replay import ReplayBuffer
 from .sim_interface import ObsHistory, SimInterface
@@ -114,6 +115,10 @@ class TrainCfg:
   wm_prefix_mask: bool = False  # WM windows that cross an episode end keep their steps up to it (v2 dropped the whole
   #                                window: the last k-1 transitions before every fall got up to k x less weight)
   clean_prev_action: bool = False  # proprio a_{t-1} = the policy's action, not the executed noisy one (as deployed)
+  # After a start / resume: iterations of world-model-only fitting (e.g. a fresh WM after a representation change), then
+  # iterations in which imagination runs and the critic is fitted but the policy is not stepped.
+  policy_delay: int = 0
+  policy_freeze: int = 0
   wm: WorldModelCfg = field(default_factory=WorldModelCfg)
   heads: HeadsCfg = field(default_factory=HeadsCfg)
 
@@ -173,8 +178,8 @@ class Trainer:
     assert abs(self.dt - hc.dt) < 1e-9, f"env dt {self.dt} != heads dt {hc.dt}"
 
     self.policy = Policy(self.heads.proprio_dim, hc.hist, self.heads.goal_frame_dim, hc.K, self.nj, input_clip=cfg.input_clip).to(self.device)
-    self.critic = Critic(self.heads.feat_dim, self.heads.goal_frame_dim, hc.K, self.xi_dim, err_dim=self.heads.critic_err_dim).to(self.device)
     self.wm = DynamicsModel(self.nj, self.xi_dim, self.dt, cfg.wm).to(self.device)
+    self.critic = Critic(self.wm.feat_dim, self.heads.goal_frame_dim, hc.K, self.xi_dim, err_dim=self.heads.critic_err_dim).to(self.device)
     self.fns = StepFns(self.heads, self.policy, self.wm, self.critic, compile_=cfg.compile, mode=cfg.compile_mode)
     self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.wm.lr)
     self.opt_pi = torch.optim.Adam(self.policy.parameters(), lr=cfg.policy_lr, betas=cfg.policy_betas)
@@ -334,7 +339,8 @@ class Trainer:
   # 3. Policy + critic through imagination
   # ---------------------------------------------------------------------------
 
-  def update_policy(self) -> dict:
+  def update_policy(self, step_policy: bool = True) -> dict:
+    """Imagined rollouts -> policy step (unless step_policy is False: policy_freeze) and critic fit."""
     cfg, heads, H, K = self.cfg, self.heads, self.cfg.H, self.cfg.heads.K
     N = cfg.rollouts_per_update
     g = cfg.gamma
@@ -403,9 +409,11 @@ class Trainer:
       J = J + (g**H) * c * V_H
     loss_pi = -J.mean() / H
     self.opt_pi.zero_grad(set_to_none=True)
-    loss_pi.backward()
-    gn_pi = clip_grads(list(self.policy.parameters()), cfg.grad_clip_norm, cfg.grad_clip_elem)
-    self.opt_pi.step()
+    gn_pi = 0.0
+    if step_policy:
+      loss_pi.backward()
+      gn_pi = clip_grads(list(self.policy.parameters()), cfg.grad_clip_norm, cfg.grad_clip_elem)
+      self.opt_pi.step()
     for p_ in self.wm.parameters():
       p_.requires_grad_(True)
 
@@ -504,6 +512,8 @@ class Trainer:
     new_goal = self._graft_inputs(ck)
     self.policy.load_state_dict(ck["policy"])
     self.critic.load_state_dict(ck["critic"])
+    if bool(ck["cfg"].get("wm", {}).get("body_frame", False)) != self.cfg.wm.body_frame:
+      self._graft_wm(ck)
     self.wm.load_state_dict(ck["wm"])
     self.opt_wm.load_state_dict(ck["opt_wm"])
     self.opt_pi.load_state_dict(ck["opt_pi"])
@@ -540,8 +550,9 @@ class Trainer:
   def _graft_inputs(self, ck: dict) -> list[str]:
     """Rewrite ``ck`` in place from its goal / critic input layout to this run's: every input column of the goal encoder
     and of the critic's first layer, their Adam moments and the goal normalizer move to their new positions; new inputs
-    get zero weights, so the grafted networks compute exactly what they computed before. Returns the goal segments that
-    are new (their normalizer statistics still need calibrating)."""
+    get zero weights, so the grafted networks compute exactly what they computed before (the critic only approximately
+    when the WM representation changed). Returns the goal segments that are new (their normalizer statistics still need
+    calibrating)."""
     known = {f.name for f in fields(HeadsCfg)}
     old_h = HeadsCfg(**{k: v for k, v in ck["cfg"]["heads"].items() if k in known})
     if ck["dims"]["goal_frame"] == 2 * self.nj + 9:  # checkpoints from before the goal_anchor_pos flag
@@ -549,7 +560,10 @@ class Trainer:
     old_seg, new_seg = self.heads.goal_layout(old_h), self.heads.goal_layout()
     old_err = 4 * len(self.heads.tracked) + 1 if old_h.critic_errors else 0
     new_err = self.heads.critic_err_dim
-    if old_seg == new_seg and old_err == new_err:
+    J = self.nj
+    wm_layout = lambda body: [("z", 1), ("grav" if body else "rot6d", 3 if body else 6), ("v", 3), ("w", 3), ("q", J), ("qd", J)]  # noqa: E731
+    old_feat, new_feat = wm_layout(bool(ck["cfg"].get("wm", {}).get("body_frame", False))), wm_layout(self.cfg.wm.body_frame)
+    if old_seg == new_seg and old_err == new_err and old_feat == new_feat:
       return []
     assert sum(n for _, n in old_seg) == ck["dims"]["goal_frame"], (old_seg, ck["dims"])
     missing = [n for n, _ in old_seg if n not in dict(new_seg)]
@@ -565,8 +579,10 @@ class Trainer:
     fm = frame_map(old_seg, new_seg)
     Go, Gn, K = ck["dims"]["goal_frame"], len(fm), self.cfg.heads.K
     goal_cols = torch.cat([torch.where(fm >= 0, fm + k * Go, -1) for k in range(K)])  # encoder input map
-    fd, xd = self.heads.feat_dim, self.xi_dim
-    crit_cols = torch.cat([torch.arange(fd), torch.full((new_err,), -1), torch.where(goal_cols >= 0, goal_cols + fd + old_err, -1),
+    # Critic state features (WM features): heading-frame v -> root-frame v keeps its weights (equal when upright),
+    # gravity (root frame) is new, the heading-removed rot6d is dropped.
+    fd, xd = sum(n for _, n in old_feat), self.xi_dim
+    crit_cols = torch.cat([frame_map(old_feat, new_feat), torch.full((new_err,), -1), torch.where(goal_cols >= 0, goal_cols + fd + old_err, -1),
                            torch.arange(xd) + fd + old_err + K * Go])
 
     def remap(w, cols):  # [out, in_old] -> [out, in_new], zero columns for new inputs
@@ -594,8 +610,45 @@ class Trainer:
     for k, v in self.critic.state_dict().items():  # new critic error normalizer: fresh statistics
       crit.setdefault(k, v)
     new = [n for n, _ in new_seg if n not in dict(old_seg)]
-    print(f"[Trainer] graft: goal frame {Go} -> {Gn} (new {new}), critic error features {old_err} -> {new_err}")
+    print(f"[Trainer] graft: goal frame {Go} -> {Gn} (new {new}), critic error features {old_err} -> {new_err}, "
+          f"critic state features {[n for n, _ in old_feat]} -> {[n for n, _ in new_feat]}")
     return new
+
+  @torch.no_grad()
+  def _graft_wm(self, ck: dict, n: int = 65536) -> None:
+    """Heading-frame world model -> root-frame (body_frame) warm start, in place on ck: the input columns of z, v (heading
+    -> root frame, equal when upright), w, q, qd, action and xi keep their weights and Adam moments, the heading-removed
+    rot6d is dropped, root-frame gravity is a new input (zero weights; normalizer statistics from n random reference root
+    orientations). The output layout is unchanged (dv / rp are now read in the root frame). Fit it before the policy
+    uses it: policy_delay."""
+    if not self.cfg.wm.body_frame:
+      raise ValueError("world-model graft only goes from the heading frame to body_frame")
+    J, xd = self.nj, self.xi_dim
+    na = 13 + 3 * J  # old features + action
+    cols = torch.cat([torch.zeros(1, dtype=torch.long), torch.full((3,), -1), torch.arange(7, na), torch.arange(na, na + xd)])
+    w = ck["wm"]["net.0.weight"]
+    keep = cols >= 0
+
+    def remap(t):
+      out = torch.zeros(t.shape[0], len(cols), dtype=t.dtype, device=t.device)
+      out[:, keep.to(t.device)] = t[:, cols[keep].to(t.device)]
+      return out
+
+    ck["wm"]["net.0.weight"] = remap(w)
+    idx = [k for k, _ in self.wm.named_parameters()].index("net.0.weight")
+    st = ck["opt_wm"]["state"].get(idx)
+    if st is not None:
+      for m in ("exp_avg", "exp_avg_sq"):
+        st[m] = remap(st[m])
+    fr = torch.randint(0, self.lib.time_step_total, (n,), device=self.device)
+    qr = self.lib.gather(fr, fields=["body_quat"])["body_quat"][:, 0]  # reference root orientation
+    g = quat_apply_inverse(qr, torch.tensor([0.0, 0.0, -1.0], device=self.device).expand(n, 3))
+    for b, new in (("mean", g.mean(0)), ("var", g.var(0, unbiased=False))):
+      old = ck["wm"][f"in_norm.{b}"]
+      ck["wm"][f"in_norm.{b}"] = torch.cat([old[:1], new.to(old), old[7:]])
+    print(f"[Trainer] world model grafted heading frame -> root frame: input {w.shape[1]} -> {len(cols)}, gravity mean "
+          f"{g.mean(0).cpu().numpy().round(3).tolist()} std {g.std(0).cpu().numpy().round(3).tolist()}; "
+          f"policy_delay {self.cfg.policy_delay}, policy_freeze {self.cfg.policy_freeze}")
 
   @torch.no_grad()
   def _calibrate_goal_norm(self, segments: list[str], n: int = 65536) -> None:
@@ -727,6 +780,9 @@ class Trainer:
   def train(self) -> None:
     cfg = self.cfg
     warmup = max(cfg.wm.k + cfg.heads.hist + 2, 32)
+    policy_from = self.it + cfg.policy_delay  # WM-only fitting before this iteration
+    step_from = policy_from + cfg.policy_freeze  # critic-only (imagination without policy steps) before this one
+    self.wd_quiet_until = max(self.wd_quiet_until, step_from + cfg.wd_warmup)
     t_log = time.time()
     steps_at_log = self.env_steps
     agg: dict[str, list[float]] = {}
@@ -746,12 +802,12 @@ class Trainer:
       t1 = time.time()
       m_wm = self.update_world_model()
       t2 = time.time()
-      m_pi = self.update_policy()
+      m_pi = self.update_policy(step_policy=self.it >= step_from) if self.it >= policy_from else {}
       t3 = time.time()
       for s in self.sched:
         s.step()
       self.it += 1
-      if self._watchdog(m_pi):
+      if m_pi and self._watchdog(m_pi):
         agg = {}
         continue
       for k, v in {**m_wm, **m_pi, "time/collect": t1 - t0, "time/wm": t2 - t1, "time/policy": t3 - t2, "time/iter": t3 - t0}.items():

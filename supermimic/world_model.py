@@ -80,13 +80,17 @@ class WorldModelCfg:
   grad_clip: float = 1.0
   batches_per_update: int = 10
   windows_per_batch: int = 2048
+  # Root-frame representation (10-25, round 19): features [z, gravity, v, w in the root frame, q, qd] and velocity /
+  # position targets in the root frame. The default removes the ZYX-Euler heading instead, which is singular at
+  # pitch +-90 deg: in a back flip the heading jumps by pi as the torso passes vertical, so features and targets jump.
+  body_frame: bool = False
 
 
 class DynamicsModel(nn.Module):
   def __init__(self, nj: int, xi_dim: int, dt: float, cfg: WorldModelCfg):
     super().__init__()
     self.nj, self.xi_dim, self.dt, self.cfg = nj, xi_dim, dt, cfg
-    self.feat_dim = 13 + 2 * nj
+    self.feat_dim = (10 if cfg.body_frame else 13) + 2 * nj
     self.out_dim = 12 + 2 * nj  # dv(3) dw(3) dqd(J) rp(3) rr(3) rq(J)
     self.in_norm = RunningMeanStd(self.feat_dim + nj)  # features + action
     self.tgt_norm = RunningMeanStd(self.out_dim)
@@ -99,8 +103,16 @@ class DynamicsModel(nn.Module):
     J = self.nj
     return s[..., 0:3], s[..., 3:7], s[..., 7:10], s[..., 10:13], s[..., 13 : 13 + J], s[..., 13 + J : 13 + 2 * J]
 
+  def _frame(self, qw: torch.Tensor) -> torch.Tensor:
+    """Rotation the translational velocity / position deltas are expressed in: root (body_frame) or ZYX heading."""
+    return qw if self.cfg.body_frame else yaw_quat(qw)
+
   def features(self, s: torch.Tensor) -> torch.Tensor:
     p, qw, v, w, q, qd = self.split(s)
+    if self.cfg.body_frame:
+      g = torch.zeros_like(v)
+      g[:, 2] = -1.0
+      return torch.cat([p[:, 2:3], quat_apply_inverse(qw, g), quat_apply_inverse(qw, v), quat_apply_inverse(qw, w), q, qd], dim=-1)
     yq = yaw_quat(qw)
     rot_local = quat_mul(quat_inv(yq), qw)
     return torch.cat(
@@ -111,7 +123,7 @@ class DynamicsModel(nn.Module):
     """Raw regression targets for (s -> s_next)."""
     p, qw, v, w, q, qd = self.split(s)
     p2, qw2, v2, w2, q2, qd2 = self.split(s_next)
-    yq = yaw_quat(qw)
+    yq = self._frame(qw)
     dt = self.dt
     dv_h = quat_apply_inverse(yq, v2 - v)
     dw_b = quat_apply_inverse(qw, w2 - w)
@@ -132,7 +144,7 @@ class DynamicsModel(nn.Module):
   def compose(self, s: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     J = self.nj
     p, qw, v, w, q, qd = self.split(s)
-    yq = yaw_quat(qw)
+    yq = self._frame(qw)
     dv_h, dw_b, dqd = out[:, 0:3], out[:, 3:6], out[:, 6 : 6 + J]
     rp_h, rr_b, rq = out[:, 6 + J : 9 + J], out[:, 9 + J : 12 + J], out[:, 12 + J : 12 + 2 * J]
     dt = self.dt

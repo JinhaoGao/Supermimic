@@ -52,7 +52,7 @@ class StepFns:
   def critic_inputs(self, s, goal, err=None):
     """Normalized critic inputs; err (critic_errors) is appended to the state features."""
     feat = self.wm.features(s)
-    fd = self.heads.feat_dim
+    fd = self.wm.feat_dim
     c = self.policy.input_clip
     feat_n = ((feat - self.wm.in_norm.mean[:fd]) / self.wm.in_norm.std[:fd]).clamp(-c, c)
     if err is not None:
