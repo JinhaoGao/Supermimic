@@ -119,8 +119,24 @@ class TrainCfg:
   # iterations in which imagination runs and the critic is fitted but the policy is not stepped.
   policy_delay: int = 0
   policy_freeze: int = 0
+  wm_delay_lr: float = 1.0  # world-model learning-rate multiplier during policy_delay (a grafted / fresh WM refits faster)
   wm: WorldModelCfg = field(default_factory=WorldModelCfg)
   heads: HeadsCfg = field(default_factory=HeadsCfg)
+
+
+def remap_columns(w: torch.Tensor, cols: torch.Tensor, sign: torch.Tensor | None = None) -> torch.Tensor:
+  """[out, in_old] -> [out, in_new]: new column j = sign[j] * old column cols[j]; zero where cols[j] < 0 (new input)."""
+  out = torch.zeros(w.shape[0], len(cols), dtype=w.dtype, device=w.device)
+  keep = (cols >= 0).to(w.device)
+  src = w[:, cols.to(w.device)[keep]]
+  out[:, keep] = src if sign is None else src * sign.to(w)[keep]
+  return out
+
+
+# Heading-frame WM features [z, rot6d(R_local) 6, v_h, w_b, q, qd]: rot6d = (R00, R01, R10, R11, R20, R21) of the
+# heading-removed rotation, whose last row equals the full rotation's, so root-frame gravity g_b = -(R20, R21, R22):
+# rot6d entries 4, 5 are exactly -g_b[0], -g_b[1] (any orientation). Grafts map them over with the sign flipped.
+ROT6D_TO_GRAV = ((4, 0), (5, 1))
 
 
 def cosine_lambda(decay_iters: int, final_ratio: float):
@@ -579,29 +595,29 @@ class Trainer:
     fm = frame_map(old_seg, new_seg)
     Go, Gn, K = ck["dims"]["goal_frame"], len(fm), self.cfg.heads.K
     goal_cols = torch.cat([torch.where(fm >= 0, fm + k * Go, -1) for k in range(K)])  # encoder input map
-    # Critic state features (WM features): heading-frame v -> root-frame v keeps its weights (equal when upright),
-    # gravity (root frame) is new, the heading-removed rot6d is dropped.
+    # Critic state features (WM features): heading-frame v -> root-frame v keeps its weights (equal when upright);
+    # gravity x, y take the rot6d entries they equal (sign flipped, see ROT6D_TO_GRAV), gravity z is new.
     fd, xd = sum(n for _, n in old_feat), self.xi_dim
-    crit_cols = torch.cat([frame_map(old_feat, new_feat), torch.full((new_err,), -1), torch.where(goal_cols >= 0, goal_cols + fd + old_err, -1),
+    feat_cols = frame_map(old_feat, new_feat)
+    feat_sign = torch.ones(len(feat_cols))
+    if dict(old_feat).get("rot6d") and dict(new_feat).get("grav"):
+      for e, g in ROT6D_TO_GRAV:
+        feat_cols[1 + g], feat_sign[1 + g] = 1 + e, -1.0
+    crit_cols = torch.cat([feat_cols, torch.full((new_err,), -1), torch.where(goal_cols >= 0, goal_cols + fd + old_err, -1),
                            torch.arange(xd) + fd + old_err + K * Go])
+    crit_sign = torch.cat([feat_sign, torch.ones(len(crit_cols) - len(feat_cols))])
 
-    def remap(w, cols):  # [out, in_old] -> [out, in_new], zero columns for new inputs
-      out = torch.zeros(w.shape[0], len(cols), dtype=w.dtype, device=w.device)
-      keep = cols >= 0
-      out[:, keep.to(w.device)] = w[:, cols[keep].to(w.device)]
-      return out
-
-    def graft(sd, opt_sd, module, key, cols):
-      sd[key] = remap(sd[key], cols)
+    def graft(sd, opt_sd, module, key, cols, sign=None):
+      sd[key] = remap_columns(sd[key], cols, sign)
       idx = [n for n, _ in module.named_parameters()].index(key)
       st = opt_sd["state"].get(idx)
       if st is not None:
-        for m in ("exp_avg", "exp_avg_sq"):
-          st[m] = remap(st[m], cols)
+        st["exp_avg"] = remap_columns(st["exp_avg"], cols, sign)
+        st["exp_avg_sq"] = remap_columns(st["exp_avg_sq"], cols)
 
     pol, crit = ck["policy"], ck["critic"]
     graft(pol, ck["opt_pi"], self.policy, "encoder.0.weight", goal_cols)
-    graft(crit, ck["opt_v"], self.critic, "net.0.weight", crit_cols)
+    graft(crit, ck["opt_v"], self.critic, "net.0.weight", crit_cols, crit_sign)
     keep = fm >= 0
     for b, fill in (("mean", 0.0), ("var", 1.0)):
       v = torch.full((Gn,), fill, dtype=pol[f"goal_norm.{b}"].dtype, device=pol[f"goal_norm.{b}"].device)
@@ -617,38 +633,37 @@ class Trainer:
   @torch.no_grad()
   def _graft_wm(self, ck: dict, n: int = 65536) -> None:
     """Heading-frame world model -> root-frame (body_frame) warm start, in place on ck: the input columns of z, v (heading
-    -> root frame, equal when upright), w, q, qd, action and xi keep their weights and Adam moments, the heading-removed
-    rot6d is dropped, root-frame gravity is a new input (zero weights; normalizer statistics from n random reference root
-    orientations). The output layout is unchanged (dv / rp are now read in the root frame). Fit it before the policy
-    uses it: policy_delay."""
+    -> root frame, equal when upright), w, q, qd, action and xi keep their weights and Adam moments; root-frame gravity
+    x, y take over the two rot6d entries they equal (ROT6D_TO_GRAV: weights and normalizer mean negated, same std), so
+    the first-order tilt information is kept exactly; gravity z is a new input (zero weights, statistics from n random
+    reference root orientations); the other four rot6d entries (second order in the tilt) are dropped. The output layout
+    is unchanged (dv / rp are now read in the root frame). Fit it before the policy uses it: policy_delay."""
     if not self.cfg.wm.body_frame:
       raise ValueError("world-model graft only goes from the heading frame to body_frame")
     J, xd = self.nj, self.xi_dim
     na = 13 + 3 * J  # old features + action
     cols = torch.cat([torch.zeros(1, dtype=torch.long), torch.full((3,), -1), torch.arange(7, na), torch.arange(na, na + xd)])
+    sign = torch.ones(len(cols))
+    for e, gi in ROT6D_TO_GRAV:
+      cols[1 + gi], sign[1 + gi] = 1 + e, -1.0
     w = ck["wm"]["net.0.weight"]
-    keep = cols >= 0
-
-    def remap(t):
-      out = torch.zeros(t.shape[0], len(cols), dtype=t.dtype, device=t.device)
-      out[:, keep.to(t.device)] = t[:, cols[keep].to(t.device)]
-      return out
-
-    ck["wm"]["net.0.weight"] = remap(w)
+    ck["wm"]["net.0.weight"] = remap_columns(w, cols, sign)
     idx = [k for k, _ in self.wm.named_parameters()].index("net.0.weight")
     st = ck["opt_wm"]["state"].get(idx)
     if st is not None:
-      for m in ("exp_avg", "exp_avg_sq"):
-        st[m] = remap(st[m])
+      st["exp_avg"] = remap_columns(st["exp_avg"], cols, sign)
+      st["exp_avg_sq"] = remap_columns(st["exp_avg_sq"], cols)
     fr = torch.randint(0, self.lib.time_step_total, (n,), device=self.device)
     qr = self.lib.gather(fr, fields=["body_quat"])["body_quat"][:, 0]  # reference root orientation
     g = quat_apply_inverse(qr, torch.tensor([0.0, 0.0, -1.0], device=self.device).expand(n, 3))
-    for b, new in (("mean", g.mean(0)), ("var", g.var(0, unbiased=False))):
-      old = ck["wm"][f"in_norm.{b}"]
-      ck["wm"][f"in_norm.{b}"] = torch.cat([old[:1], new.to(old), old[7:]])
+    m_old, v_old = ck["wm"]["in_norm.mean"], ck["wm"]["in_norm.var"]
+    g_mean = torch.stack([-m_old[1 + 4], -m_old[1 + 5], g.mean(0)[2].to(m_old)])
+    g_var = torch.stack([v_old[1 + 4], v_old[1 + 5], g.var(0, unbiased=False)[2].to(v_old)])
+    ck["wm"]["in_norm.mean"] = torch.cat([m_old[:1], g_mean, m_old[7:]])
+    ck["wm"]["in_norm.var"] = torch.cat([v_old[:1], g_var, v_old[7:]])
     print(f"[Trainer] world model grafted heading frame -> root frame: input {w.shape[1]} -> {len(cols)}, gravity mean "
-          f"{g.mean(0).cpu().numpy().round(3).tolist()} std {g.std(0).cpu().numpy().round(3).tolist()}; "
-          f"policy_delay {self.cfg.policy_delay}, policy_freeze {self.cfg.policy_freeze}")
+          f"{g_mean.cpu().numpy().round(3).tolist()} std {g_var.sqrt().cpu().numpy().round(3).tolist()}; "
+          f"policy_delay {self.cfg.policy_delay} (WM lr x{self.cfg.wm_delay_lr}), policy_freeze {self.cfg.policy_freeze}")
 
   @torch.no_grad()
   def _calibrate_goal_norm(self, segments: list[str], n: int = 65536) -> None:
@@ -731,6 +746,14 @@ class Trainer:
     best = max(e for _, e in self.wd_hist)
     return self.wd_reward_ema >= best - 0.5 * self.cfg.wd_drop
 
+  def _set_wm_lr_mult(self, mult: float) -> None:
+    """World-model learning rate = schedule x lr_scale x mult (policy_delay boost)."""
+    sch = self.sched[0]
+    sch.base_lrs = [b * self.lr_scale * mult for b in self._base_lrs0[0]]
+    for grp, b in zip(sch.optimizer.param_groups, sch.base_lrs):
+      grp["lr"] = b * sch.lr_lambdas[0](self.it)
+    print(f"[Trainer] it {self.it}: world-model lr x{mult} -> {sch.optimizer.param_groups[0]['lr']:.2e}", flush=True)
+
   def _set_lr_scale(self, scale: float) -> None:
     self.lr_scale = scale
     for sch, b0 in zip(self.sched, self._base_lrs0):
@@ -783,6 +806,8 @@ class Trainer:
     policy_from = self.it + cfg.policy_delay  # WM-only fitting before this iteration
     step_from = policy_from + cfg.policy_freeze  # critic-only (imagination without policy steps) before this one
     self.wd_quiet_until = max(self.wd_quiet_until, step_from + cfg.wd_warmup)
+    if self.it < policy_from and cfg.wm_delay_lr != 1.0:
+      self._set_wm_lr_mult(cfg.wm_delay_lr)
     t_log = time.time()
     steps_at_log = self.env_steps
     agg: dict[str, list[float]] = {}
@@ -800,6 +825,8 @@ class Trainer:
           self.collect_step()
         continue
       t1 = time.time()
+      if self.it == policy_from and cfg.policy_delay and cfg.wm_delay_lr != 1.0:
+        self._set_wm_lr_mult(1.0)
       m_wm = self.update_world_model()
       t2 = time.time()
       m_pi = self.update_policy(step_policy=self.it >= step_from) if self.it >= policy_from else {}

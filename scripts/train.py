@@ -59,6 +59,7 @@ def main():
                       "heading-frame checkpoint starts a fresh WM -> use --policy_delay")
   p.add_argument("--policy_delay", type=int, default=0, help="iterations of world-model-only fitting after start / resume")
   p.add_argument("--policy_freeze", type=int, default=0, help="then iterations of critic fitting without policy steps")
+  p.add_argument("--wm_delay_lr", type=float, default=1.0, help="world-model lr multiplier during --policy_delay")
   p.add_argument("--wm_batches", type=int, default=10)
   p.add_argument("--wm_windows", type=int, default=2048)
   p.add_argument("--wm_k", type=int, default=8)
@@ -146,6 +147,7 @@ def main():
                      body_frame=args.wm_body_frame),
     policy_delay=args.policy_delay,
     policy_freeze=args.policy_freeze,
+    wm_delay_lr=args.wm_delay_lr,
     heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos, goal_ref_root=args.goal_ref_root, critic_errors=args.critic_errors,
                    ee_term_z=args.ee_term_z),
   )
