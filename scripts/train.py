@@ -60,6 +60,9 @@ def main():
   p.add_argument("--policy_delay", type=int, default=0, help="iterations of world-model-only fitting after start / resume")
   p.add_argument("--policy_freeze", type=int, default=0, help="then iterations of critic fitting without policy steps")
   p.add_argument("--wm_delay_lr", type=float, default=1.0, help="world-model lr multiplier during --policy_delay")
+  p.add_argument("--lr_scale", type=float, default=None,
+                 help="override the learning-rate scale restored from --resume (watchdog halvings accumulate along a resume "
+                      "chain: the G1 v2 chain carried 0.0625 from round 15 on)")
   p.add_argument("--wm_batches", type=int, default=10)
   p.add_argument("--wm_windows", type=int, default=2048)
   p.add_argument("--wm_k", type=int, default=8)
@@ -160,6 +163,9 @@ def main():
   trainer = Trainer(cfg)
   if args.resume:
     trainer.load(args.resume)
+  if args.lr_scale is not None:
+    trainer._set_lr_scale(args.lr_scale)
+    print(f"[train] lr_scale set to {args.lr_scale} (policy lr {trainer.opt_pi.param_groups[0]['lr']:.2e})")
   trainer.run()
 
 
