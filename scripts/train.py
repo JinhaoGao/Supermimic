@@ -169,7 +169,7 @@ def main():
   p.add_argument("--wm_delay_lr", type=float, default=1.0, help="world-model lr multiplier during --policy_delay")
   p.add_argument("--resume_lr_scale", type=float, default=None,
                  help="override the run-time learning-rate scale restored from --resume (watchdog halvings accumulate along a "
-                      "resume chain: the bj27 G1 v2 chain carried 0.0625 from round 15 on); not --lr_scale, which multiplies "
+                      "resume chain: the bj27 G1 v2 chain carried 0.0625 from round 15 on); not --base_lr_scale, which multiplies "
                       "the base learning rate")
   p.add_argument("--wm_batches", type=int, default=10)
   p.add_argument("--wm_windows", type=int, default=2048)
@@ -222,11 +222,18 @@ def main():
                       "rollback drops the evals of the abandoned branch; a --resume at an eval slot evaluates the loaded "
                       "weights first. Default off")
   p.add_argument("--es_patience", type=int, default=2, help="consecutive bad evals before the early stop (default 2)")
+  p.add_argument("--es_median_floor", type=float, default=1.0,
+                 help="floor of the previous evals' median failed count in the early-stop threshold (default 1; with "
+                      "single-digit failures on a 1024-clip eval set 5, else a median of 2 makes 3 failures bad)")
   p.add_argument("--no_compile", action="store_true")
   p.add_argument("--compile_mode", type=str, default=None, help="e.g. reduce-overhead or max-autotune")
   p.add_argument("--num_threads", type=int, default=0, help="CPU threads: OMP/MKL/OpenBLAS env + torch.set_num_threads (0 = leave defaults)")
   # Data parallel (only active under torchrun with more than one process).
-  p.add_argument("--lr_scale", type=float, default=1.0, help="multiply policy / critic / world-model LR (e.g. for the larger DDP batch); default 1 = paper LR")
+  p.add_argument("--base_lr_scale", type=float, default=1.0,
+                 help="multiply the policy / critic / world-model base LR (e.g. for the larger DDP batch); default 1 = paper LR")
+  # Removed name (10-26 consolidation): on ddp-bj31-v2 it was the base multiplier above, on master 7afc772 the run-time override
+  # now called --resume_lr_scale. Old launch scripts would silently get the other meaning, so it is an error.
+  p.add_argument("--lr_scale", type=float, default=None, help=argparse.SUPPRESS)
   p.add_argument("--dist_timeout_min", type=float, default=120.0, help="process-group timeout; must exceed one evaluation on rank 0 (and a cache build)")
   p.add_argument("--sampler_sync_interval", type=int, default=0, help="iterations between reset-sampler merges across ranks (0 = --log_interval)")
   p.add_argument("--param_check_interval", type=int, default=1000, help="iterations between cross-rank learned-state hash checks (0 = start/end only)")
@@ -235,6 +242,9 @@ def main():
   p.add_argument("--sampler_clamp_returns", action="store_true",
                  help="clamp reset-sampler bin returns to [0, g_max] (EMA input, sampled G, bin_G loaded on resume / rollback)")
   args = p.parse_args()
+  if args.lr_scale is not None:
+    p.error("--lr_scale no longer exists (10-26): use --base_lr_scale to multiply the base learning rate (data-parallel "
+            "branch meaning) or --resume_lr_scale to override the run-time scale restored by --resume (master 7afc772 meaning)")
   if args.motion_list and (args.motion_dirs or args.blacklist or args.name_exclude or args.max_motions):
     p.error("--motion_list replaces --motion_dirs / --blacklist / --name_exclude / --max_motions (give one or the other)")
   if not args.motion_list and not args.motion_dirs:
@@ -294,7 +304,7 @@ def main():
   else:
     files, log_dir = None, None
   files, log_dir = dctx.broadcast_object((files, log_dir))
-  lr = args.lr * args.lr_scale
+  lr = args.lr * args.base_lr_scale
   cfg = TrainCfg(
     motion_files=files,
     robot=args.robot,
@@ -352,9 +362,10 @@ def main():
     wd_baseline_after_warmup=args.wd_baseline_after_warmup,
     es_eval_fail_ratio=args.es_eval_fail_ratio,
     es_patience=args.es_patience,
+    es_median_floor=args.es_median_floor,
     compile_mode=args.compile_mode,
     world_size=dctx.world,
-    base_lr_scale=args.lr_scale,
+    base_lr_scale=args.base_lr_scale,
     sampler_sync_interval=args.sampler_sync_interval,
     sampler_clamp_returns=args.sampler_clamp_returns,
     param_check_interval=args.param_check_interval,
@@ -369,8 +380,8 @@ def main():
   os.makedirs(log_dir, exist_ok=True)
   if dctx.is_main:
     print(f"[train] log_dir = {log_dir}")
-    if args.lr_scale != 1.0:
-      print(f"[train] lr_scale {args.lr_scale}: policy / critic / world-model lr = {lr:g}")
+    if args.base_lr_scale != 1.0:
+      print(f"[train] base_lr_scale {args.base_lr_scale}: policy / critic / world-model lr = {lr:g}")
     with open(os.path.join(args.log_root, "last_run.txt"), "a") as f:
       f.write(log_dir + "\n")
     with open(os.path.join(log_dir, "motion_files.txt"), "w") as f:

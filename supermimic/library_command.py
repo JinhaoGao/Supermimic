@@ -11,6 +11,8 @@ termination functions keep working, but:
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -124,7 +126,8 @@ class LibraryMotionCommand(MotionCommand):
     # Source / name prior for the uniform share of the reset distribution (v2, see reset_prior); None = uniform.
     # A pure function of the clip list and the cfg: every DDP rank builds the same one (Trainer checks it).
     self.bin_prior: torch.Tensor | None = reset_prior(
-      [c.name for c in lib.clips], lib.bin_clip, cfg.source_weights, cfg.name_weights, self.device
+      [c.name for c in lib.clips], lib.bin_clip, cfg.source_weights, cfg.name_weights, self.device,
+      log=print if int(os.environ.get("RANK", "0")) == 0 else (lambda *a, **k: None),  # once under torchrun
     )
     # Cluster-balanced prior (allmimic, see bin_clusters.py; 10-26) mixed into the source / keyword prior of the uniform
     # share: (1 - cluster_mix) x source / keyword prior + cluster_mix x cluster prior. A mixture, not a product: both
@@ -254,7 +257,8 @@ class LibraryMotionCommand(MotionCommand):
     clamp a penalty-dominated clip-end bin, G << 0 via the r_last / (1 - gamma) bootstrap, takes all softmax mass).
     Returns (bins clamped, min before)."""
     g_min = float(self.bin_G.min()) if self.bin_G.numel() else 0.0
-    n = int(((self.bin_G < 0.0) | (self.bin_G > self.cfg.g_max)).sum())
+    n = int(((self.bin_G < 0.0) | (self.bin_G > self.cfg.g_max) | ~torch.isfinite(self.bin_G)).sum())
+    torch.nan_to_num_(self.bin_G, nan=self.cfg.g_max * 0.5, posinf=self.cfg.g_max, neginf=0.0)  # clamp keeps NaN
     self.bin_G.clamp_(0.0, self.cfg.g_max)
     return n, g_min
 
@@ -264,7 +268,9 @@ class LibraryMotionCommand(MotionCommand):
     NB = self.library.num_bins
     # The source / name prior reshapes only the uniform share; clamp_returns acts only on the softmax's G.
     uniform = self.bin_prior if self.bin_prior is not None else torch.full((NB,), 1.0 / NB, device=self.device)
-    bin_G = self.bin_G.clamp(0.0, c.g_max) if c.clamp_returns else self.bin_G
+    # (a NaN bin_G -- e.g. from a corrupt checkpoint -- would make the whole softmax NaN: an unvisited bin's G instead)
+    bin_G = torch.nan_to_num(self.bin_G, nan=c.g_max * 0.5, posinf=c.g_max, neginf=-c.g_max)
+    bin_G = bin_G.clamp(0.0, c.g_max) if c.clamp_returns else bin_G
     G = torch.where(self.bin_visits > 0, bin_G, torch.full_like(self.bin_G, c.g_max * 0.5))
     soft = torch.softmax(-c.softmax_temp * G / c.g_max, dim=0)
     cap = getattr(c, "softmax_cap", 0.0)  # (cfg stand-ins of older tests lack the field)

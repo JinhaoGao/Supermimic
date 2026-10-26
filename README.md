@@ -12,12 +12,13 @@
 
 | 机器人 | 策略 | v4 成功率 | progress | 备注 |
 |---|---|---|---|---|
-| G1 | `g1v2_floor10_r25` model_208000 | **91.70%** | 95.36% | 站点 run 669a45a8，与离线评测逐位一致；榜 #4/307（榜首 91.83%，见下） |
+| G1 | `g1v2_ro10_8g_168k` model_174000（bj31 8 卡） | **91.83%** | — | 站点 run b43fdd83，**榜 #1**；骨盆朝向终止，goal 64 维（无 ref_root）；MPJPE 0.0851 |
+| G1 | `g1v2_floor10_r25` model_208000（bj27 单卡） | **91.70%** | 95.36% | 站点 run 669a45a8，与离线评测逐位一致；骨盆终止 + ref_root + 地面加权 |
 | E2 | `e2v2_rorootfloor_r25` model_156000 | **89.91%** | 94.35% | 站点 run 0b0ce387；E2 榜 #34/295（榜首团队 GMT 集群 90.95%） |
 | E2 | `e2v2_roroot_r26` model_164000 | 90.17% | 94.49% | 离线（同协议），未上站 |
 | G1 | v1（论文配方）model_32000 | 67.80% | — | 起点：论文去掉了末端终止，评测站按末端高度判失败 |
 
-G1 榜首 91.83% 是 bj31 8 卡数据并行线（骨盆朝向终止，model_174000，本仓库合并进来的 ddp-bj31-v2 分支训练）；它还没有用上 `--goal_ref_root`，在单卡线上这一项在骨盆终止之上 +0.5pp。
+两条 G1 线的配方不同：8 卡线（ddp-bj31-v2 分支，已并入）只开了骨盆朝向终止；单卡线另外加了 `--goal_ref_root` 和地面动作加权（单卡线上在骨盆终止之上 +0.5 / +0.3pp）。两条线成功段的并集上限 94.67%，会的段不完全重合；8 卡线的移植估计认为这两项在它那条线上收益不大，所以要逐项做同起点对照，不要整套照搬。8 卡线的完整经验和对照数据见 `docs/bj31_8gpu_handoff_1026/`（交接总结 + 合并核对清单）。
 
 论文对照实验（LAFAN1 G1 40 条，2.45 h，单卡 RTX PRO 5000，论文完整配置）：2.44 h / 16000 轮达到 benchmark 回报 0.92、40 条 0 失败；论文报告的是 SuperMimic 1.2 h（H100）0.82、PPO-Sim 18 h（8 卡）0.72。
 
@@ -42,8 +43,10 @@ G1 榜首 91.83% 是 bj31 8 卡数据并行线（骨盆朝向终止，model_1740
 | `scripts/eval_ckpt.py`、`check_fk.py`、`wm_diag.py`、`avg_ckpt.py` | 离线评测、FK 校验、世界模型诊断、权重平均 |
 | `scripts/launch_*.sh` | 集群启动脚本（bj27 单卡、bj31 多卡；路径用环境变量覆盖） |
 | `eval_site/` | 团队评测站插件 `eval_supermimic.py`、站点补丁、离线 v4 评测器 `eval_r18.sh`、提交脚本 `submit_v4.sh`、失败分析工具 |
-| `tests/` | CPU 单元测试（14 个文件，见"测试"） |
+| `tests/` | CPU 单元测试（15 个文件，见"测试"） |
+| `tools/` | 两条训练线的诊断和 bj31 运维脚本（采样器探针、退化 / 骨盆 / root_pos 逐帧复跑、v4 差距分析、自动导出上站），见 `tools/README.md` |
 | `docs/README_legacy_en.md` | 之前的英文 README（逐轮日志、数据并行实现细节、看门狗事故记录） |
+| `docs/bj31_8gpu_handoff_1026/` | bj31 8 卡线交接：经验总结（配方、对照、退化 / 骨盆 / root_pos 诊断、运维坑）和合并核对清单 |
 
 ## 安装
 
@@ -95,10 +98,29 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 PORT=29521 NPROC=4 ROOT=/data/supermimic VENV=~/sup
 bash scripts/stop_bj31_ddp.sh <run_name>
 ```
 
-同一台机器跑两个多卡任务要各用一组 GPU 和各自的 `PORT`；控制台日志只有 rank 0，每个 rank 的完整输出在 `$ROOT/runs/<run>_ranks/`。
+同一台机器跑两个多卡任务要各用一组 GPU 和各自的 `PORT`；控制台日志只有 rank 0，每个 rank 的完整输出在 `$ROOT/runs/<run>_ranks/`。8 卡 H48 约 0.89~0.95 s/轮（全局 36k env-step/s），每轮约相当于单卡的 1.6 倍样本效率（经验估计）；LR 不随卡数缩放。
+
+bj31 8 卡线（G1 91.83%）的生产参数（从 model_174000 续训；`--iterations` 是绝对终点）：
+
+```bash
+NPROC=8 bash scripts/launch_bj31_ddp.sh <run> --num_threads 24 --motion_list <g1 列表> --robot g1 --robot_variant eval+evalcontact \
+  --ee_term_z 0.25 --source_weights $SW --name_weights $NW --sampler_clamp_returns --num_envs 4096 --rollouts 4096 --H 48 \
+  --wm_batches 10 --wm_windows 2048 --wm_k 8 --lr 8.9252e-4 --lr_decay_iters 250000 --iterations <终点> --seed 0 \
+  --wd_drop 0.2 --wd_reward_floor -1.0 --wd_signal imagined_reward_alive --num_workers 64 \
+  --eval_clip_names <1024 条评测名单> --eval_interval 2000 --eval_envs 1024 --es_eval_fail_ratio 1.5 --es_patience 2 \
+  --ckpt_interval 2000 --log_interval 50 --param_check_interval 1000 --root_ori_term 1.0 --root_ori_term_temp 0.05 \
+  --resume warmstart_ori8g_model_174000.pt
+```
+
+**两套看门狗风格**（合并后默认值随 8 卡分支：`imagined_reward_norm`、warmup 500、一触发就回滚；两种风格都要显式写全）：
+- bj31 8 卡线：`--wd_signal imagined_reward_alive --wd_reward_floor -1.0`（不加 alive + floor 时，norm 会被死后发散的世界模型拖到 −17 / −35 造成误回滚）。
+- bj27 单卡线：`--wd_sustain 200 --wd_warmup 1500 --wd_baseline_after_warmup --wd_signal imagined_reward_robust`。
+
+**学习率**：实际 policy LR = `--lr` × ckpt 里继承的运行时 lr_scale × λ(it)，λ(t) = 0.03 + 0.97·½(1 + cos(π·t/250000))（λ(160k) = 0.309，λ(174k) = 0.235，λ(208k) = 0.096）。看门狗每回滚一次 lr_scale 减半，写进之后所有 ckpt：8 卡线的 ckpt 带 0.0625（8.9252e-4 × 0.0625 × 0.2349 = 1.31e-5），单卡 G1 线带 0.25。陷阱：在继承了 1/16 的 ckpt 上照旧写 `--lr 5e-5`，实际 LR 只有约 5e-7（bj27 r16–r18 掉进过）。每次续训后先看日志里的 `resumed … (policy lr X = lr x lr_scale Y x cosine Z)` 这一行。
 
 续训要点：
-- `--resume` 恢复权重、优化器、采样器统计和运行时 lr_scale（看门狗每次回滚减半，会沿续训链累积）；`--resume_lr_scale X` 覆盖它。`--lr_scale` 是另一回事：基础学习率的倍数（多卡放大 batch 时用）。
+- `--resume` 恢复权重、优化器、采样器统计和运行时 lr_scale；`--resume_lr_scale X` 覆盖运行时 lr_scale，`--base_lr_scale` 是基础学习率倍数。**`--lr_scale` 已删除**（两个分支里它的含义不同，旧脚本会静默多乘一次），用了会直接报错。
+- 续训时 `_resume_diffs` 会对和 ckpt 不同的设置逐条打 WARNING（机器人 / 先验 / 钳位 / 课程 / H / heads / 片段表 / `input_clip` 与 `--fixes` 各项 / 执行噪声 / UTD / 世界模型坐标系 / 采样器封顶与聚类），续训后先看这些行。注意末端终止默认开（0.25），EE 关的旧 ckpt 不加旗标续训会被打开。
 - 新加 policy / critic 输入（`--goal_ref_root`、`--critic_errors`）续训时自动嫁接：旧列原位、新列零初始化、Adam 动量跟着搬，新 goal 段的归一化统计从 65k 库帧校准，嫁接后网络输出与原来一致。
 - 世界模型表示换成本体系（`--wm_body_frame`）续训时也会嫁接，配合 `--policy_delay N --wm_delay_lr 6` 先只训世界模型。
 
@@ -109,20 +131,20 @@ bash scripts/stop_bj31_ddp.sh <run_name>
 | 想象 | `--H 48`、`--rollouts`、`--env_steps_per_iter` | 想象步数（论文 32）；每次更新采样的仿真步数（2.5 试过：无收益且慢 15%） |
 | 终止 | `--ee_term_z 0.25` 或 `--ee_termination/--no_ee_termination --ee_threshold` | 末端高度终止（论文去掉了，评测站要）；默认开 0.25 m |
 | | `--root_ori_term 1.0 --root_ori_term_temp 0.05 [--root_ori_body]` | 根（G1 骨盆）全角含 yaw 终止 = 评测站 root_ori 判据；**有效**（bj31 线 +1.1pp，单卡线 +0.2~0.3） |
-| | `--root_z_term 0.25` | 根高度终止 = 评测站 root_pos 判据（训练原来判躯干高度）；10-26 新加，待 r28 验证 |
+| | `--root_z_term 0.25` | 根高度终止 = 评测站 root_pos 判据；8 卡线逐帧复跑 42 条 root_pos 失败：34 条躯干高度判据已先触发，40 条是跳不到参考高度（能力问题），预期无收益，r28 同起点对照中 |
 | goal / critic | `--goal_ref_root` | goal 每帧加参考躯干高度 + 本体系线/角速度 + 重力（10 维，只用参考侧，可部署）；**有效**（骨盆终止之上 +0.5pp，E2 +0.4） |
 | | `--critic_errors` | critic 加特权跟踪误差特征；无效 |
 | 世界模型 | `--wm_body_frame`、`--policy_delay`、`--policy_freeze`、`--wm_delay_lr` | 本体系 WM（去掉俯仰 ±90° 的航向奇异）；无收益，翻腾失败阶段不变 |
 | 采样器 | `--source_weights`、`--name_weights` | 来源 / 关键词先验（只作用在均匀份额上） |
 | | `--sampler_clamp_returns` | bin 回报钳到 [0, g_max]；**有效**（+0.8，防片尾负奖励吸走全部份额） |
 | | `--sampler_cap 50` | softmax 份额每 bin 封顶 50×均匀（allmimic）；G1 r25 时一半重置落在 0.03% 的 bin 上；待 r28 验证 |
-| | `--sampler_clusters 256 --sampler_cluster_alpha 0.3 --sampler_cluster_mix 0.5` | 12 个运动学特征 k-means 聚类，簇份额 ∝ n^0.3，与来源先验混合；待 r28 验证 |
+| | `--sampler_clusters 256 --sampler_cluster_alpha 0.3 --sampler_cluster_mix 0.5` | 12 个运动学特征 k-means 聚类，簇份额 ∝ n^0.3；与来源 / 关键词先验按 mix 混合而不是相乘（相乘时两者都给翻腾加权，翻腾 bin 占 0.08% 却拿到 G1 均匀份额的 34%；混合后约 4%）；待 r28 验证 |
 | | `--sampler_boot_mean` | 片尾超时用平均奖励自举（替代 r_last） |
 | | `--hard_names --hard_term_schedule` | 难片段放宽终止的课程；短课程无收益 |
 | 修复 | `--fixes` | 开源对照发现的六项：输入钳位 ±50σ、价值钳位、critic 按存活加权、想象片尾截断 + 自举、WM 前缀掩码、观测用干净动作；整体在噪声内，最好的模型都开着 |
 | 看门狗 | `--wd_sustain`、`--wd_warmup`、`--wd_baseline_after_warmup`、`--wd_signal`、`--wd_reward_floor`、`--wd_nf_patience` | 想象奖励塌缩 / critic 损失爆炸 / 连续非有限时回滚到健康 checkpoint 并减半 LR；默认 = 多卡分支行为（立即回滚），单卡线用括号里那组 |
-| 提前停止 | `--es_eval_fail_ratio 1.5 --es_patience 2` | 训练内评测失败数连续超中位数 1.5 倍即停，另存 `model_best_eval.pt` |
-| 学习率 | `--lr`、`--lr_decay_iters`、`--lr_scale`、`--resume_lr_scale` | 余弦到 25 万轮剩 3%；后期调高 LR 有害，退火无收益 |
+| 提前停止 | `--es_eval_fail_ratio 1.5 --es_patience 2 [--es_median_floor 5]` | 训练内评测失败数连续超中位数 1.5 倍即停，另存 `model_best_eval.pt`；中位数下限默认 1，失败数个位数时过敏，建议 5；评测连续失败 3 次才关闭并明确提示 |
+| 学习率 | `--lr`、`--lr_decay_iters`、`--base_lr_scale`、`--resume_lr_scale` | 余弦到 25 万轮剩 3%；后期调高 LR 有害，退火无收益；`--lr_scale` 已删除 |
 
 ## 评测
 
@@ -150,13 +172,28 @@ unitree_mujoco（G1）里有两个 FSM 模式，按 ONNX 的 goal 格式区分�
 
 ## 实验结论（G1 / E2 全量，v4 成功率）
 
-有效：末端终止 + 评测站机器人模型（v1 67.8% → v2 85.7%）、难片段课程（腾空 1/13 → 13/13）、采样器钳位（+0.8）、骨盆朝向终止（+0.2~1.1）、goal 根部运动（+0.5）、地面动作加权（长程 +0.3~0.4）。
+有效（两条线合计）：末端终止（同起点 +8.8；v1 67.8% → v2 85.7%）、H32 → H48（+1.9）、来源加权采样（+3.7）、难片段课程（腾空 1/13 → 13/13，总分 −0.6）、采样器钳位（+0.8）、骨盆朝向终止（8 卡线 4+4 卡同起点六点全部领先，三点均值 +1.12；单卡线 +0.2~0.3，因为末端失败多了约 25 条）、goal 根部运动（单卡线骨盆终止之上 +0.5）、地面动作加权（单卡线长程 +0.3~0.4）、看门狗 alive 信号 + 奖励下限（8 卡线误回滚从 3 次到 0 次）。
 
-无效或噪声内：开源对照六项修复、critic 特权误差、本体系世界模型、UTD 2.5、骨盆终止收紧到 0.8、短难片段课程、checkpoint 权重平均、后期提高 / 降低学习率。
+无效或噪声内：开源对照六项修复、critic 特权误差、本体系世界模型、UTD 2.5、骨盆终止收紧到 0.8（两条线都不支持）、短难片段课程、checkpoint 权重平均、后期提高 / 降低学习率、8 卡从零训全量三层数据（H32、不加权，峰值 84.75 后退化）。
+
+有害：H32 长续训（执行噪声 σ=0.1 下"峰后持续退化"，116k 88.51 → 212k 79.61；干预实验显示策略依赖训练时的执行噪声，确定性闭环会抖）——要看训练内评测 `eval/failed`（与 v4 相关 −0.98，比悬崖早约 2.8 万轮）并开早停。
 
 翻腾：失败基本都发生在参考第一次倒立后 0.6 s 内（18/21），换本体系世界模型不变；r28 用采样器封顶 + 聚类和"只训翻腾"的诊断实验区分是数据被稀释还是配方本身的问题。
 
 单 checkpoint 的 v4 噪声约 ±0.3~0.5pp，比较配方要看多个点的均值。
+
+## 合并后的默认值变化（相对合并前的 master 60f6b6a）
+
+| 项目 | 合并前 master | 合并后 | 想要原 master 行为时 |
+|---|---|---|---|
+| 末端终止 | 关（`--ee_term_z 0`） | 开，0.25 | `--no_ee_termination` 或 `--ee_term_z 0` |
+| `--wd_signal` | `imagined_reward_robust` | `imagined_reward_norm` | `--wd_signal imagined_reward_robust` |
+| 看门狗 warmup / 基线 / sustain | 1500 / warmup 后才计基线 / 200 | 500 / 从第 1 轮起 / 1 | `--wd_warmup 1500 --wd_baseline_after_warmup --wd_sustain 200` |
+| 非有限的想象奖励 | 立即回滚 | 当暂态跳步，连续 `--wd_nf_patience 100` 轮才回滚 | — |
+| `--lr_scale` | 续训覆盖运行时 lr_scale | 已删除（报错） | `--resume_lr_scale`；基础倍数是 `--base_lr_scale` |
+| 簇先验 | 乘到来源先验上 | 混合（`--sampler_cluster_mix 0.5`） | `--sampler_cluster_mix 1` 只用簇先验（没有相乘模式） |
+
+默认开关下，合并后的代码与 master 60f6b6a 逐位一致（CPU 6 轮，final ckpt 全部张量相同）；与 ddp-bj31-v2 42b211e 不逐位（e59e947 改了世界模型窗口损失的归一化），所以 8 卡线的数值轨迹只能统计意义上复现。
 
 ## 与论文的差异 / 论文没说清的选择
 

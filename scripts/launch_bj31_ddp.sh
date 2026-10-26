@@ -88,7 +88,7 @@ fi
 {
   echo "[launch] $(date '+%F %T') host $(hostname) commit $(cat "$REPO_DIR/COMMIT" 2>/dev/null || echo '?')"
   if [ -n "${CUDA_VISIBLE_DEVICES:-}" ] || [ -n "$PORT" ]; then
-    echo "[launch] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<all>} rendezvous ${PORT:+localhost:$PORT}${PORT:-standalone}"
+    echo "[launch] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<all>} rendezvous $([ -n "$PORT" ] && echo "localhost:$PORT" || echo standalone)"
   fi
   echo "[launch] $CMDQ"
 } > "$LOG"

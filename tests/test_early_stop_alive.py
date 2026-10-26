@@ -556,8 +556,11 @@ def test_es_survives_a_failing_evaluator():
     t = loop_trainer(d, es_eval_fail_ratio=1.5, eval_raises_at=2)
     with mock.patch("traceback.print_exc"):
       r = run_loop(t)
+    # 10-26: evaluation goes off only after EVAL_MAX_ERRORS (3) failures in a row, and says so (was: after the first, silently)
     assert r["it"] == 44 and t.es_stop is None and len(t.es_hist) == 2 and t.cfg.eval_enabled is False
-    assert r["evals"] == [4, 8, 12] and "[eval] failed: RuntimeError('evaluator died (test)')" in r["stdout"]
+    assert r["evals"] == [4, 8, 12, 16, 20], r["evals"]
+    assert "[eval] failed (1 in a row, off after 3): RuntimeError('evaluator died (test)')" in r["stdout"]
+    assert "in-training evaluation OFF for the rest of the run -- the early stop is inactive from here" in r["stdout"]
 
 
 # ---------------------------------------------------------------------------

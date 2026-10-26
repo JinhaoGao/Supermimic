@@ -117,7 +117,7 @@ class TrainCfg:
   num_threads: int = 0  # torch intra-op CPU threads (0 = torch default); scripts/train.py also sets OMP_NUM_THREADS
   # Data parallel (torchrun). Every rank: num_envs envs + rollouts_per_update rollouts (global = world_size x).
   world_size: int = 1  # informational (set by scripts/train.py from torchrun)
-  base_lr_scale: float = 1.0  # --lr_scale, already folded into policy_lr / critic_lr / wm.lr (record only)
+  base_lr_scale: float = 1.0  # --base_lr_scale, already folded into policy_lr / critic_lr / wm.lr (record only)
   sampler_sync_interval: int = 0  # iterations between reset-sampler merges across ranks (0 = log_interval)
   param_check_interval: int = 1000  # iterations between cross-rank state hash checks (0 = only at start / end)
   dist_timeout_min: float = 120.0  # process-group timeout; must exceed one evaluation (and a cache build)
@@ -182,6 +182,7 @@ class TrainCfg:
   # the loaded weights are evaluated before the first update (history and best start from them).
   es_eval_fail_ratio: float | None = None
   es_patience: int = 2
+  es_median_floor: float = 1.0  # floor of the previous evals' median failed count (see early_stop_verdict)
   # Logging / eval / checkpoints.
   log_interval: int = 50
   eval_interval: int = 2000
@@ -271,6 +272,7 @@ def cfg_dict(cfg: "TrainCfg") -> dict:
 WD_SIGNALS = {"imagined_reward_norm": "imagined reward", "imagined_reward_alive": "imagined alive reward",
               "imagined_reward_robust": "imagined robust reward"}  # -> log label
 ES_MIN_PREV = 3  # early stop: previous evals needed before the first verdict
+EVAL_MAX_ERRORS = 3  # in-training evaluation is switched off after this many failures in a row
 
 
 def _check_cfg(cfg: TrainCfg) -> None:
@@ -280,15 +282,21 @@ def _check_cfg(cfg: TrainCfg) -> None:
     raise ValueError(f"early stop needs es_eval_fail_ratio > 0 and es_patience >= 1 (got {cfg.es_eval_fail_ratio}, {cfg.es_patience})")
   if cfg.hard_term_schedule and not cfg.hard_names:
     raise ValueError("hard_term_schedule needs hard_names (the hard set it applies to)")
+  f = cfg.wd_reward_floor  # nan = silently off, inf = a rollback every wd_nf_patience its, > 0 masks every collapse
+  if f is not None and not (math.isfinite(float(f)) and float(f) <= 0.0):
+    raise ValueError(f"wd_reward_floor must be finite and <= 0 (normalized reward; production -1.0), got {f}")
+  if not cfg.es_median_floor >= 1.0:
+    raise ValueError(f"es_median_floor must be >= 1, got {cfg.es_median_floor}")
 
 
-def early_stop_verdict(prev_failed: list, failed: float, ratio: float) -> tuple[bool, float | None]:
+def early_stop_verdict(prev_failed: list, failed: float, ratio: float, median_floor: float = 1.0) -> tuple[bool, float | None]:
   """Is an eval with ``failed`` failures bad, given the failed counts of all previous evals of the run? ->
-  (bad, threshold). threshold = ratio x max(median(prev), 1) once there are ES_MIN_PREV previous evals (the floor at 1
-  keeps a median of 0 failures from making every later eval bad), else (False, None)."""
+  (bad, threshold). threshold = ratio x max(median(prev), median_floor) once there are ES_MIN_PREV previous evals (the
+  floor keeps a median of 0 failures from making every later eval bad; at the default 1 a median of 2 already makes 3
+  failures bad -- --es_median_floor 5 for 1024-clip evals with single-digit failures), else (False, None)."""
   if len(prev_failed) < ES_MIN_PREV:
     return False, None
-  thr = float(ratio) * max(float(np.median(np.asarray(prev_failed, dtype=np.float64))), 1.0)
+  thr = float(ratio) * max(float(np.median(np.asarray(prev_failed, dtype=np.float64))), float(median_floor))
   return bool(float(failed) >= thr), thr
 
 
@@ -886,6 +894,27 @@ class Trainer:
     ]
     if "H" in ck_cfg:
       pairs.append(("H", int(ck_cfg["H"]), int(cur.H)))
+    # Master-side settings (10-25 / 10-26) that change the forward pass, the targets or the sampling without being in
+    # any state_dict: a resume that forgets --fixes silently drops input_clip from 50 back to 10, etc.
+    pairs += [
+      ("input_clip", float(ck_cfg.get("input_clip", 10.0)), float(cur.input_clip)),
+      ("clip_values", bool(ck_cfg.get("clip_values", False)), bool(cur.clip_values)),
+      ("critic_weight_survival", bool(ck_cfg.get("critic_weight_survival", False)), bool(cur.critic_weight_survival)),
+      ("imag_truncate", bool(ck_cfg.get("imag_truncate", False)), bool(cur.imag_truncate)),
+      ("wm_prefix_mask", bool(ck_cfg.get("wm_prefix_mask", False)), bool(cur.wm_prefix_mask)),
+      ("clean_prev_action", bool(ck_cfg.get("clean_prev_action", False)), bool(cur.clean_prev_action)),
+      ("action_noise_std", float(ck_cfg.get("action_noise_std", 0.1)), float(cur.action_noise_std)),
+      ("env_steps_per_iter", float(ck_cfg.get("env_steps_per_iter", 1.0)), float(cur.env_steps_per_iter)),
+      ("wm.body_frame", bool((ck_cfg.get("wm") or {}).get("body_frame", False)), bool(cur.wm.body_frame)),
+      ("sampler_cap", float(ck_cfg.get("sampler_cap", 0.0)), float(cur.sampler_cap)),
+      ("sampler_clusters", int(ck_cfg.get("sampler_clusters", 0)), int(cur.sampler_clusters)),
+      ("sampler_boot_mean", bool(ck_cfg.get("sampler_boot_mean", False)), bool(cur.sampler_boot_mean)),
+    ]
+    if int(ck_cfg.get("sampler_clusters", 0)) or int(cur.sampler_clusters):
+      pairs += [
+        ("sampler_cluster_alpha", float(ck_cfg.get("sampler_cluster_alpha", 0.3)), float(cur.sampler_cluster_alpha)),
+        ("sampler_cluster_mix", float(ck_cfg.get("sampler_cluster_mix", 0.5)), float(cur.sampler_cluster_mix)),
+      ]
     diffs = [f"{k} = {a!r} in the checkpoint, {b!r} here" for k, a, b in pairs if a != b]
     try:
       hk = HeadsCfg.from_dict(ck_cfg["heads"])
@@ -946,9 +975,10 @@ class Trainer:
     self.env_steps = ck["env_steps"]
     for s in self.sched:
       s.last_epoch = self.it
-    if not rollback and float(ck.get("lr_scale", 1.0)) != 1.0:
-      self._set_lr_scale(float(ck["lr_scale"]))
-      self._print(f"[Trainer] lr_scale {self.lr_scale} restored from checkpoint")
+    if not rollback:  # also at 1.0: the optimizer state brought the saved lr, not this run's --lr (resumed line below)
+      self._set_lr_scale(float(ck.get("lr_scale", 1.0)))
+      if self.lr_scale != 1.0:
+        self._print(f"[Trainer] lr_scale {self.lr_scale} restored from checkpoint")
     if new_goal:
       self._calibrate_goal_norm(new_goal)
     self.wd_healthy_ckpt = path
@@ -1504,7 +1534,8 @@ class Trainer:
       ckpt_slot |= cfg.wd_enabled and cfg.wd_early_ckpt > 0 and self.it == cfg.wd_early_ckpt and self.wd_healthy_ckpt is None
       eval_slot = bool(cfg.eval_interval) and self.it % cfg.eval_interval == 0
       check_slot = bool(cfg.param_check_interval) and self.it % cfg.param_check_interval == 0
-      if dctx.enabled and (self.it % sync_every == 0 or ckpt_slot or check_slot):
+      # eval slots too: model_best_eval.pt (saved by rank 0 at an eval) must hold the merged sampler statistics
+      if dctx.enabled and (self.it % sync_every == 0 or ckpt_slot or check_slot or eval_slot):
         self._merge_sampler()
 
       if self.it % cfg.log_interval == 0:
@@ -1593,13 +1624,21 @@ class Trainer:
       print(f"[eval it {self.it}] return {sc['return_mean']:.4f} min {sc['return_min']:.3f} failed {int(sc['failed'])}/{res['num_clips']}{ori} ({time.time()-te:.0f}s)", flush=True)
       with open(os.path.join(cfg.log_dir, "eval.jsonl"), "a") as f:
         f.write(json.dumps({"it": self.it, "env_steps": self.env_steps, "wall_s": time.time() - self._t_start, **res["scalars"], "failed_clips": res["failed_clips"]}) + "\n")
+      self._eval_errors = 0
       return {"failed": float(res["scalars"]["failed"]), "return_mean": float(res["scalars"]["return_mean"]), "num_clips": int(res["num_clips"])}
     except Exception as e:  # noqa: BLE001
       import traceback
 
       traceback.print_exc()
-      print(f"[eval] failed: {e!r}", flush=True)
-      cfg.eval_enabled = False
+      # A transient failure (e.g. a CUDA OOM next to another job) must not end evaluation -- and with it the early stop --
+      # silently for the rest of the run: off only after EVAL_MAX_ERRORS failures in a row, and then said loudly.
+      self._eval_errors = getattr(self, "_eval_errors", 0) + 1
+      if self._eval_errors >= EVAL_MAX_ERRORS:
+        cfg.eval_enabled = False
+        print(f"[eval] failed {self._eval_errors} times in a row ({e!r}): in-training evaluation OFF for the rest of the run"
+              + (" -- the early stop is inactive from here" if self._es_on else ""), flush=True)
+      else:
+        print(f"[eval] failed ({self._eval_errors} in a row, off after {EVAL_MAX_ERRORS}): {e!r}", flush=True)
       return None
 
   # ---------------------------------------------------------------------------
@@ -1641,7 +1680,7 @@ class Trainer:
       return False
     failed, ret = float(ev["failed"]), float(ev["return_mean"])
     prev = [h["failed"] for h in self.es_hist]
-    bad, thr = early_stop_verdict(prev, failed, cfg.es_eval_fail_ratio)
+    bad, thr = early_stop_verdict(prev, failed, cfg.es_eval_fail_ratio, cfg.es_median_floor)
     self.es_streak = self.es_streak + 1 if bad else 0
     self.es_hist.append({"it": self.it, "failed": failed, "return_mean": ret, "threshold": thr, "bad": bad, "streak": self.es_streak})
     b = self.es_best
