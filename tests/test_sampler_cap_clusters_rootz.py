@@ -8,6 +8,8 @@ import sys
 import tempfile
 import types
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))  # the repo root
+
 import numpy as np
 import torch
 
@@ -26,7 +28,7 @@ def iterative_cap(p, cap, iters=200):
 
 
 def test_cap_simplex():
-  from supermimic.library_command import cap_simplex
+  from supermimic.math_utils import cap_simplex
 
   g = torch.Generator().manual_seed(0)
   for n, temp in ((1000, 25.0), (50_000, 25.0), (200_000, 40.0)):

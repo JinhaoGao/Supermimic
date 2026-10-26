@@ -2,6 +2,12 @@
 import types
 from dataclasses import asdict
 
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))  # the repo root
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import test_sampler_clamp  # noqa: E402,F401  (stubs mjlab / tensorboard via sys.modules when they are missing)
 import torch
 
 from supermimic.world_model import WorldModelCfg

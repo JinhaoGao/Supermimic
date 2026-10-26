@@ -21,7 +21,7 @@ from mjlab.managers import CommandTerm
 from mjlab.tasks.tracking.mdp.commands import MotionCommand, MotionCommandCfg
 from mjlab.utils.lab_api.math import quat_apply_inverse, quat_from_euler_xyz, quat_mul, sample_uniform
 
-from .math_utils import quat_angle
+from .math_utils import cap_simplex, quat_angle
 from .motions import MotionLibrary
 
 if TYPE_CHECKING:
@@ -347,27 +347,6 @@ class LibraryMotionCommand(MotionCommand):
       self._pending_forward = False
       self._env.sim.forward()
     self.update_relative_body_poses()
-
-
-@torch.no_grad()
-def cap_simplex(p: torch.Tensor, cap: float) -> torch.Tensor:
-  """Water-filling cap of a distribution: min(cap, s * p) with s such that the result sums to 1 (the mass above the cap
-  goes to the uncapped entries in proportion; needs cap * len(p) >= 1). Exact, via one sort (float64)."""
-  if float(p.max()) <= cap * float(p.sum()):
-    return p
-  q, idx = torch.sort(p.double(), descending=True)
-  q = q / q.sum()
-  k = torch.arange(q.numel(), device=q.device, dtype=torch.float64)  # entries before position k are capped
-  rest = (1.0 - (torch.cumsum(q, 0) - q)).clamp(min=1e-300)  # mass of the entries from k on
-  s = (1.0 - k * cap) / rest
-  ok = (s * q <= cap) & (k * cap < 1.0)  # first such k: the capped set is exactly the k largest entries
-  k0 = int(torch.argmax(ok.to(torch.uint8)).item())
-  assert bool(ok[k0]), "cap_simplex: cap * len(p) must be >= 1"
-  out = torch.empty_like(q)
-  out[:k0] = cap
-  out[k0:] = s[k0] * q[k0:]
-  res = torch.empty_like(out).scatter_(0, idx, out)
-  return (res / res.sum()).to(p.dtype)
 
 
 def motion_clip_end(env: "ManagerBasedRlEnv", command_name: str) -> torch.Tensor:
