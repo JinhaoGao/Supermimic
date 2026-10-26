@@ -6,6 +6,11 @@ Reference data is passed explicitly:
   * simulator side: tensors gathered for the current frames / goal windows,
   * imagination side: a window "pack" [N, L, ...] per rollout and per-rollout
     local frame indices into it.
+
+term_scale (post / imagine_step, optional): per-sample termination multiplier of the hard-clip curriculum
+(heads.termination ``scale``); the trainer passes None when the curriculum is off (the code path before it).
+The root-orientation termination (heads.termination ``ref_rq``, HeadsCfg.root_ori_term) takes the reference pelvis
+quaternion from the same target-frame tracked-body quaternions (simulator: ref_bq; imagination: the pack's body_quat).
 """
 
 from __future__ import annotations
@@ -28,6 +33,12 @@ class StepFns:
     self.imagine_step = wrap(self._imagine_step)
     self.wm_loss = wrap(self._wm_loss)
 
+  def _ref_root(self, ref_bq):
+    """Reference quaternion [B,4] of the root-orientation body (pelvis) from the tracked-body quaternions [B,Bt,4] of
+    the target frame, for heads.termination's root_ori_term; None when that term is off (the graph before it)."""
+    h = self.heads
+    return ref_bq[:, h.root_ori] if h.cfg.root_ori_on else None
+
   # ---- simulator side (no grad) -------------------------------------------
 
   def _refresh(self, state, prev_action, bias, noise: bool):
@@ -44,7 +55,8 @@ class StepFns:
     kin_next = self.heads.kin(next_state)
     ref = dict(body_pos=ref_bp, body_quat=ref_bq, body_lin_vel=ref_blv, body_ang_vel=ref_bav)
     r = self.heads.reward(kin, kin_next, next_state, a_exec, prev_action, ref)
-    hard, _ = self.heads.termination(kin_next, ref_bp, ref_bq, term_scale)
+    a_idx = self.heads.anchor
+    hard, _ = self.heads.termination(kin_next, ref_bp[:, a_idx], ref_bq[:, a_idx], ref_bp, term_scale, ref_rq=self._ref_root(ref_bq))
     return r, hard
 
   # ---- imagination (grad) --------------------------------------------------
@@ -87,7 +99,9 @@ class StepFns:
     kin_next = heads.kin(s_next)
     ref = dict(body_pos=p_bp[ar, f_loc], body_quat=p_bq[ar, f_loc], body_lin_vel=p_blv[ar, f_loc], body_ang_vel=p_bav[ar, f_loc])
     r = heads.reward(kin, kin_next, s_next, a, prev_a, ref)
-    _, d = heads.termination(kin_next, ref["body_pos"], ref["body_quat"], term_scale)
+    a_idx = heads.anchor
+    _, d = heads.termination(kin_next, ref["body_pos"][:, a_idx], ref["body_quat"][:, a_idx], ref["body_pos"], term_scale,
+                             ref_rq=self._ref_root(ref["body_quat"]))
     f_next = torch.minimum(f_loc + 1, clip_end_loc - 1)
     obs_next = heads.proprio(s_next, a, bias, True)
     obs_hist_next = torch.cat([obs_hist[:, 1:], obs_next[:, None]], dim=1)

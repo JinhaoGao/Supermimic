@@ -72,9 +72,11 @@ def quat_error_magnitude(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
 
 
 def quat_angle(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
-  """Full rotation angle in [0, pi] between q1 and q2 (yaw included): 2 atan2(|v|, |w|) of q1 q2^*. The team eval
-  site's quat_error_angle (2 arccos(|w|) of normalized quaternions) without normalization and with finite gradients
-  everywhere (ported from branch ddp-bj31-v2 ecc551f)."""
+  """Full rotation angle in [0, pi] between q1 and q2 (yaw included): 2 atan2(|v|, |w|) of q1 q2^*.
+
+  The team eval site's ``quat_error_angle`` (evaluate_mujoco.py: 2 arccos(|w|) of q_ref q_robot^-1, both normalized)
+  in a form that needs no normalization (atan2 is scale-invariant: the world model's / the motion files' quaternions
+  are unit only up to float error) and has finite gradients everywhere (0 at angle 0, where arccos' is infinite)."""
   dq = quat_mul(q1, quat_conjugate(q2))
   return 2.0 * torch.atan2(torch.linalg.vector_norm(dq[..., 1:], dim=-1), dq[..., 0].abs())
 

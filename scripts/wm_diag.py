@@ -9,6 +9,9 @@ the given groups, then reports per group and per phase (reference airborne or no
 
   uv run python scripts/wm_diag.py --ckpt logs/.../model_96000.pt \
       --group aerial=aerial.txt --group kicks=kicks.txt --group normal=normal.txt --out diag.json
+
+(ddp-bj31-v2: the checkpoint's heads cfg goes through HeadsCfg.from_dict, so master-format and this branch's
+checkpoints both load; imagination runs without the hard-clip curriculum factor, as the policy is evaluated.)
 """
 
 from __future__ import annotations
@@ -113,7 +116,7 @@ def main():
   c = ck["cfg"]
   files, owner = group_lists(args.group)
   gnames = list(dict.fromkeys(s.split("=", 1)[0] for s in args.group))
-  hk = {kk: v for kk, v in c["heads"].items() if kk != "extra"}
+  heads_cfg = HeadsCfg.from_dict({kk: v for kk, v in c["heads"].items() if kk != "extra"})  # any branch's cfg (EE spellings)
   wk = dict(c["wm"])
   wk["hidden"] = tuple(wk["hidden"])
   H = args.H or int(c["H"])
@@ -123,7 +126,7 @@ def main():
     device=args.device, seed=1, log_dir=args.log_dir, cache_dir=c.get("cache_dir", ""), num_workers=32,
     iterations=0, action_noise_std=args.action_noise, replay_capacity=T + 8,
     episode_length_s=float(c.get("episode_length_s", 10.0)), compile=False, H=H, gamma=float(c["gamma"]),
-    eval_enabled=False, wd_enabled=False, wm=WorldModelCfg(**wk), heads=HeadsCfg(**hk),
+    eval_enabled=False, wd_enabled=False, wm=WorldModelCfg(**wk), heads=heads_cfg,
   )
   tr = Trainer(cfg)
   tr.load(args.ckpt)

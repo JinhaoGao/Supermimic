@@ -19,7 +19,6 @@ import torch
 
 from mjlab.managers import CommandTerm
 from mjlab.tasks.tracking.mdp.commands import MotionCommand, MotionCommandCfg
-from mjlab.tasks.tracking.mdp.rewards import _get_body_indexes
 from mjlab.utils.lab_api.math import quat_apply_inverse, quat_from_euler_xyz, quat_mul, sample_uniform
 
 from .math_utils import quat_angle
@@ -30,6 +29,51 @@ if TYPE_CHECKING:
 
 # Libraries shared between envs of one process (train env + eval env).
 LIBRARY_REGISTRY: dict[str, MotionLibrary] = {}
+
+
+@torch.no_grad()
+def reset_prior(clip_names, bin_clip: torch.Tensor, source_weights=(), name_weights=(), device=None, log=print):
+  """Prior of the uniform share of the reset distribution over bins (master 276c942 / b131dc0), or None (uniform).
+
+  Source prior: clip "<robot>__<source>_..." gets the weight of its longest matching source prefix (default 1); the
+  team's own sources are <1% of the bins. Name keywords (case-insensitive substring, e.g. crawl / getup): a skill
+  quota across sources (ground work is spread over sonic / motiondecode / hiphi / g1_all). A clip gets the larger of
+  its source and keyword weights; a bin the weight of its clip, normalized over all bins."""
+  if not source_weights and not name_weights:
+    return None
+  device = bin_clip.device if device is None else device
+  kws = sorted(((str(k), float(v)) for k, v in source_weights), key=lambda kv: -len(kv[0]))
+  nws = [(str(k).lower(), float(v)) for k, v in name_weights]
+
+  def src_weight(name: str) -> tuple[str, float]:
+    src = name.split("__", 1)[-1]
+    for k, v in kws:
+      if src == k or src.startswith(k + "_"):
+        return k, v
+    return "", 1.0
+
+  tags = [src_weight(n) for n in clip_names]
+  name_w = [max([v for k, v in nws if k in n.lower()], default=1.0) for n in clip_names]
+  w_clip = torch.tensor([max(w, nw) for (_, w), nw in zip(tags, name_w)], dtype=torch.float32, device=device)
+  prior = w_clip[bin_clip]
+  bin_prior = prior / prior.sum()
+  tag_of_bin = [tags[i][0] for i in bin_clip.tolist()]
+  for k, v in kws:
+    mask = torch.tensor([t == k for t in tag_of_bin], device=device)
+    log(f"[LibraryMotionCommand] source {k!r} x{v:g}: {mask.float().mean().item() * 100:.2f}% of bins -> "
+        f"{bin_prior[mask].sum().item() * 100:.2f}% of the uniform share")
+  if nws:
+    hit = torch.tensor([nw > 1.0 for nw in name_w], device=device)[bin_clip]
+    log(f"[LibraryMotionCommand] name keywords {nws}: {int(sum(nw > 1.0 for nw in name_w))} clips, "
+        f"{hit.float().mean().item() * 100:.2f}% of bins -> {bin_prior[hit].sum().item() * 100:.2f}% of the uniform share")
+  return bin_prior
+
+
+def hard_clip_mask(clip_names, hard_names=(), device=None) -> torch.Tensor:
+  """Hard set of the termination curriculum (master 4314a50): clip name contains any hard_names keyword
+  (case-insensitive substring) -> bool [num_clips]. All False without keywords."""
+  hn = [str(k).lower() for k in hard_names]
+  return torch.tensor([any(k in n.lower() for k in hn) for n in clip_names], dtype=torch.bool, device=device)
 
 
 class LibraryMotionCommand(MotionCommand):
@@ -77,52 +121,34 @@ class LibraryMotionCommand(MotionCommand):
     self.bin_G = torch.zeros(NB, device=self.device)
     self.bin_visits = torch.zeros(NB, device=self.device)
     self.bin_weight_hist = torch.full((NB,), 1.0 / NB, device=self.device)
-    # Source prior for the uniform share of the reset distribution (v2): clip "<robot>__<source>_..." gets the
-    # weight of its longest matching source prefix (default 1). The team's own sources are <1% of the bins.
-    self.bin_prior: torch.Tensor | None = None
-    if cfg.source_weights or cfg.name_weights:
-      kws = sorted(((str(k), float(v)) for k, v in cfg.source_weights), key=lambda kv: -len(kv[0]))
-      nws = [(str(k).lower(), float(v)) for k, v in cfg.name_weights]
-      def src_weight(name: str) -> tuple[str, float]:
-        src = name.split("__", 1)[-1]
-        for k, v in kws:
-          if src == k or src.startswith(k + "_"):
-            return k, v
-        return "", 1.0
-      tags = [src_weight(c.name) for c in lib.clips]
-      # Name keywords (case-insensitive substring, e.g. crawl / getup): a skill quota across sources (ground work is
-      # spread over sonic / motiondecode / hiphi / g1_all). A clip gets the larger of its source and keyword weights.
-      name_w = [max([v for k, v in nws if k in c.name.lower()], default=1.0) for c in lib.clips]
-      w_clip = torch.tensor([max(w, nw) for (_, w), nw in zip(tags, name_w)], dtype=torch.float32, device=self.device)
-      prior = w_clip[lib.bin_clip]
-      self.bin_prior = prior / prior.sum()
-      tag_of_bin = [tags[i][0] for i in lib.bin_clip.tolist()]
-      for k, v in kws:
-        mask = torch.tensor([t == k for t in tag_of_bin], device=self.device)
-        print(f"[LibraryMotionCommand] source {k!r} x{v:g}: {mask.float().mean().item() * 100:.2f}% of bins -> "
-              f"{self.bin_prior[mask].sum().item() * 100:.2f}% of the uniform share")
-      if nws:
-        hit = torch.tensor([nw > 1.0 for nw in name_w], device=self.device)[lib.bin_clip]
-        print(f"[LibraryMotionCommand] name keywords {nws}: {int(sum(nw > 1.0 for nw in name_w))} clips, "
-              f"{hit.float().mean().item() * 100:.2f}% of bins -> {self.bin_prior[hit].sum().item() * 100:.2f}% of the uniform share")
-    # Cluster-balanced prior (allmimic, see bin_clusters.py): multiplies the source / keyword prior of the uniform share.
+    # Source / name prior for the uniform share of the reset distribution (v2, see reset_prior); None = uniform.
+    # A pure function of the clip list and the cfg: every DDP rank builds the same one (Trainer checks it).
+    self.bin_prior: torch.Tensor | None = reset_prior(
+      [c.name for c in lib.clips], lib.bin_clip, cfg.source_weights, cfg.name_weights, self.device
+    )
+    # Cluster-balanced prior (allmimic, see bin_clusters.py; 10-26) mixed into the source / keyword prior of the uniform
+    # share: (1 - cluster_mix) x source / keyword prior + cluster_mix x cluster prior. A mixture, not a product: both
+    # up-weight the rare kinds (a product put 34 % of the G1 uniform share on the 0.08 % flip bins). Deterministic
+    # (cached k-means with a fixed seed), so every DDP rank builds the same one.
     if cfg.cluster_k > 0:
       from .bin_clusters import bin_cluster_prior
 
       cw = bin_cluster_prior(lib, cfg.cluster_k, cfg.cluster_alpha, self.device, log=print)
-      base = self.bin_prior if self.bin_prior is not None else torch.full((NB,), 1.0 / NB, device=self.device)
-      self.bin_prior = base * cw / (base * cw).sum()
-    # Hard-clip termination curriculum (v2 r13): clips whose name contains a hard_names keyword get every
-    # termination threshold (env terms below + the trainer's soft head) multiplied by hard_mult, which the
-    # trainer anneals back to 1; other clips keep 1. Episodes keep the factor of the clip they reset into.
-    hn = [str(k).lower() for k in cfg.hard_names]
-    self.clip_hard = torch.tensor([any(k in c.name.lower() for k in hn) for c in lib.clips], dtype=torch.bool, device=self.device)
+      base = self.bin_prior if self.bin_prior is not None else torch.full((lib.num_bins,), 1.0 / lib.num_bins, device=self.device)
+      self.bin_prior = (1.0 - cfg.cluster_mix) * base + cfg.cluster_mix * cw
+    # Hard-clip termination curriculum (master 4314a50, v2 r13): clips whose name contains a hard_names keyword get
+    # every termination threshold (env terms + the trainer's soft head) multiplied by hard_mult, which the trainer
+    # sets from cfg.hard_term_schedule at the iteration (identical on every DDP rank); other clips keep 1. Episodes keep
+    # the factor of the clip they reset into. clip_hard is a pure function of the clip list and cfg (rank-identical,
+    # checked by the Trainer's state check); env_hard / term_scale_env are per env (each rank's own envs).
+    self.clip_hard = hard_clip_mask([c.name for c in lib.clips], cfg.hard_names, self.device)
     self.env_hard = torch.zeros(E, dtype=torch.bool, device=self.device)
     self.term_scale_env = torch.ones(E, device=self.device)
     self.hard_mult = 1.0
-    if hn:
+    if cfg.hard_names:
       hb = self.clip_hard[lib.bin_clip]
-      print(f"[LibraryMotionCommand] hard set {hn}: {int(self.clip_hard.sum())} clips, {hb.float().mean().item() * 100:.2f}% of bins")
+      print(f"[LibraryMotionCommand] hard set {[str(k).lower() for k in cfg.hard_names]}: {int(self.clip_hard.sum())} clips, "
+            f"{hb.float().mean().item() * 100:.2f}% of bins")
     # Sequential clip assignment for "start" (evaluation) mode.
     ec = cfg.eval_clips if cfg.eval_clips else tuple(range(lib.num_clips))
     self.eval_clips = torch.tensor(ec, dtype=torch.long, device=self.device)
@@ -223,15 +249,27 @@ class LibraryMotionCommand(MotionCommand):
     self.bin_visits[visited] += c[visited]
 
   @torch.no_grad()
+  def clamp_bin_returns_(self) -> tuple[int, float]:
+    """Clamp bin_G to [0, g_max] in place (clamp_returns: a resumed / rolled-back EMA restarts bounded; without the
+    clamp a penalty-dominated clip-end bin, G << 0 via the r_last / (1 - gamma) bootstrap, takes all softmax mass).
+    Returns (bins clamped, min before)."""
+    g_min = float(self.bin_G.min()) if self.bin_G.numel() else 0.0
+    n = int(((self.bin_G < 0.0) | (self.bin_G > self.cfg.g_max)).sum())
+    self.bin_G.clamp_(0.0, self.cfg.g_max)
+    return n, g_min
+
+  @torch.no_grad()
   def sampling_probabilities(self) -> torch.Tensor:
     c = self.cfg
     NB = self.library.num_bins
+    # The source / name prior reshapes only the uniform share; clamp_returns acts only on the softmax's G.
     uniform = self.bin_prior if self.bin_prior is not None else torch.full((NB,), 1.0 / NB, device=self.device)
     bin_G = self.bin_G.clamp(0.0, c.g_max) if c.clamp_returns else self.bin_G
     G = torch.where(self.bin_visits > 0, bin_G, torch.full_like(self.bin_G, c.g_max * 0.5))
     soft = torch.softmax(-c.softmax_temp * G / c.g_max, dim=0)
-    if c.softmax_cap > 0:
-      soft = cap_simplex(soft, c.softmax_cap / NB)
+    cap = getattr(c, "softmax_cap", 0.0)  # (cfg stand-ins of older tests lack the field)
+    if cap > 0:
+      soft = cap_simplex(soft, cap / NB)
     hist = self.bin_weight_hist / self.bin_weight_hist.sum()
     probs = c.mix_uniform * uniform + c.mix_softmax * soft + c.mix_history * hist
     probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0) + 1e-12
@@ -338,8 +376,9 @@ def motion_clip_end(env: "ManagerBasedRlEnv", command_name: str) -> torch.Tensor
   return cmd.time_steps >= cmd.clip_end_env - 1  # type: ignore[attr-defined]
 
 
-# mjlab's anchor / end-effector terminations with the per-env threshold multiplier of the hard-clip curriculum
-# (LibraryMotionCommand.term_scale_env, 1 outside the hard set); swapped in by make_env_cfg when it is used.
+# mjlab's anchor / end-effector terminations (bad_anchor_pos_z_only / bad_anchor_ori / bad_motion_body_pos_z_only, same
+# signatures and tests) with the per-env threshold multiplier of the hard-clip curriculum (LibraryMotionCommand.
+# term_scale_env, 1 outside the hard set); swapped in by make_env_cfg only when hard_names is set.
 
 
 def scaled_anchor_pos_z(env: "ManagerBasedRlEnv", command_name: str, threshold: float) -> torch.Tensor:
@@ -355,6 +394,8 @@ def scaled_anchor_ori(env: "ManagerBasedRlEnv", asset_cfg, command_name: str, th
 
 
 def scaled_body_pos_z(env: "ManagerBasedRlEnv", command_name: str, threshold: float, body_names=None) -> torch.Tensor:
+  from mjlab.tasks.tracking.mdp.rewards import _get_body_indexes
+
   cmd = env.command_manager.get_term(command_name)
   idx = _get_body_indexes(cmd, body_names)
   err = (cmd.body_pos_relative_w[:, idx, -1] - cmd.robot_body_pos_w[:, idx, -1]).abs()  # type: ignore[attr-defined]
@@ -362,8 +403,11 @@ def scaled_body_pos_z(env: "ManagerBasedRlEnv", command_name: str, threshold: fl
 
 
 def bad_root_ori_full(env: "ManagerBasedRlEnv", command_name: str, threshold: float, body_name: str) -> torch.Tensor:
-  """Root-orientation termination (HeadsCfg.root_ori_term): full rotation angle (yaw included) between the reference and
-  the robot's ``body_name`` (the root: G1 pelvis) > threshold x term_scale_env; the team eval site's root_ori test."""
+  """Root-orientation termination (2026-10-25, HeadsCfg.root_ori_term; added by make_env_cfg only when switched on): the
+  full rotation angle (yaw included) between the reference and the robot's ``body_name`` (the robot root: G1 pelvis) >
+  threshold x term_scale_env (1 outside the hard-clip curriculum's hard set). The team eval site's root_ori test
+  (quat_error_angle(reference root quat, qpos[3:7]) > 1.0); the same math (math_utils.quat_angle) as the heads' hard
+  test on the state's root quaternion (MuJoCo xquat of the root body, = body_link_quat_w)."""
   cmd = env.command_manager.get_term(command_name)
   ref_q = cmd.body_quat_w[:, cmd.cfg.body_names.index(body_name)]  # type: ignore[attr-defined]
   rob_q = cmd.robot.data.body_link_quat_w[:, cmd.robot.body_names.index(body_name)]  # type: ignore[attr-defined]
@@ -390,9 +434,9 @@ class LibraryMotionCommandCfg(MotionCommandCfg):
   softmax_temp: float = 25.0
   g_max: float = 10.0
   return_ema: float = 0.05
-  # Clamp bin returns (EMA input and sampled G) to [0, g_max]. Off = paper: a clip-end bin whose last reward is
-  # negative (joint-limit penalty) gets G << 0 through the time-out bootstrap r_last / (1 - gamma) and takes the whole
-  # softmax + history share (sampler/top1_prob 0.5 in every G1 run; found by the bj31 session, branch ddp-bj31 5bb8c0d).
+  # Clamp bin returns (EMA input, sampled G, bin_G loaded on resume / rollback) to [0, g_max]. Off = paper: a clip-end
+  # bin whose last reward is negative (joint-limit penalty) gets G << 0 through the time-out bootstrap r_last / (1 - gamma)
+  # and takes the whole softmax + history share (sampler/top1_prob 0.5). ddp-bj31 5bb8c0d == master 5f020a9: one switch.
   clamp_returns: bool = False
   weight_ema: float = 0.01
   source_weights: tuple = ()  # ((source prefix, weight), ...): prior of the uniform share, see LibraryMotionCommand
@@ -404,6 +448,7 @@ class LibraryMotionCommandCfg(MotionCommandCfg):
   softmax_cap: float = 0.0
   cluster_k: int = 0
   cluster_alpha: float = 0.3
+  cluster_mix: float = 0.5  # share of the cluster prior in the uniform-share prior (rest: source / keyword prior)
   sampling_mode: Literal["return", "uniform", "start"] = "return"  # type: ignore[assignment]
   cache_dir: str = ""
   num_workers: int = 32

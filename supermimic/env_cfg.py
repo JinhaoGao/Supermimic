@@ -2,13 +2,17 @@
 
 Starts from mjlab's BeyondMimic G1 tracking task and applies the paper's
 changes (Appendix A): no push events, no self-collision penalty, joint-limit
-weight -2, no end-effector termination, DR context re-sampled per episode,
+weight -2, no end-effector termination (restored by default since 2026-10-22,
+``ee_termination``; see heads.HeadsCfg), DR context re-sampled per episode,
 multi-clip library command with return-based reset sampling and a clip-end
 time-out. The env never auto-resets: the trainer reads terminal states and
 calls ``reset(env_ids)`` itself.
 
-v2 options: ``ee_term_z`` keeps BeyondMimic's end-effector height termination (the team's
-benchmark terminates on it), ``robot_variant`` swaps the robot model (see base_tracking_cfg).
+v2 options (master e57be5b..b131dc0): the end-effector height termination (master's ``ee_term_z``, here
+``ee_termination`` / ``ee_threshold``), ``robot_variant`` swaps the robot model (see base_tracking_cfg),
+``source_weights`` / ``name_weights`` reshape the uniform share of the reset sampler.
+master 4314a50: ``hard_names`` (hard-clip termination curriculum, per-env threshold multiplier).
+2026-10-25: ``root_ori_term`` (opt-in) adds the team eval site's root-orientation test (pelvis full angle incl. yaw).
 """
 
 from __future__ import annotations
@@ -21,7 +25,9 @@ from mjlab.tasks.tracking import mdp
 
 from .library_command import LibraryMotionCommandCfg, bad_root_ori_full, bad_root_pos_z, motion_clip_end
 
-# Robot root (free-joint) body: the body of the root-orientation termination (the eval site compares qpos[3:7]).
+# Root body (free joint) per robot: the body of the root-orientation termination when HeadsCfg.root_ori_body is ""
+# (the eval site compares qpos[3:7] with its first tracked body: G1 pelvis, E2 base_link). SimInterface checks it against
+# the built model (the free-joint body) and that it is a tracked body.
 ROOT_BODY = {"g1": "pelvis", "e2": "base_link"}
 
 
@@ -89,18 +95,34 @@ def make_env_cfg(
   eval_clips: tuple[int, ...] = (),
   cache_dir: str = "",
   num_workers: int = 32,
-  ee_term_z: float = 0.0,
+  ee_termination: bool = True,
+  ee_threshold: float = 0.25,
+  clamp_returns: bool = False,
   robot_variant: str = "",
   source_weights: tuple = (),
   name_weights: tuple = (),
   hard_names: tuple = (),
-  clamp_returns: bool = False,
   root_ori_term: float = 0.0,
+  root_ori_body: str = "",
   root_z_term: float = 0.0,
   softmax_cap: float = 0.0,
   cluster_k: int = 0,
   cluster_alpha: float = 0.3,
+  cluster_mix: float = 0.5,
 ) -> ManagerBasedRlEnvCfg:
+  """ee_termination: keep BeyondMimic's end-effector height termination (``ee_body_pos``: any end-effector body
+  z error > ee_threshold; bodies per robot cfg). Must match ``HeadsCfg.ee_termination`` / ``ee_term_z`` of the
+  learner (SimInterface checks). Off = the paper's recipe (term removed). master's v2 ``ee_term_z=Z`` is
+  ``ee_termination=Z > 0, ee_threshold=Z`` here (heads.ee_flags).
+  clamp_returns: reset sampler bin returns clamped to [0, g_max] (LibraryMotionCommandCfg.clamp_returns).
+  robot_variant: robot model ("+"-joined, see base_tracking_cfg). source_weights / name_weights: prior of the reset
+  sampler's uniform share (train mode only; LibraryMotionCommand.bin_prior).
+  hard_names: hard set of the termination curriculum (master 4314a50; train mode only): the anchor / end-effector
+  termination terms are swapped for the scaled versions (library_command.scaled_*, threshold x term_scale_env);
+  empty = mjlab's terms, untouched.
+  root_ori_term: > 0 adds the root-orientation termination ``root_ori`` (library_command.bad_root_ori_full: full rotation
+  angle of root_ori_body, "" = ROOT_BODY[robot], against the reference > root_ori_term rad, x term_scale_env); must match
+  ``HeadsCfg.root_ori_term`` / ``root_ori_body`` (SimInterface checks). 0 (default) = no such term, as before."""
   assert mode in ("train", "eval")
   cfg = base_tracking_cfg(robot, robot_variant)
   cfg.scene.num_envs = num_envs
@@ -124,13 +146,14 @@ def make_env_cfg(
     num_workers=num_workers,
     library_key=library_key,
     eval_clips=tuple(eval_clips),
+    clamp_returns=clamp_returns,
     source_weights=tuple(tuple(kv) for kv in source_weights) if mode == "train" else (),
     name_weights=tuple(tuple(kv) for kv in name_weights) if mode == "train" else (),
     hard_names=tuple(hard_names) if mode == "train" else (),
-    clamp_returns=clamp_returns,
     softmax_cap=softmax_cap if mode == "train" else 0.0,
     cluster_k=cluster_k if mode == "train" else 0,
     cluster_alpha=cluster_alpha,
+    cluster_mix=cluster_mix,
   )
 
   # Minimal observation group (the trainer builds policy inputs itself).
@@ -156,9 +179,12 @@ def make_env_cfg(
   cfg.rewards.pop("self_collisions", None)
   cfg.rewards["joint_limit"].weight = -2.0
 
-  # Terminations. ee_body_pos (end-effector height) only when asked for (v2); the paper drops it.
-  if ee_term_z > 0:
-    cfg.terminations["ee_body_pos"].params["threshold"] = float(ee_term_z)
+  # Terminations. ee_body_pos (end-effector height) unless switched off (the paper drops it).
+  if ee_termination:
+    ee = cfg.terminations["ee_body_pos"]
+    assert ee.params["body_names"], f"{robot}: ee_body_pos has no end-effector bodies"
+    assert ee_threshold > 0, f"ee_threshold must be > 0 (got {ee_threshold}); off: ee_termination=False"
+    ee.params["threshold"] = float(ee_threshold)
   else:
     cfg.terminations.pop("ee_body_pos", None)
   if hard_names and mode == "train":  # hard-clip curriculum: per-env threshold multiplier (library_command)
@@ -168,13 +194,15 @@ def make_env_cfg(
     cfg.terminations["anchor_ori"].func = scaled_anchor_ori
     if "ee_body_pos" in cfg.terminations:
       cfg.terminations["ee_body_pos"].func = scaled_body_pos_z
-  if root_ori_term > 0:  # the eval site's root_ori test (train and eval mode, like ee_body_pos); HeadsCfg.root_ori_term
+  if root_ori_term > 0:  # eval site's root_ori (train and eval mode alike, like ee_body_pos)
     cfg.terminations["root_ori"] = TerminationTermCfg(
-      func=bad_root_ori_full, params={"command_name": "motion", "threshold": float(root_ori_term), "body_name": ROOT_BODY[robot]}
+      func=bad_root_ori_full,
+      params={"command_name": "motion", "threshold": float(root_ori_term), "body_name": root_ori_body or ROOT_BODY[robot]},
     )
-  if root_z_term > 0:  # the eval site's root_pos test (mode z); HeadsCfg.root_z_term
+  if root_z_term > 0:  # eval site's root_pos (mode z) on the same root body; HeadsCfg.root_z_term (10-26)
     cfg.terminations["root_z"] = TerminationTermCfg(
-      func=bad_root_pos_z, params={"command_name": "motion", "threshold": float(root_z_term), "body_name": ROOT_BODY[robot]}
+      func=bad_root_pos_z,
+      params={"command_name": "motion", "threshold": float(root_z_term), "body_name": root_ori_body or ROOT_BODY[robot]},
     )
   cfg.terminations["clip_end"] = TerminationTermCfg(
     func=motion_clip_end, params={"command_name": "motion"}, time_out=True

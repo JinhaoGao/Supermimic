@@ -1,7 +1,17 @@
 """Benchmark evaluation (Appendix F.1): clips played once from their first
 frame, friction 1.0, no DR / noise, deterministic policy. Reports the
 normalized return (undiscounted reward sum / max attainable) and the number
-of failed clips (training termination triggered before the clip end).
+of failed clips (training termination triggered before the clip end). With
+``HeadsCfg.ee_termination`` the end-effector height test counts as a failure
+too (the bj31 eval site's G1 / E2 official protocol: termination bodies
+ankle_roll + wrist_yaw / elbow links, z error > 0.25); ``failed_ee`` counts
+clips whose first failure was end-effector only (the site's "body_pos"
+reason, checked after the root tests), ``failed_fall`` the rest.
+
+Always (2026-10-25, logging only): ``failed_ori`` counts clips whose pelvis (root body) full rotation angle against the
+reference exceeded 1.0 rad at some step of their episode -- the eval site's root_ori test, which the training
+terminations do not contain unless ``HeadsCfg.root_ori_term`` is on (then the env terminates there and those clips are
+in ``failed`` as well); ``failed_with_ori`` = failed or failed_ori, the count comparable across both settings.
 
 Envs cycle through the evaluation clip list (all clips, or a fixed random
 subset for large libraries); the in-RAM library is shared with the training
@@ -16,6 +26,7 @@ from .env_cfg import make_env_cfg
 from .fns import StepFns
 from .heads import HeadsCfg
 from .sim_interface import ObsHistory, SimInterface
+from .watch import ORI_FAIL_THRESHOLD
 
 
 class Evaluator:
@@ -41,8 +52,8 @@ class Evaluator:
     self.num_envs = min(self.num_clips, max_envs)
     env_cfg = make_env_cfg(
       motion_files, self.num_envs, mode="eval", robot=robot, library_key=library_key, eval_clips=self.eval_clips, cache_dir=cache_dir,
-      ee_term_z=heads_cfg.ee_term_z, robot_variant=robot_variant, root_ori_term=heads_cfg.root_ori_term,
-      root_z_term=heads_cfg.root_z_term,
+      ee_termination=heads_cfg.ee_termination, ee_threshold=heads_cfg.ee_term_z, robot_variant=robot_variant,
+      root_ori_term=heads_cfg.root_ori_term, root_ori_body=heads_cfg.root_ori_body, root_z_term=heads_cfg.root_z_term,
     )
     self.env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
     self.sim = SimInterface(self.env, heads_cfg)
@@ -83,6 +94,11 @@ class Evaluator:
     sum_r = torch.zeros(n, device=self.device)
     done_clip = torch.zeros(n, dtype=torch.bool, device=self.device)
     failed = torch.zeros(n, dtype=torch.bool, device=self.device)
+    failed_ee = torch.zeros(n, dtype=torch.bool, device=self.device)  # first failure was end-effector only
+    ori_over = torch.zeros(n, dtype=torch.bool, device=self.device)  # pelvis angle > 1.0 rad at some step (eval site)
+    tm = env.termination_manager
+    ee_on = "ee_body_pos" in tm.active_terms
+    ro_on = "root_ori" in tm.active_terms
     # Map clip index -> position in eval list.
     pos_of_clip = torch.full((lib.num_clips,), -1, dtype=torch.long, device=self.device)
     pos_of_clip[self.clip_ids] = torch.arange(n, device=self.device)
@@ -99,11 +115,20 @@ class Evaluator:
       env.step(a)
       next_state = sim.state()
       r, _ = fns.post(next_state, kin, a, prev_action, *ref_cur)
+      ang = heads.root_ori_angle_state(next_state, ref_cur[1])
       terminated = env.reset_terminated.bool()
       timeouts = env.reset_time_outs.bool()
       act = env_active
       sum_r.index_add_(0, env_pos[act], r[act])
+      if ang is not None:
+        ori_over[env_pos[(ang > ORI_FAIL_THRESHOLD) & act]] = True
       fail_now = terminated & act
+      if ee_on:
+        root = tm.get_term("anchor_pos") | tm.get_term("anchor_ori")
+        if ro_on:  # the eval site tests root_ori before the end effectors
+          root = root | tm.get_term("root_ori")
+        ee_only = tm.get_term("ee_body_pos") & ~root
+        failed_ee[env_pos[fail_now & ee_only]] = True
       failed[env_pos[fail_now]] = True
       done = terminated | timeouts
       fin = done & act
@@ -142,7 +167,11 @@ class Evaluator:
         "return_min": float(norm_ret.min()),
         "failed": float(failed.sum()),
         "failed_frac": float(failed.float().mean()),
+        "failed_ee": float(failed_ee.sum()),
+        "failed_fall": float((failed & ~failed_ee).sum()),
         "clips_done": float(done_clip.sum()),
+        **({"failed_ori": float(ori_over.sum()), "failed_with_ori": float((failed | ori_over).sum())}
+           if heads.root_ori is not None else {}),
       },
       "per_clip": per_clip,
       "failed_clips": [names[i] for i in range(n) if bool(failed[i])][:200],

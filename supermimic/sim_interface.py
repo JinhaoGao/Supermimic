@@ -39,25 +39,20 @@ class SimInterface:
     self.lib = self.cmd.library
     tracked_local = [int(i) for i in self.cmd.body_indexes.tolist()]
     self.fk = TorchFK(env.sim.mj_model, self.robot, self.device, needed_bodies=tracked_local)
-    # End-effector height termination: same bodies / threshold in the env (mjlab ee_body_pos) and the soft head.
-    ee_term = env.cfg.terminations.get("ee_body_pos")
-    tracked_names = list(self.cmd.cfg.body_names)
-    ee_idx = [tracked_names.index(n) for n in ee_term.params["body_names"]] if ee_term is not None else []
-    env_thr = float(ee_term.params["threshold"]) if ee_term is not None else 0.0
-    if abs(env_thr - heads_cfg.ee_term_z) > 1e-9:
-      raise ValueError(f"env ee_body_pos threshold {env_thr} != heads ee_term_z {heads_cfg.ee_term_z}")
-    # Root-orientation termination: same switch / threshold in the env (root_ori) and the heads.
-    ro_term = env.cfg.terminations.get("root_ori")
-    ro_thr = float(ro_term.params["threshold"]) if ro_term is not None else 0.0
-    if abs(ro_thr - heads_cfg.root_ori_term) > 1e-9:
-      raise ValueError(f"env root_ori threshold {ro_thr} != heads root_ori_term {heads_cfg.root_ori_term}")
-    # Root-height termination: same switch / threshold in the env (root_z) and the heads; both root terms use the root body.
+    self.ee_body_names, ee_idx = self.ee_bodies(env, heads_cfg)
+    self.root_body_name = str(self.robot.body_names[self.fk.root_local])  # free-joint body (G1 pelvis, E2 base_link)
+    self.root_ori_body, ro_idx = self.root_ori_body_of(env, heads_cfg, self.root_body_name)
+    # Root-height termination (10-26): same switch / threshold in the env (root_z) and the heads, on the root-orientation
+    # body (the eval site's root_pos test uses the same root body as its root_ori test).
     rz_term = env.cfg.terminations.get("root_z")
-    rz_thr = float(rz_term.params["threshold"]) if rz_term is not None else 0.0
-    if abs(rz_thr - heads_cfg.root_z_term) > 1e-9:
-      raise ValueError(f"env root_z threshold {rz_thr} != heads root_z_term {heads_cfg.root_z_term}")
-    root_term = ro_term if ro_term is not None else rz_term
-    ro_idx = tracked_names.index(root_term.params["body_name"]) if root_term is not None else None
+    if bool(heads_cfg.root_z_on) != (rz_term is not None):
+      raise ValueError(f"root-height termination mismatch: HeadsCfg.root_z_term={heads_cfg.root_z_term} but the env "
+                       f"{'has' if rz_term is not None else 'has no'} 'root_z' term (make_env_cfg(root_z_term=...))")
+    if rz_term is not None:
+      if abs(float(rz_term.params["threshold"]) - float(heads_cfg.root_z_term)) > 1e-9:
+        raise ValueError(f"root-height threshold mismatch: env {rz_term.params['threshold']} vs HeadsCfg.root_z_term {heads_cfg.root_z_term}")
+      if rz_term.params["body_name"] != self.root_ori_body or ro_idx is None:
+        raise ValueError(f"root-height body {rz_term.params['body_name']!r} must be the tracked root-orientation body {self.root_ori_body!r}")
     self.heads = AnalyticHeads(
       self.fk,
       tracked_local,
@@ -67,6 +62,7 @@ class SimInterface:
       heads_cfg,
       ee_indices=ee_idx,
       root_ori_index=ro_idx,
+      root_ori_is_root=self.root_ori_body == self.root_body_name,
     )
     self.nj = self.heads.nj
     self.xi_dim = 4 + self.nj
@@ -88,6 +84,63 @@ class SimInterface:
       env.sim.create_graph()
     except Exception:  # noqa: BLE001
       pass
+
+  @staticmethod
+  def ee_bodies(env, heads_cfg: HeadsCfg) -> tuple[tuple[str, ...], list[int]]:
+    """End-effector bodies of the simulator's ``ee_body_pos`` termination as indices into the tracked-body list
+    (mjlab ``_get_body_indexes`` order). The env and the heads must agree: the imagined termination has to see
+    the same failures as the simulator, so a mismatch in switch or threshold is an error."""
+    terms = env.cfg.terminations
+    has = "ee_body_pos" in terms
+    if bool(heads_cfg.ee_termination) != has:
+      raise ValueError(
+        f"end-effector termination mismatch: HeadsCfg.ee_termination={heads_cfg.ee_termination} but the env "
+        f"{'has' if has else 'has no'} 'ee_body_pos' term (make_env_cfg(ee_termination=...))"
+      )
+    if not has:
+      return (), []
+    params = terms["ee_body_pos"].params
+    thr = float(params["threshold"])
+    if abs(thr - float(heads_cfg.ee_term_z)) > 1e-9:
+      raise ValueError(f"end-effector threshold mismatch: env {thr} vs HeadsCfg.ee_term_z {heads_cfg.ee_term_z}")
+    names = tuple(params["body_names"])
+    tracked = tuple(env.command_manager.get_term("motion").cfg.body_names)
+    missing = [n for n in names if n not in tracked]
+    if missing:
+      raise ValueError(f"end-effector bodies {missing} are not tracked bodies {tracked}")
+    idx = [i for i, n in enumerate(tracked) if n in names]
+    return tuple(tracked[i] for i in idx), idx
+
+  @staticmethod
+  def root_ori_body_of(env, heads_cfg: HeadsCfg, root_body: str) -> tuple[str, int | None]:
+    """Body of the root-orientation test -> (name, index into the tracked-body list or None if it is not tracked).
+
+    The eval site compares the reference's first tracked body with qpos[3:7], i.e. the robot's free-joint root body
+    (root_body: G1 pelvis, E2 base_link); HeadsCfg.root_ori_body "" means that body. The env's ``root_ori`` term and the
+    heads must agree (switch, threshold, body), and the default body name of env_cfg.ROOT_BODY must be the model's root.
+    With the term off the index still serves the always-on pelvis-angle logging (None = not tracked: no logging)."""
+    terms = env.cfg.terminations
+    has = "root_ori" in terms
+    on = bool(heads_cfg.root_ori_on)
+    if on != has:
+      raise ValueError(
+        f"root-orientation termination mismatch: HeadsCfg.root_ori_term={heads_cfg.root_ori_term} but the env "
+        f"{'has' if has else 'has no'} 'root_ori' term (make_env_cfg(root_ori_term=...))"
+      )
+    name = heads_cfg.root_ori_body or root_body
+    if has:
+      params = terms["root_ori"].params
+      if abs(float(params["threshold"]) - float(heads_cfg.root_ori_term)) > 1e-9:
+        raise ValueError(f"root-orientation threshold mismatch: env {params['threshold']} vs HeadsCfg.root_ori_term {heads_cfg.root_ori_term}")
+      if params["body_name"] != name:
+        raise ValueError(f"root-orientation body mismatch: env {params['body_name']!r} vs heads {name!r} (robot root {root_body!r}; "
+                         "env_cfg.ROOT_BODY wrong for this model?)")
+    tracked = tuple(env.command_manager.get_term("motion").cfg.body_names)
+    if name not in tracked:
+      if on:
+        raise ValueError(f"root-orientation body {name!r} is not a tracked body {tracked}")
+      return name, None
+    return name, tracked.index(name)
 
   # ---- state -----------------------------------------------------------------
 

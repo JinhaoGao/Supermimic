@@ -115,9 +115,9 @@ def test_clusters():
 def test_root_z_head():
   from supermimic.heads import AnalyticHeads, HeadsCfg
 
-  cfg = HeadsCfg(root_z_term=0.25)
+  cfg = HeadsCfg(root_z_term=0.25, ee_termination=False)
   h = AnalyticHeads.__new__(AnalyticHeads)  # only termination(): set the attributes it reads
-  h.cfg, h.anchor, h.root_ori, h.ee = cfg, 1, 0, []
+  h.cfg, h.anchor, h.root_ori, h.root_ori_is_root, h.ee = cfg, 1, 0, True, torch.zeros(0, dtype=torch.long)
   h.gravity = torch.tensor([0.0, 0.0, -1.0])
   B = 4
   ref_bp = torch.zeros(B, 2, 3)
@@ -127,7 +127,7 @@ def test_root_z_head():
   ref_bp[:, 1, 2] = 1.05
   kin = {"anchor_pos": ref_bp[:, 1].clone(), "anchor_quat": ref_bq[:, 1].clone(), "body_pos": ref_bp.clone(), "body_quat": ref_bq.clone()}
   kin["body_pos"][:, 0, 2] = torch.tensor([0.78, 0.60, 0.50, 0.40])  # pelvis height errors 0, 0.18, 0.28, 0.38
-  hard, p = h.termination(kin, ref_bp, ref_bq)
+  hard, p = h.termination(kin, ref_bp[:, 1], ref_bq[:, 1], ref_bp)
   assert hard.tolist() == [False, False, True, True], hard
   assert float(p[0]) < 1e-3 and float(p[1]) < 0.05 and float(p[2]) > 0.75 and float(p[3]) > 0.99, p
   print("root_z head ok")
