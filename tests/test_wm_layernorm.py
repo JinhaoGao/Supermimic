@@ -81,6 +81,31 @@ def test_graft_from_a_checkpoint_without_layernorm():
   assert len(opt_new.state_dict()["state"]) == len(list(new.parameters()))
 
 
+def test_acro_weight():
+  """acro_weight 1 = the plain mean (bitwise); > 1 moves the loss toward the acrobatic transitions' error."""
+  torch.manual_seed(2)
+  cfg0 = WorldModelCfg(hidden=(32, 32))
+  m0 = DynamicsModel(J, XD, DT, cfg0)
+  for p in m0.net[-1].parameters():
+    torch.nn.init.normal_(p, std=0.1)
+  m1 = DynamicsModel(J, XD, DT, WorldModelCfg(hidden=(32, 32), acro_weight=1.0))
+  m4 = DynamicsModel(J, XD, DT, WorldModelCfg(hidden=(32, 32), acro_weight=4.0, acro_ang_vel=1.0))
+  m1.load_state_dict(m0.state_dict())
+  m4.load_state_dict(m0.state_dict())
+  n, k = 32, 3
+  s0, _, xi = batch(n)
+  acts = torch.randn(n, k, J)
+  nxt = torch.stack([batch(n, seed=10 + j)[0] for j in range(k)], dim=1)
+  nxt[: n // 2, :, 10:13] = 0.0  # first half: still -> not acrobatic (start state of step j >= 1)
+  nxt[n // 2 :, :, 10:13] = 5.0  # second half: spinning
+  mask = torch.ones(n, dtype=torch.bool)
+  l0, *_ = m0.window_loss(s0, acts, nxt, xi, mask)
+  l1, *_ = m1.window_loss(s0, acts, nxt, xi, mask)
+  l4, *_ = m4.window_loss(s0, acts, nxt, xi, mask)
+  assert torch.equal(l0, l1), (l0, l1)
+  assert not torch.allclose(l0, l4)
+
+
 if __name__ == "__main__":
   for name, fn in list(globals().items()):
     if name.startswith("test_") and callable(fn):

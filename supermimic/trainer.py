@@ -909,6 +909,7 @@ class Trainer:
       ("wm.layernorm", bool((ck_cfg.get("wm") or {}).get("layernorm", False)), bool(cur.wm.layernorm)),
       ("wm.input_clip", float((ck_cfg.get("wm") or {}).get("input_clip", 0.0)), float(cur.wm.input_clip)),
       ("wm.min_std", float((ck_cfg.get("wm") or {}).get("min_std", 1e-4)), float(cur.wm.min_std)),
+      ("wm.acro_weight", float((ck_cfg.get("wm") or {}).get("acro_weight", 1.0)), float(cur.wm.acro_weight)),
       ("sampler_cap", float(ck_cfg.get("sampler_cap", 0.0)), float(cur.sampler_cap)),
       ("sampler_clusters", int(ck_cfg.get("sampler_clusters", 0)), int(cur.sampler_clusters)),
       ("sampler_boot_mean", bool(ck_cfg.get("sampler_boot_mean", False)), bool(cur.sampler_boot_mean)),

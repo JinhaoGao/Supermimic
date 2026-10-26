@@ -169,6 +169,10 @@ def main():
                       "identity LayerNorms -> use --policy_delay)")
   p.add_argument("--wm_input_clip", type=float, default=0.0, help="clamp of the world model's normalized inputs (0 = off)")
   p.add_argument("--wm_min_std", type=float, default=1e-4, help="floor of the world model's input normalizer std")
+  p.add_argument("--wm_acro_weight", type=float, default=1.0,
+                 help="weight of acrobatic transitions in the world-model loss (start state spinning > --wm_acro_ang_vel "
+                      "rad/s or root tilted past 60 deg); 1 = off")
+  p.add_argument("--wm_acro_ang_vel", type=float, default=4.0, help="angular speed [rad/s] of an acrobatic WM transition")
   p.add_argument("--policy_delay", type=int, default=0, help="iterations of world-model-only fitting after start / resume")
   p.add_argument("--policy_freeze", type=int, default=0, help="then iterations of critic fitting without policy steps")
   p.add_argument("--wm_delay_lr", type=float, default=1.0, help="world-model lr multiplier during --policy_delay")
@@ -377,7 +381,7 @@ def main():
     dist_timeout_min=args.dist_timeout_min,
     wm=WorldModelCfg(k=args.wm_k, lr=lr, batches_per_update=args.wm_batches, windows_per_batch=args.wm_windows,
                      body_frame=args.wm_body_frame, layernorm=args.wm_layernorm, input_clip=args.wm_input_clip,
-                     min_std=args.wm_min_std),
+                     min_std=args.wm_min_std, acro_weight=args.wm_acro_weight, acro_ang_vel=args.wm_acro_ang_vel),
     heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos, goal_ref_root=args.goal_ref_root, critic_errors=args.critic_errors,
                    ee_termination=ee_on, ee_term_z=ee_thr, root_ori_term=args.root_ori_term,
                    root_ori_term_temp=args.root_ori_term_temp, root_ori_body=args.root_ori_body,

@@ -96,6 +96,12 @@ class WorldModelCfg:
   layernorm: bool = False
   input_clip: float = 0.0
   min_std: float = 1e-4
+  # Acrobatic-step weighting of the k-step loss (10-26; the flips fail in flight, where the WM error is ~40x the flat
+  # one): a transition whose (true) start state spins faster than acro_ang_vel rad/s or tilts the root's up axis below
+  # acro_up_z (0.5 = 60 deg) weighs acro_weight in the (weighted-mean) loss. 1 = off = the plain mean, bitwise.
+  acro_weight: float = 1.0
+  acro_ang_vel: float = 4.0
+  acro_up_z: float = 0.5
 
 
 class DynamicsModel(nn.Module):
@@ -225,7 +231,16 @@ class DynamicsModel(nn.Module):
       errs.append(self.state_error(s, next_states[:, j]))
     errs = torch.stack(errs, dim=1)  # [n,k]
     m = (mask if mask.dim() == 2 else mask[:, None].expand(-1, k)).float()  # [n,k] step mask
-    loss = (errs * m).sum() / m.sum().clamp(min=1.0)
+    c = self.cfg
+    if c.acro_weight != 1.0:
+      prev = torch.cat([s0[:, None], next_states[:, :-1]], dim=1)  # true start state of every transition [n,k,D]
+      qw = prev[..., 3:7]
+      up_z = 1.0 - 2.0 * (qw[..., 1] ** 2 + qw[..., 2] ** 2)  # root up axis . world z
+      acro = (prev[..., 10:13].norm(dim=-1) > c.acro_ang_vel) | (up_z < c.acro_up_z)
+      wm_ = m * (1.0 + (c.acro_weight - 1.0) * acro.float())
+      loss = (errs * wm_).sum() / wm_.sum().clamp(min=1.0)
+    else:
+      loss = (errs * m).sum() / m.sum().clamp(min=1.0)
     e1 = (errs[:, 0] * m[:, 0]).sum() / m[:, 0].sum().clamp(min=1.0)
     ek = (errs[:, -1] * m[:, -1]).sum() / m[:, -1].sum().clamp(min=1.0)
     return loss, e1.detach(), ek.detach()
