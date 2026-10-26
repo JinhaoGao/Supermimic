@@ -44,7 +44,6 @@ else
 ROBOT=${ROBOT:?set ROBOT=g1|e2 with SKIP_EXPORT}
 fi
 if [ -n "${OFFLINE:-}" ]; then
-  [ "$ROBOT" = g1 ] || { echo "[submit] OFFLINE evaluation is G1 only" >&2; exit 1; }
   retry $SSH tencent_bj31 "cd ~/work/supermimic_eval_onnx && mkdir -p evaluator_r18/runs && (setsid bash evaluator_r18/eval_r18.sh $OUT evaluator_r18/runs/${RUN}_$IT 48 > evaluator_r18/runs/${RUN}_$IT.out 2>&1 < /dev/null &)"
   echo "[submit] offline evaluation started: bj31 ~/work/supermimic_eval_onnx/evaluator_r18/runs/${RUN}_$IT ($NAME)"
   exit 0

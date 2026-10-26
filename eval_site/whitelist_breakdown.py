@@ -1,5 +1,5 @@
 """Whitelist / high-dynamic breakdown of site runs on a v4 dataset.
-  python whitelist_breakdown.py <dataset_dir> label=run_id ...
+  python whitelist_breakdown.py <dataset_dir> label=run_id|report_dir ...  (report_dir: e.g. an eval_r18.sh offline run)
 Groups: the GMT hard-set whitelist (noetix_kungfu, noetix_kungfu_dance_show, sportsmeeting) split by move type
 from the clip names, plus g1_all (robot_acro / balance / lie_getup ...)."""
 import collections
@@ -43,7 +43,8 @@ def group_of(name):
 tabs = []
 for label, run in pairs:
     t = collections.defaultdict(lambda: [0, 0])
-    for r in csv.DictReader(open(f"/home/ubuntu/work/NOetix_GMT_eval/storage/runs/{run}/evaluation_per_segment.csv")):
+    run_dir = run if os.path.isdir(run) else f"/home/ubuntu/work/NOetix_GMT_eval/storage/runs/{run}"  # site run id or report dir
+    for r in csv.DictReader(open(f"{run_dir}/evaluation_per_segment.csv")):
         g = group_of(r["motion_name"])
         if g is None:
             continue
