@@ -105,6 +105,13 @@ class LibraryMotionCommand(MotionCommand):
         hit = torch.tensor([nw > 1.0 for nw in name_w], device=self.device)[lib.bin_clip]
         print(f"[LibraryMotionCommand] name keywords {nws}: {int(sum(nw > 1.0 for nw in name_w))} clips, "
               f"{hit.float().mean().item() * 100:.2f}% of bins -> {self.bin_prior[hit].sum().item() * 100:.2f}% of the uniform share")
+    # Cluster-balanced prior (allmimic, see bin_clusters.py): multiplies the source / keyword prior of the uniform share.
+    if cfg.cluster_k > 0:
+      from .bin_clusters import bin_cluster_prior
+
+      cw = bin_cluster_prior(lib, cfg.cluster_k, cfg.cluster_alpha, self.device, log=print)
+      base = self.bin_prior if self.bin_prior is not None else torch.full((NB,), 1.0 / NB, device=self.device)
+      self.bin_prior = base * cw / (base * cw).sum()
     # Hard-clip termination curriculum (v2 r13): clips whose name contains a hard_names keyword get every
     # termination threshold (env terms below + the trainer's soft head) multiplied by hard_mult, which the
     # trainer anneals back to 1; other clips keep 1. Episodes keep the factor of the clip they reset into.
@@ -223,6 +230,8 @@ class LibraryMotionCommand(MotionCommand):
     bin_G = self.bin_G.clamp(0.0, c.g_max) if c.clamp_returns else self.bin_G
     G = torch.where(self.bin_visits > 0, bin_G, torch.full_like(self.bin_G, c.g_max * 0.5))
     soft = torch.softmax(-c.softmax_temp * G / c.g_max, dim=0)
+    if c.softmax_cap > 0:
+      soft = cap_simplex(soft, c.softmax_cap / NB)
     hist = self.bin_weight_hist / self.bin_weight_hist.sum()
     probs = c.mix_uniform * uniform + c.mix_softmax * soft + c.mix_history * hist
     probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0) + 1e-12
@@ -302,6 +311,27 @@ class LibraryMotionCommand(MotionCommand):
     self.update_relative_body_poses()
 
 
+@torch.no_grad()
+def cap_simplex(p: torch.Tensor, cap: float) -> torch.Tensor:
+  """Water-filling cap of a distribution: min(cap, s * p) with s such that the result sums to 1 (the mass above the cap
+  goes to the uncapped entries in proportion; needs cap * len(p) >= 1). Exact, via one sort (float64)."""
+  if float(p.max()) <= cap * float(p.sum()):
+    return p
+  q, idx = torch.sort(p.double(), descending=True)
+  q = q / q.sum()
+  k = torch.arange(q.numel(), device=q.device, dtype=torch.float64)  # entries before position k are capped
+  rest = (1.0 - (torch.cumsum(q, 0) - q)).clamp(min=1e-300)  # mass of the entries from k on
+  s = (1.0 - k * cap) / rest
+  ok = (s * q <= cap) & (k * cap < 1.0)  # first such k: the capped set is exactly the k largest entries
+  k0 = int(torch.argmax(ok.to(torch.uint8)).item())
+  assert bool(ok[k0]), "cap_simplex: cap * len(p) must be >= 1"
+  out = torch.empty_like(q)
+  out[:k0] = cap
+  out[k0:] = s[k0] * q[k0:]
+  res = torch.empty_like(out).scatter_(0, idx, out)
+  return (res / res.sum()).to(p.dtype)
+
+
 def motion_clip_end(env: "ManagerBasedRlEnv", command_name: str) -> torch.Tensor:
   """Time-out when the reference clip has been played to its last frame."""
   cmd = env.command_manager.get_term(command_name)
@@ -340,6 +370,15 @@ def bad_root_ori_full(env: "ManagerBasedRlEnv", command_name: str, threshold: fl
   return quat_angle(ref_q, rob_q) > threshold * cmd.term_scale_env  # type: ignore[attr-defined]
 
 
+def bad_root_pos_z(env: "ManagerBasedRlEnv", command_name: str, threshold: float, body_name: str) -> torch.Tensor:
+  """Root-height termination (HeadsCfg.root_z_term): |z_ref - z_robot| of ``body_name`` (the root: G1 pelvis) >
+  threshold x term_scale_env; the team eval site's root_pos test (root_pos_mode z). Flat ground: env origins have z = 0."""
+  cmd = env.command_manager.get_term(command_name)
+  ref_z = cmd.body_pos_w[:, cmd.cfg.body_names.index(body_name), 2]  # type: ignore[attr-defined]
+  rob_z = cmd.robot.data.body_link_pos_w[:, cmd.robot.body_names.index(body_name), 2]  # type: ignore[attr-defined]
+  return (ref_z - rob_z).abs() > threshold * cmd.term_scale_env  # type: ignore[attr-defined]
+
+
 @dataclass(kw_only=True)
 class LibraryMotionCommandCfg(MotionCommandCfg):
   motion_files: tuple[str, ...] = ()
@@ -359,6 +398,12 @@ class LibraryMotionCommandCfg(MotionCommandCfg):
   source_weights: tuple = ()  # ((source prefix, weight), ...): prior of the uniform share, see LibraryMotionCommand
   name_weights: tuple = ()  # ((name keyword, weight), ...): max with the source weight (case-insensitive substring)
   hard_names: tuple = ()  # clip-name keywords of the hard set (termination curriculum, case-insensitive substring)
+  # allmimic sampler pieces (10-26): cap every bin of the softmax share at softmax_cap x the uniform share 1/NB
+  # (allmimic: 50; 0 = off). Without it about half of all resets went to ~1.6k mostly always-failing bins of 5.4M
+  # (G1 r25 208000: 90 % of the softmax mass on G <= 1.1). cluster_k > 0: cluster-balanced prior (bin_clusters.py).
+  softmax_cap: float = 0.0
+  cluster_k: int = 0
+  cluster_alpha: float = 0.3
   sampling_mode: Literal["return", "uniform", "start"] = "return"  # type: ignore[assignment]
   cache_dir: str = ""
   num_workers: int = 32

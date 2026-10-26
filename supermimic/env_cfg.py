@@ -19,7 +19,7 @@ from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationT
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.tasks.tracking import mdp
 
-from .library_command import LibraryMotionCommandCfg, bad_root_ori_full, motion_clip_end
+from .library_command import LibraryMotionCommandCfg, bad_root_ori_full, bad_root_pos_z, motion_clip_end
 
 # Robot root (free-joint) body: the body of the root-orientation termination (the eval site compares qpos[3:7]).
 ROOT_BODY = {"g1": "pelvis", "e2": "base_link"}
@@ -96,6 +96,10 @@ def make_env_cfg(
   hard_names: tuple = (),
   clamp_returns: bool = False,
   root_ori_term: float = 0.0,
+  root_z_term: float = 0.0,
+  softmax_cap: float = 0.0,
+  cluster_k: int = 0,
+  cluster_alpha: float = 0.3,
 ) -> ManagerBasedRlEnvCfg:
   assert mode in ("train", "eval")
   cfg = base_tracking_cfg(robot, robot_variant)
@@ -124,6 +128,9 @@ def make_env_cfg(
     name_weights=tuple(tuple(kv) for kv in name_weights) if mode == "train" else (),
     hard_names=tuple(hard_names) if mode == "train" else (),
     clamp_returns=clamp_returns,
+    softmax_cap=softmax_cap if mode == "train" else 0.0,
+    cluster_k=cluster_k if mode == "train" else 0,
+    cluster_alpha=cluster_alpha,
   )
 
   # Minimal observation group (the trainer builds policy inputs itself).
@@ -164,6 +171,10 @@ def make_env_cfg(
   if root_ori_term > 0:  # the eval site's root_ori test (train and eval mode, like ee_body_pos); HeadsCfg.root_ori_term
     cfg.terminations["root_ori"] = TerminationTermCfg(
       func=bad_root_ori_full, params={"command_name": "motion", "threshold": float(root_ori_term), "body_name": ROOT_BODY[robot]}
+    )
+  if root_z_term > 0:  # the eval site's root_pos test (mode z); HeadsCfg.root_z_term
+    cfg.terminations["root_z"] = TerminationTermCfg(
+      func=bad_root_pos_z, params={"command_name": "motion", "threshold": float(root_z_term), "body_name": ROOT_BODY[robot]}
     )
   cfg.terminations["clip_end"] = TerminationTermCfg(
     func=motion_clip_end, params={"command_name": "motion"}, time_out=True

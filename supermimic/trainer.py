@@ -49,6 +49,13 @@ class TrainCfg:
   hard_names: tuple = ()
   hard_term_schedule: tuple = ()
   sampler_clamp_returns: bool = False  # reset sampler bin returns clamped to [0, g_max] (library_command)
+  # allmimic sampler pieces (10-26; LibraryMotionCommandCfg.softmax_cap / cluster_k / cluster_alpha): per-bin cap of the
+  # softmax share at sampler_cap x uniform, cluster-balanced uniform share; sampler_boot_mean bootstraps time-outs with
+  # the episode's mean reward instead of its last reward (one joint-limit penalty step no longer sinks a bin).
+  sampler_cap: float = 0.0
+  sampler_clusters: int = 0
+  sampler_cluster_alpha: float = 0.3
+  sampler_boot_mean: bool = False
   num_envs: int = 4096
   device: str = "cuda:0"
   seed: int = 0
@@ -179,7 +186,8 @@ class Trainer:
       library_key=self.LIB_KEY, cache_dir=cfg.cache_dir, num_workers=cfg.num_workers,
       ee_term_z=cfg.heads.ee_term_z, robot_variant=cfg.robot_variant, source_weights=cfg.source_weights,
       name_weights=cfg.name_weights, hard_names=cfg.hard_names, clamp_returns=cfg.sampler_clamp_returns,
-      root_ori_term=cfg.heads.root_ori_term,
+      root_ori_term=cfg.heads.root_ori_term, root_z_term=cfg.heads.root_z_term, softmax_cap=cfg.sampler_cap,
+      cluster_k=cfg.sampler_clusters, cluster_alpha=cfg.sampler_cluster_alpha,
     )
     env_cfg.seed = cfg.seed
     self.env = ManagerBasedRlEnv(cfg=env_cfg, device=self.device)
@@ -316,6 +324,8 @@ class Trainer:
     t = torch.arange(Lmax, device=self.device)
     valid = t[None, :] < L[:, None]
     r_last = rews.gather(1, (L - 1)[:, None]).squeeze(1)
+    if self.cfg.sampler_boot_mean:
+      r_last = self.ep_ret[ids] / L.float().clamp(min=1.0)
     boot = torch.where(failed, torch.zeros_like(r_last), r_last / (1.0 - g))
     w = rews * valid * self._gamma_pow[:Lmax][None, :]
     S = torch.flip(torch.cumsum(torch.flip(w, [1]), 1), [1])

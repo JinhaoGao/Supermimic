@@ -51,7 +51,13 @@ class SimInterface:
     ro_thr = float(ro_term.params["threshold"]) if ro_term is not None else 0.0
     if abs(ro_thr - heads_cfg.root_ori_term) > 1e-9:
       raise ValueError(f"env root_ori threshold {ro_thr} != heads root_ori_term {heads_cfg.root_ori_term}")
-    ro_idx = tracked_names.index(ro_term.params["body_name"]) if ro_term is not None else None
+    # Root-height termination: same switch / threshold in the env (root_z) and the heads; both root terms use the root body.
+    rz_term = env.cfg.terminations.get("root_z")
+    rz_thr = float(rz_term.params["threshold"]) if rz_term is not None else 0.0
+    if abs(rz_thr - heads_cfg.root_z_term) > 1e-9:
+      raise ValueError(f"env root_z threshold {rz_thr} != heads root_z_term {heads_cfg.root_z_term}")
+    root_term = ro_term if ro_term is not None else rz_term
+    ro_idx = tracked_names.index(root_term.params["body_name"]) if root_term is not None else None
     self.heads = AnalyticHeads(
       self.fk,
       tracked_local,
@@ -74,9 +80,12 @@ class SimInterface:
     self.env_origins = env.scene.env_origins.to(self.device)
     self.com_scale = torch.tensor(self.COM_RANGE, device=self.device)
     # MuJoCo Warp prints a solver/linesearch overflow warning every step the
-    # iteration cap is hit (common with random actions); silence it.
+    # iteration cap is hit (common with random actions); silence it. The flag is a
+    # compile-time constant of the kernels (wp.static), baked into the CUDA graphs
+    # captured at env construction, so the graphs are re-captured after changing it.
     try:
       env.sim.wp_model.opt.warn_overflow = 0
+      env.sim.create_graph()
     except Exception:  # noqa: BLE001
       pass
 

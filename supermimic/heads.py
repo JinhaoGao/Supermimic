@@ -88,6 +88,11 @@ class HeadsCfg:
   # term sigmoid((angle - A) / root_ori_term_temp) in the noisy-OR. 0 = off.
   root_ori_term: float = 0.0
   root_ori_term_temp: float = 0.05
+  # Root-height termination (10-26): fail when the root's (G1 pelvis) height error vs the reference exceeds root_z_term m,
+  # the eval site's root_pos test (root_pos_mode z, 0.25 m); the anchor-height test compares the torso, which the waist
+  # decouples from the pelvis. Soft term sigmoid((dz - Z) / root_z_term_temp) in the noisy-OR. 0 = off.
+  root_z_term: float = 0.0
+  root_z_term_temp: float = 0.02
   extra: dict = field(default_factory=dict)
 
   @property
@@ -121,9 +126,9 @@ class AnalyticHeads:
     self.ee = torch.as_tensor(list(ee_indices or []), dtype=torch.long, device=self.device)  # within the tracked list
     if cfg.ee_term_z > 0 and self.ee.numel() == 0:
       raise ValueError("ee_term_z > 0 needs the end-effector bodies (env termination 'ee_body_pos')")
-    self.root_ori = root_ori_index  # root body (pelvis) within the tracked-body list (root_ori_term)
-    if cfg.root_ori_term > 0 and root_ori_index is None:
-      raise ValueError("root_ori_term > 0 needs the root body's index in the tracked-body list")
+    self.root_ori = root_ori_index  # root body (pelvis) within the tracked-body list (root_ori_term / root_z_term)
+    if (cfg.root_ori_term > 0 or cfg.root_z_term > 0) and root_ori_index is None:
+      raise ValueError("root_ori_term / root_z_term > 0 needs the root body's index in the tracked-body list")
     self.anchor = anchor_index  # index within the tracked-body list
     self.anchor_local = int(tracked_local_ids[anchor_index])
     self.nj = default_joint_pos.shape[-1]
@@ -295,4 +300,8 @@ class AnalyticHeads:
       ang = quat_angle(ref_bq[:, self.root_ori], kin_next["body_quat"][:, self.root_ori])
       hard = hard | (ang > c.root_ori_term * k)
       alive = alive * (1.0 - torch.sigmoid((ang - c.root_ori_term * k) / (c.root_ori_term_temp * k)))
+    if c.root_z_term > 0:
+      rz = (ref_bp[:, self.root_ori, 2] - kin_next["body_pos"][:, self.root_ori, 2]).abs()
+      hard = hard | (rz > c.root_z_term * k)
+      alive = alive * (1.0 - torch.sigmoid((rz - c.root_z_term * k) / (c.root_z_term_temp * k)))
     return hard, 1.0 - alive

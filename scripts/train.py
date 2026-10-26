@@ -38,6 +38,13 @@ def main():
   p.add_argument("--hard_term_schedule", type=str, default="",
                  help="termination multiplier of the hard set, piecewise linear over absolute iterations, e.g. 104000:2,108000:2,114000:1")
   p.add_argument("--sampler_clamp_returns", action="store_true", help="clamp reset-sampler bin returns to [0, g_max]")
+  p.add_argument("--sampler_cap", type=float, default=0.0,
+                 help="cap every bin's softmax share at this x the uniform share 1/num_bins (allmimic: 50); 0 = off")
+  p.add_argument("--sampler_clusters", type=int, default=0,
+                 help="k-means clusters of 12 kinematic bin features; the uniform share becomes cluster-balanced (allmimic: 256)")
+  p.add_argument("--sampler_cluster_alpha", type=float, default=0.3, help="cluster share ~ n_bins^alpha")
+  p.add_argument("--sampler_boot_mean", action="store_true",
+                 help="sampler returns: bootstrap time-outs with the episode's mean reward instead of its last reward")
   p.add_argument("--ee_term_z", type=float, default=0.0,
                  help="end-effector height termination in m (env + soft head); 0 = off as in the paper, 0.25 = BeyondMimic / team benchmark")
   p.add_argument("--run_name", type=str, default="run")
@@ -58,6 +65,10 @@ def main():
                  help="terminate when the robot root's (G1 pelvis) full rotation angle vs the reference, yaw included, exceeds "
                       "this [rad] (env + soft term in imagination); 1.0 = the eval site's root_ori test; 0 = off")
   p.add_argument("--root_ori_term_temp", type=float, default=0.05, help="sigmoid temperature of the imagined root_ori term")
+  p.add_argument("--root_z_term", type=float, default=0.0,
+                 help="terminate when the robot root's (G1 pelvis) height error vs the reference exceeds this [m] (env + soft "
+                      "term in imagination); 0.25 = the eval site's root_pos test (mode z); 0 = off")
+  p.add_argument("--root_z_term_temp", type=float, default=0.02, help="sigmoid temperature of the imagined root_z term")
   p.add_argument("--wm_body_frame", action="store_true",
                  help="WM features / targets in the root frame (no ZYX heading, singular at pitch +-90 deg); resuming a "
                       "heading-frame checkpoint starts a fresh WM -> use --policy_delay")
@@ -117,6 +128,10 @@ def main():
     name_weights=tuple((kv.split("=")[0], float(kv.split("=")[1])) for kv in args.name_weights.split(",") if kv),
     hard_names=tuple(k for k in args.hard_names.split(",") if k),
     sampler_clamp_returns=args.sampler_clamp_returns,
+    sampler_cap=args.sampler_cap,
+    sampler_clusters=args.sampler_clusters,
+    sampler_cluster_alpha=args.sampler_cluster_alpha,
+    sampler_boot_mean=args.sampler_boot_mean,
     hard_term_schedule=tuple((int(kv.split(":")[0]), float(kv.split(":")[1])) for kv in args.hard_term_schedule.split(",") if kv),
     num_envs=args.num_envs,
     device=args.device,
@@ -156,7 +171,8 @@ def main():
     policy_freeze=args.policy_freeze,
     wm_delay_lr=args.wm_delay_lr,
     heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos, goal_ref_root=args.goal_ref_root, critic_errors=args.critic_errors,
-                   ee_term_z=args.ee_term_z, root_ori_term=args.root_ori_term, root_ori_term_temp=args.root_ori_term_temp),
+                   ee_term_z=args.ee_term_z, root_ori_term=args.root_ori_term, root_ori_term_temp=args.root_ori_term_temp,
+                   root_z_term=args.root_z_term, root_z_term_temp=args.root_z_term_temp),
   )
   print(f"[train] log_dir = {log_dir}")
   os.makedirs(log_dir, exist_ok=True)
