@@ -89,6 +89,13 @@ class WorldModelCfg:
   # position targets in the root frame. The default removes the ZYX-Euler heading instead, which is singular at
   # pitch +-90 deg: in a back flip the heading jumps by pi as the torso passes vertical, so features and targets jump.
   body_frame: bool = False
+  # Flight-phase robustness (open-source comparison 10-25, allmimic networks.py: 3x2048 SiLU + LayerNorm): during flips the
+  # normalized WM inputs reach 10-20 sigma unclamped. layernorm: LayerNorm after every hidden Linear (separate modules, the
+  # net.* keys stay as they are, so heading / root-frame checkpoints graft in: Trainer._graft_wm_ln); input_clip > 0
+  # clamps the normalized inputs; min_std is the floor of the input normalizer's std (review: >= 1e-2).
+  layernorm: bool = False
+  input_clip: float = 0.0
+  min_std: float = 1e-4
 
 
 class DynamicsModel(nn.Module):
@@ -97,10 +104,12 @@ class DynamicsModel(nn.Module):
     self.nj, self.xi_dim, self.dt, self.cfg = nj, xi_dim, dt, cfg
     self.feat_dim = (10 if cfg.body_frame else 13) + 2 * nj
     self.out_dim = 12 + 2 * nj  # dv(3) dw(3) dqd(J) rp(3) rr(3) rq(J)
-    self.in_norm = RunningMeanStd(self.feat_dim + nj)  # features + action
+    self.in_norm = RunningMeanStd(self.feat_dim + nj, min_std=cfg.min_std)  # features + action
     self.tgt_norm = RunningMeanStd(self.out_dim)
     self.err_norm = RunningMeanStd(12 + 2 * nj)  # dp drot dv dw dq dqd (1-step diffs)
     self.net = mlp(self.feat_dim + nj + xi_dim, cfg.hidden, self.out_dim, zero_last=True)
+    if cfg.layernorm:  # registered after net: its parameters come after net's in parameters() (optimizer graft)
+      self.ln = nn.ModuleList([nn.LayerNorm(h) for h in cfg.hidden])
 
   # ---- state algebra -------------------------------------------------------
 
@@ -166,8 +175,21 @@ class DynamicsModel(nn.Module):
 
   def step(self, s: torch.Tensor, a: torch.Tensor, xi: torch.Tensor) -> torch.Tensor:
     x = self.in_norm.normalize(torch.cat([self.features(s), a], dim=-1))
-    out_n = self.net(torch.cat([x, xi], dim=-1))
+    if self.cfg.input_clip > 0:
+      x = x.clamp(-self.cfg.input_clip, self.cfg.input_clip)
+    out_n = self._run_net(torch.cat([x, xi], dim=-1))
     return self.compose(s, self.tgt_norm.denormalize(out_n))
+
+  def _run_net(self, h: torch.Tensor) -> torch.Tensor:
+    if not self.cfg.layernorm:
+      return self.net(h)
+    mods, k = list(self.net), 0
+    for m in mods[:-1]:  # Linear, act, Linear, act, ...: LayerNorm between each hidden Linear and its activation
+      h = m(h)
+      if isinstance(m, nn.Linear):
+        h = self.ln[k](h)
+        k += 1
+    return mods[-1](h)
 
   def state_error(self, s_pred: torch.Tensor, s_true: torch.Tensor) -> torch.Tensor:
     """Per-sample normalized squared error (mean over components)."""

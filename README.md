@@ -43,7 +43,7 @@
 | `scripts/eval_ckpt.py`、`check_fk.py`、`wm_diag.py`、`avg_ckpt.py` | 离线评测、FK 校验、世界模型诊断、权重平均 |
 | `scripts/launch_*.sh` | 集群启动脚本（bj27 单卡、bj31 多卡；路径用环境变量覆盖） |
 | `eval_site/` | 团队评测站插件 `eval_supermimic.py`、站点补丁、离线 v4 评测器 `eval_r18.sh`、提交脚本 `submit_v4.sh`、失败分析工具 |
-| `tests/` | CPU 单元测试（15 个文件，见"测试"） |
+| `tests/` | CPU 单元测试（16 个文件，见"测试"） |
 | `tools/` | 两条训练线的诊断和 bj31 运维脚本（采样器探针、退化 / 骨盆 / root_pos 逐帧复跑、v4 差距分析、自动导出上站），见 `tools/README.md` |
 | `docs/README_legacy_en.md` | 之前的英文 README（逐轮日志、数据并行实现细节、看门狗事故记录） |
 | `docs/bj31_8gpu_handoff_1026/` | bj31 8 卡线交接：经验总结（配方、对照、退化 / 骨盆 / root_pos 诊断、运维坑）和合并核对清单 |
@@ -135,6 +135,7 @@ NPROC=8 bash scripts/launch_bj31_ddp.sh <run> --num_threads 24 --motion_list <g1
 | goal / critic | `--goal_ref_root` | goal 每帧加参考躯干高度 + 本体系线/角速度 + 重力（10 维，只用参考侧，可部署）；**有效**（骨盆终止之上 +0.5pp，E2 +0.4） |
 | | `--critic_errors` | critic 加特权跟踪误差特征；无效 |
 | 世界模型 | `--wm_body_frame`、`--policy_delay`、`--policy_freeze`、`--wm_delay_lr` | 本体系 WM（去掉俯仰 ±90° 的航向奇异）；无收益，翻腾失败阶段不变 |
+| | `--wm_layernorm`、`--wm_input_clip`、`--wm_min_std` | 世界模型隐藏层加 LayerNorm、归一化输入钳位、归一化 std 下限（allmimic 的做法：翻腾时输入到 10~20σ）；续训无 LayerNorm 的 ckpt 会嫁接（LayerNorm 从恒等初始化开始，配 `--policy_delay`）；待验证 |
 | 采样器 | `--source_weights`、`--name_weights` | 来源 / 关键词先验（只作用在均匀份额上） |
 | | `--sampler_clamp_returns` | bin 回报钳到 [0, g_max]；**有效**（+0.8，防片尾负奖励吸走全部份额） |
 | | `--sampler_cap 50` | softmax 份额每 bin 封顶 50×均匀（allmimic）；G1 r25 时一半重置落在 0.03% 的 bin 上；待 r28 验证 |

@@ -906,6 +906,9 @@ class Trainer:
       ("action_noise_std", float(ck_cfg.get("action_noise_std", 0.1)), float(cur.action_noise_std)),
       ("env_steps_per_iter", float(ck_cfg.get("env_steps_per_iter", 1.0)), float(cur.env_steps_per_iter)),
       ("wm.body_frame", bool((ck_cfg.get("wm") or {}).get("body_frame", False)), bool(cur.wm.body_frame)),
+      ("wm.layernorm", bool((ck_cfg.get("wm") or {}).get("layernorm", False)), bool(cur.wm.layernorm)),
+      ("wm.input_clip", float((ck_cfg.get("wm") or {}).get("input_clip", 0.0)), float(cur.wm.input_clip)),
+      ("wm.min_std", float((ck_cfg.get("wm") or {}).get("min_std", 1e-4)), float(cur.wm.min_std)),
       ("sampler_cap", float(ck_cfg.get("sampler_cap", 0.0)), float(cur.sampler_cap)),
       ("sampler_clusters", int(ck_cfg.get("sampler_clusters", 0)), int(cur.sampler_clusters)),
       ("sampler_boot_mean", bool(ck_cfg.get("sampler_boot_mean", False)), bool(cur.sampler_boot_mean)),
@@ -966,6 +969,8 @@ class Trainer:
     self.critic.load_state_dict(ck["critic"])
     if bool(ck["cfg"].get("wm", {}).get("body_frame", False)) != self.cfg.wm.body_frame:
       self._graft_wm(ck)
+    if self.cfg.wm.layernorm and not any(k.startswith("ln.") for k in ck["wm"]):
+      self._graft_wm_ln(ck)
     self.wm.load_state_dict(ck["wm"])
     self.opt_wm.load_state_dict(ck["opt_wm"])
     self.opt_pi.load_state_dict(ck["opt_pi"])
@@ -1094,6 +1099,20 @@ class Trainer:
     self._print(f"[Trainer] graft: goal frame {Go} -> {Gn} (new {new}), critic error features {old_err} -> {new_err}, "
           f"critic state features {[n for n, _ in old_feat]} -> {[n for n, _ in new_feat]}")
     return new
+
+  @torch.no_grad()
+  def _graft_wm_ln(self, ck: dict) -> None:
+    """World model without LayerNorm -> with (WorldModelCfg.layernorm), in place on ck: the net.* weights stay, the
+    LayerNorm modules start at their initialization (gain 1, bias 0, the same on every rank) and get fresh Adam state.
+    LayerNorm changes the function, so fit the world model before the policy uses it: --policy_delay."""
+    ln = {k: v.detach().clone() for k, v in self.wm.state_dict().items() if k.startswith("ln.")}
+    ck["wm"].update(ln)
+    names = [k for k, _ in self.wm.named_parameters()]
+    n_old = len(ck["opt_wm"]["param_groups"][0]["params"])
+    assert names[:n_old] == [k for k in names if not k.startswith("ln.")], "LayerNorm parameters must follow net's"
+    ck["opt_wm"]["param_groups"][0]["params"] = list(range(len(names)))  # Adam state of the new ones: lazily fresh
+    self._print(f"[Trainer] world model grafted to LayerNorm: {len(ln) // 2} LayerNorm layers at identity init, "
+                f"policy_delay {self.cfg.policy_delay} (WM lr x{self.cfg.wm_delay_lr})")
 
   @torch.no_grad()
   def _graft_wm(self, ck: dict, n: int = 65536) -> None:
