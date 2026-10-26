@@ -5,7 +5,9 @@
 #   SKIP_EXPORT=1: the ONNX is already on bj31 (only upload + run)
 #   REPRO=<dir>: export with ~/supermimic/<dir> on bj27 (PYTHONPATH; default supermimic_repro = the editable install)
 #   OFFLINE=1: no site upload; run the private offline v4 evaluation on bj31 instead (evaluator_r18/eval_r18.sh,
-#              identical protocol; needed for goal layouts the site does not accept yet, e.g. ref_root)
+#              identical protocol, nothing on the leaderboard)
+# The observation profile follows the ONNX goal_layout: q,qd,rot6d -> supermimic_g1_v1 / e2_supermimic_v1,
+# q,qd,rot6d,ref_root -> supermimic_g1_v2 / e2_supermimic_v2 (site profiles added 10-26). With SKIP_EXPORT set GOAL_LAYOUT.
 # run_name = the bj27 run (logs/*_<run_name>), damping: actuator (kd only, default; G1 eval XML has its own passive
 # damping) or training (kd + passive damping of the training model, v1 E2).
 set -euo pipefail
@@ -33,22 +35,27 @@ BODIES=$G1B; [ "$ROBOT" = e2 ] && BODIES=$E2B
 mkdir -p "$HOME/supermimic/eval_onnx"
 .venv/bin/python ../$REPRO/scripts/export_eval_onnx.py --bundle "$B" --out "$HOME/supermimic/eval_onnx/$OUT" --metric_bodies "$BODIES" --damping "$DAMP" | tail -2
 echo "ROBOT=$ROBOT"
+.venv/bin/python -c "import onnx, sys; m = {p.key: p.value for p in onnx.load(sys.argv[1], load_external_data=False).metadata_props}; print('GOAL_LAYOUT=' + m.get('goal_layout', 'q,qd,rot6d'))" "$HOME/supermimic/eval_onnx/$OUT"
 EOS
 )
 echo "$EXP"
 ROBOT=$(echo "$EXP" | sed -n "s/^ROBOT=//p" | tail -1)
-[ -n "$ROBOT" ] || { echo "[submit] export failed" >&2; exit 1; }
+GOAL_LAYOUT=$(echo "$EXP" | sed -n "s/^GOAL_LAYOUT=//p" | tail -1)
+[ -n "$ROBOT" ] && [ -n "$GOAL_LAYOUT" ] || { echo "[submit] export failed" >&2; exit 1; }
 echo "[submit] relaying $OUT (robot $ROBOT) bj27 -> bj31"
 retry bash -c "$SSH tencent_bj27 'cat ~/supermimic/eval_onnx/$OUT' < /dev/null | $SSH tencent_bj31 'mkdir -p ~/work/supermimic_eval_onnx && cat > ~/work/supermimic_eval_onnx/$OUT'"
 else
 ROBOT=${ROBOT:?set ROBOT=g1|e2 with SKIP_EXPORT}
+GOAL_LAYOUT=${GOAL_LAYOUT:-q,qd,rot6d}
 fi
 if [ -n "${OFFLINE:-}" ]; then
   retry $SSH tencent_bj31 "cd ~/work/supermimic_eval_onnx && mkdir -p evaluator_r18/runs && (setsid bash evaluator_r18/eval_r18.sh $OUT evaluator_r18/runs/${RUN}_$IT 48 > evaluator_r18/runs/${RUN}_$IT.out 2>&1 < /dev/null &)"
   echo "[submit] offline evaluation started: bj31 ~/work/supermimic_eval_onnx/evaluator_r18/runs/${RUN}_$IT ($NAME)"
   exit 0
 fi
-if [ "$ROBOT" = e2 ]; then OBS=e2_supermimic_v1; DS=e2_motionatlas_v4; BM=noetix_e2_motion_official_v1; else OBS=supermimic_g1_v1; DS=g1_motionatlas_v4; BM=kimodo_g1_motion_official_v3; fi
+case "$GOAL_LAYOUT" in q,qd,rot6d) V=v1 ;; q,qd,rot6d,ref_root) V=v2 ;; *) echo "[submit] no site profile for goal_layout $GOAL_LAYOUT" >&2; exit 1 ;; esac
+if [ "$ROBOT" = e2 ]; then OBS=e2_supermimic_$V; DS=e2_motionatlas_v4; BM=noetix_e2_motion_official_v1; else OBS=supermimic_g1_$V; DS=g1_motionatlas_v4; BM=kimodo_g1_motion_official_v3; fi
+echo "[submit] goal_layout $GOAL_LAYOUT -> observation profile $OBS"
 retry $SSH tencent_bj31 "bash -s -- $(printf '%q ' "$OUT" "$NAME" "$OBS" "$DS" "$BM")" <<'EOS'
 set -euo pipefail
 OUT=$1; NAME=$2; OBS=$3; DS=$4; BM=$5

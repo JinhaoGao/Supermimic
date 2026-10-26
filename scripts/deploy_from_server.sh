@@ -9,7 +9,9 @@
 #
 # Steps: export_bundle.py on the server (CPU, mjlab venv) -> scp meta.json + policy.onnx ->
 #        export_deploy.py locally (named ONNX under exported/, deploy.yaml). Reference clips need no conversion.
-# Env: SERVER (tencent_bj27), DEPLOY_DIR (~/Workspace/unitree_mujoco/deploy/robots/g1_29dof), PY (python with numpy).
+# Env: SERVER (tencent_bj27), DEPLOY_DIR (~/Workspace/unitree_mujoco/deploy/robots/g1_29dof), PY (python with numpy),
+#      REPRO (code dir under ~/supermimic on the server, default supermimic_repro; must know the checkpoint's heads, e.g.
+#      goal_ref_root runs: a checkout with chain body_pos in export_bundle.py).
 set -euo pipefail
 RUN="${1:?run name, e.g. g1_atlas_v1}"
 IT="${2:-best}"
@@ -17,15 +19,16 @@ if [ $# -ge 2 ]; then shift 2; else shift $#; fi
 SERVER="${SERVER:-tencent_bj27}"
 DEPLOY_DIR="${DEPLOY_DIR:-$HOME/Workspace/unitree_mujoco/deploy/robots/g1_29dof}"
 PY="${PY:-python3}"
+REPRO="${REPRO:-supermimic_repro}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 BUNDLE="$HOME/supermimic/bundle_deploy_${RUN}"
 
 echo "[deploy] exporting $RUN @ $IT on $SERVER ..."
-ssh -o BatchMode=yes "$SERVER" bash -s -- "$RUN" "$IT" <<'EOS'
+ssh -o BatchMode=yes "$SERVER" bash -s -- "$RUN" "$IT" "$REPRO" <<'EOS'
 set -euo pipefail
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY || true
 export PATH="$HOME/.local/bin:$PATH"
-RUN=$1; IT=$2
+RUN=$1; IT=$2; REPRO=$3
 D=$(ls -d "$HOME"/supermimic/logs/*_"$RUN" | tail -1)
 CK=$(python3 - "$D" "$IT" <<'PY'
 import glob, json, os, re, sys
@@ -54,7 +57,7 @@ PY
 [ -n "$CK" ] && [ -f "$CK" ] || { echo "[deploy] no checkpoint selected" >&2; exit 1; }
 echo "[deploy] checkpoint $CK"
 cd "$HOME/supermimic/mjlab"
-CUDA_VISIBLE_DEVICES= uv run python ../supermimic_repro/scripts/export_bundle.py --ckpt "$CK" \
+PYTHONPATH="$HOME/supermimic/$REPRO" CUDA_VISIBLE_DEVICES= uv run python "../$REPRO/scripts/export_bundle.py" --ckpt "$CK" \
   --motion "$HOME/supermimic/data/lafan1/g1__lafan1_dance1_subject1.npz" --out "$HOME/supermimic/bundle_deploy_$RUN" --device cpu 2>&1 \
   | grep "^\[export\]"
 EOS

@@ -91,7 +91,9 @@ def main():
   b = bid_anchor
   while b != bid_root:
     jadr, jnum = int(mj.body_jntadr[b]), int(mj.body_jntnum[b])
-    link = {"body": mujoco.mj_id2name(mj, mujoco.mjtObj.mjOBJ_BODY, b).split("/")[-1], "body_quat": mj.body_quat[b].tolist(), "joint": None, "axis": [0.0, 0.0, 1.0], "qpos0": 0.0}
+    # body_pos: offset in the parent frame (anchor position = root pose + chain FK; the ref_root goal needs the anchor height)
+    link = {"body": mujoco.mj_id2name(mj, mujoco.mjtObj.mjOBJ_BODY, b).split("/")[-1], "body_pos": mj.body_pos[b].tolist(),
+            "body_quat": mj.body_quat[b].tolist(), "joint": None, "axis": [0.0, 0.0, 1.0], "qpos0": 0.0}
     if jnum == 1 and int(mj.jnt_type[jadr]) == mujoco.mjtJoint.mjJNT_HINGE:
       link["joint"] = mujoco.mj_id2name(mj, mujoco.mjtObj.mjOBJ_JOINT, jadr).split("/")[-1]
       link["axis"] = mj.jnt_axis[jadr].tolist()
