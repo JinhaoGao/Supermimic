@@ -44,6 +44,7 @@
 | `scripts/launch_*.sh` | 集群启动脚本（bj27 单卡、bj31 多卡；路径用环境变量覆盖） |
 | `eval_site/` | 团队评测站插件 `eval_supermimic.py`、站点补丁、离线 v4 评测器 `eval_r18.sh`、提交脚本 `submit_v4.sh`、失败分析工具 |
 | `tests/` | CPU 单元测试（16 个文件，见"测试"） |
+| `supermimic/human/`、`scripts/human/` | 人体动作输入（`--reference human`）：骨方向对应、人体 goal / 奖励 / 终止头、人体动作库与命令、数据准备、配对评测，见"人体动作输入" |
 | `tools/` | 两条训练线的诊断和 bj31 运维脚本（采样器探针、退化 / 骨盆 / root_pos 逐帧复跑、v4 差距分析、自动导出上站），见 `tools/README.md` |
 | `docs/README_legacy_en.md` | 之前的英文 README（逐轮日志、数据并行实现细节、看门狗事故记录） |
 | `docs/bj31_8gpu_handoff_1026/` | bj31 8 卡线交接：经验总结（配方、对照、退化 / 骨盆 / root_pos 诊断、运维坑）和合并核对清单 |
@@ -205,11 +206,45 @@ unitree_mujoco（G1）里有两个 FSM 模式，按 ONNX 的 goal 格式区分�
 - 采样器的片尾超时回报默认用 r_last/(1−γ) 自举（`--sampler_boot_mean` 改用平均奖励）。
 - `torch.compile` 默认模式（`reduce-overhead` 的 CUDA graph 遇到输出别名会失败）。
 
+## 人体动作输入（dev_gjh，`--reference human`）
+
+验证"策略直接以人体动作（SMPL）为输入、奖励直接对人体动作构建、不经过逐帧重定向"。设计和取舍见 `docs/human_input_plan.md`。代码都在 `supermimic/human/`，默认 `--reference robot` 时原有路径逐位不变（旧测试全部通过）。
+
+- goal（每帧 140 维）：人体 138 维特征（骨盆系重力、航向系根速度 / 静息骨盆高、角速度、归一化骨盆高、21 关节局部 rot6d、足接触），外加人体与机器人的相对航向（cos, sin）。
+- 奖励：全部经 TorchFK 可微。包括骨方向（躯干在航向系，其余各骨在父系；弦长平方核）、按身高比 k 缩放的根速度、yaw rate、航向、归一化骨盆高，以及 action rate / joint limit。
+- 终止：躯干骨方向角 > 1.0 rad，或归一化骨盆高误差 > 0.3。仿真端和想象端调用同一个函数。
+- 重置：离线骨方向 IK 的姿态，只用于重置。骨方向对应和 T-pose 标定沿用 Noetix-RGMT P1；mjlab 的 G1 连杆坐标系与它一致，标定误差 0。
+- 参数覆盖：`--human_cfg key=value,...`（`HumanHeadsCfg` 字段，例如 `w_heading=0,goal_rel_yaw=0`）。
+
+数据（配对的 AMASS 片段，基线用同一批片段的重定向结果）：
+
+```bash
+# 1. AMASS -> 人体 npz（需要 smplx：用 RGMT 的 conda 环境）
+~/miniconda3/envs/noetix_gmt/bin/python scripts/human/prepare_smpl_motion.py --amass_paths ~/AMASS \
+    --smplx_model_dir ~/models/smplx_v1_1/models --output_dir ~/datasets/smpl_human_50hz --names <clip 名单> --num_workers 16
+# 2. 机器人重置状态（mjlab 的 G1，在本仓库 venv 里）
+cd ~/supermimic_ws/mjlab && uv run python ~/Supermimic/scripts/human/prepare_init_states.py --motion_dir ~/datasets/smpl_human_50hz --num_workers 16
+# 3. 与重定向片段配对：同一片段集合、时间偏移、歧义子集（kp_vs_retarget_err_m 前 10%）
+python ~/Supermimic/scripts/human/pair_with_retarget.py --human_dir ~/datasets/smpl_human_50hz \
+    --retarget_dir ~/datasets/smplkp_full/g1_amass_retarget_npz --quality_report ~/datasets/smplkp_full/quality_report.csv --out_dir ~/datasets/paired_amass
+```
+
+训练与对比（两张卡各跑一臂，配方相同）：
+
+```bash
+PAIRS=~/datasets/paired_amass ROOT=~/supermimic_runs bash scripts/human/launch_pair.sh ab1
+uv run python scripts/human/eval_paired.py --ckpt <run>/model_N.pt --pairs ~/datasets/paired_amass/pairs.tsv --subset ~/datasets/paired_amass/ambig_top.txt
+```
+
+`eval_paired.py` 对两臂用同一套人体侧指标打分（逐帧对人体动作算骨方向误差、根速度、航向、高度误差，以及失败率），基线另报 `fail_human`（人体判据会判失败的步数占比）。
+
 ## 测试
 
 ```bash
 for t in tests/*.py; do PYTHONPATH=. python "$t" || echo "FAIL $t"; done      # CPU，torch（+ mujoco）即可，mjlab 缺失时自动打桩
 ```
+
+`tests/test_human_heads.py` 需要 mjlab 和 pilot 片段（`~/datasets/smpl_motion_pilot_50hz`），缺失时跳过。
 
 覆盖：数据并行同步（3 个 gloo rank）、末端 / 骨盆朝向 / 骨盆高度终止、看门狗与 NaN 守卫、提前停止、采样器钳位 / 封顶 / 聚类、master 与多卡分支合并后的逐位一致性、输入嫁接与世界模型嫁接、旧代码能读新 checkpoint 的配置。
 

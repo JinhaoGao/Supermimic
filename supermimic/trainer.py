@@ -81,6 +81,9 @@ from .world_model import DynamicsModel, WorldModelCfg
 @dataclass
 class TrainCfg:
   motion_files: list[str] = field(default_factory=list)
+  # "robot" (default): retargeted robot motions, BeyondMimic rewards (everything as before). "human": raw SMPL motions
+  # (supermimic/human: human npz files, heads = HumanHeadsCfg, bone-direction rewards, no retargeting).
+  reference: str = "robot"
   robot: str = "g1"
   robot_variant: str = ""  # see env_cfg.base_tracking_cfg (g1: eval; e2: nodamp)
   source_weights: tuple = ()  # ((source prefix, weight), ...) prior of the reset sampler's uniform share
@@ -287,6 +290,12 @@ def _check_cfg(cfg: TrainCfg) -> None:
     raise ValueError(f"wd_reward_floor must be finite and <= 0 (normalized reward; production -1.0), got {f}")
   if not cfg.es_median_floor >= 1.0:
     raise ValueError(f"es_median_floor must be >= 1, got {cfg.es_median_floor}")
+  if cfg.reference not in ("robot", "human"):
+    raise ValueError(f"reference {cfg.reference!r}: 'robot' or 'human'")
+  if (cfg.reference == "human") != (getattr(cfg.heads, "reference", "robot") == "human"):
+    raise ValueError(f"reference {cfg.reference!r} needs the matching heads cfg (human: human.heads.HumanHeadsCfg)")
+  if cfg.reference == "human" and (cfg.hard_names or cfg.sampler_clusters or cfg.wm.body_frame):
+    raise ValueError("reference 'human': hard_names, sampler_clusters and wm body_frame are robot-reference features")
 
 
 def early_stop_verdict(prev_failed: list, failed: float, ratio: float, median_floor: float = 1.0) -> tuple[bool, float | None]:
@@ -342,7 +351,8 @@ class Trainer:
       robot_variant=cfg.robot_variant, source_weights=cfg.source_weights, name_weights=cfg.name_weights,
       hard_names=cfg.hard_names, root_ori_term=cfg.heads.root_ori_term, root_ori_body=cfg.heads.root_ori_body,
       root_z_term=cfg.heads.root_z_term, softmax_cap=cfg.sampler_cap, cluster_k=cfg.sampler_clusters,
-      cluster_alpha=cfg.sampler_cluster_alpha, cluster_mix=cfg.sampler_cluster_mix,
+      cluster_alpha=cfg.sampler_cluster_alpha, cluster_mix=cfg.sampler_cluster_mix, reference=cfg.reference,
+      bone_map=getattr(cfg.heads, "bone_map", "g1"),
     )
     env_cfg.seed = seed
     # Rank 0 builds the env first (and the packed motion cache if it is missing); the others wait so that
@@ -352,7 +362,13 @@ class Trainer:
     self.env = ManagerBasedRlEnv(cfg=env_cfg, device=self.device)
     if dctx.enabled and self.main:
       dctx.barrier()
-    self.sim = SimInterface(self.env, cfg.heads)
+    self.human = cfg.reference == "human"
+    if self.human:
+      from .human.sim_interface import HumanSimInterface
+
+      self.sim = HumanSimInterface(self.env, cfg.heads)
+    else:
+      self.sim = SimInterface(self.env, cfg.heads)
     self.heads = self.sim.heads
     self.lib = self.sim.lib
     self.cmd = self.sim.cmd
@@ -367,7 +383,10 @@ class Trainer:
     self.wm = DynamicsModel(self.nj, self.xi_dim, self.dt, cfg.wm).to(self.device)
     self.critic = Critic(self.wm.feat_dim, self.heads.goal_frame_dim, hc.K, self.xi_dim, err_dim=self.heads.critic_err_dim).to(self.device)
     dctx.broadcast_modules_(self.policy, self.critic, self.wm)  # one model: rank 0's initialization everywhere
-    self.fns = StepFns(self.heads, self.policy, self.wm, self.critic, compile_=cfg.compile, mode=cfg.compile_mode)
+    fns_cls = StepFns
+    if self.human:
+      from .human.fns import HumanStepFns as fns_cls  # noqa: N813
+    self.fns = fns_cls(self.heads, self.policy, self.wm, self.critic, compile_=cfg.compile, mode=cfg.compile_mode)
     self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.wm.lr)
     self.opt_pi = torch.optim.Adam(self.policy.parameters(), lr=cfg.policy_lr, betas=cfg.policy_betas)
     self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic_lr)
@@ -663,7 +682,8 @@ class Trainer:
       kin = heads.kin(st["state"])
       # Reference window pack for this batch: frames f0 .. f0+H+K-1 of every rollout.
       Lw = H + K
-      pack = self.lib.gather_windows(st["frame"], Lw)
+      pf = self._pack_fields()
+      pack = self.lib.gather_windows(st["frame"], Lw) if pf is None else self.lib.gather_windows(st["frame"], Lw, fields=pf)
       if getattr(heads, "critic_err_dim", 0):  # error normalizer statistics from the rollout start states (real replay states)
         self.dist.rms_update([(self.critic.err_norm, heads.critic_errors(kin, pack["body_pos"][:, 0], pack["body_quat"][:, 0]))])
       f_loc = torch.zeros(N, dtype=torch.long, device=self.device)
@@ -678,7 +698,7 @@ class Trainer:
     # Clip-end truncation (imag_truncate): step t is a transition of the episode only while t < tlim (target frame
     # f0 + t <= clip_end - 2); the state reached at t = tlim is the env's time-out state -> critic bootstrap there.
     tlim = (clip_end_loc - 1) if cfg.imag_truncate else None
-    p = (pack["joint_pos"], pack["joint_vel"], pack["body_pos"], pack["body_quat"], pack["body_lin_vel"], pack["body_ang_vel"])
+    p = self._pack_args(pack)
     ro_angles = [] if heads.root_ori is not None else None  # logging only (pi/root_ori_*; None: body not tracked)
     ar_n = torch.arange(N, device=self.device)
     for t in range(H):
@@ -747,6 +767,20 @@ class Trainer:
       metrics.update(self._fit_critic(feats_n, goals_n, fn_H.detach(), gn_H.detach(), xi, rews, dsoft, tlim,
                                       alive if cfg.critic_weight_survival else None))
     return metrics
+
+  ROBOT_PACK = ("joint_pos", "joint_vel", "body_pos", "body_quat", "body_lin_vel", "body_ang_vel")
+
+  def _pack_fields(self):
+    """Library fields of the imagination window pack (None = all: the robot library holds exactly ROBOT_PACK)."""
+    from .human.heads import PACK_FIELDS
+
+    return PACK_FIELDS if getattr(self, "human", False) else None
+
+  def _pack_args(self, pack: dict) -> tuple:
+    """Pack tensors in the positional order of fns.imagine_step / goal_from_pack."""
+    from .human.heads import PACK_FIELDS
+
+    return tuple(pack[k] for k in (PACK_FIELDS if getattr(self, "human", False) else self.ROBOT_PACK))
 
   @torch.no_grad()
   def _imagined_root_ori(self, ang: torch.Tensor, c: torch.Tensor, d: torch.Tensor, term_scale: torch.Tensor | None) -> dict:
@@ -884,6 +918,7 @@ class Trainer:
       return tuple((int(a), float(b)) for a, b in (x or ()))
 
     pairs = [
+      ("reference", ck_cfg.get("reference", "robot"), getattr(cur, "reference", "robot")),
       ("robot", ck_cfg.get("robot", "g1"), cur.robot),
       ("robot_variant", ck_cfg.get("robot_variant", "") or "", cur.robot_variant or ""),
       ("source_weights", w(ck_cfg.get("source_weights")), w(cur.source_weights)),
@@ -954,6 +989,13 @@ class Trainer:
 
   def load(self, path: str, rollback: bool = False) -> None:
     ck = torch.load(path, map_location=self.device, weights_only=False)
+    ck_ref = (ck.get("cfg") or {}).get("reference", "robot")
+    if ck_ref != getattr(self.cfg, "reference", "robot"):
+      raise ValueError(f"{path}: a reference={ck_ref!r} checkpoint cannot be resumed with reference={self.cfg.reference!r}")
+    if getattr(self, "human", False) and not rollback:  # human heads options are not grafted: report what differs
+      for k, v in sorted((ck["cfg"].get("heads") or {}).items()):
+        if hasattr(self.cfg.heads, k) and getattr(self.cfg.heads, k) != v:
+          self._print(f"[Trainer] WARNING resume from another setup: heads.{k} {v!r} -> {getattr(self.cfg.heads, k)!r}")
     if rollback:  # this run's own checkpoint ("same"), or the resume checkpoint (until this run wrote a healthy one; r15
       # rolled back to it twice): then the clip-list relation found at the resume (prefix / other), not "same"
       rf = self._resume_from
@@ -1038,6 +1080,10 @@ class Trainer:
     get zero weights, so the grafted networks compute exactly what they computed before (the critic only approximately
     when the WM representation changed). Returns the goal segments that are new (their normalizer statistics still need
     calibrating)."""
+    if getattr(self, "human", False):  # no input grafting for the human goal: the layout must match
+      if ck.get("dims", {}).get("goal_frame", self.heads.goal_frame_dim) != self.heads.goal_frame_dim:
+        raise ValueError(f"goal frame {ck['dims']['goal_frame']} in the checkpoint vs {self.heads.goal_frame_dim} (goal_rel_yaw?)")
+      return []
     known = {f.name for f in fields(HeadsCfg)} | {"ee_term_temp"}  # from_dict maps master's v2 EE keys
     old_h = HeadsCfg.from_dict({k: v for k, v in ck["cfg"]["heads"].items() if k in known})
     if "dims" not in ck or not hasattr(self.heads, "goal_layout"):  # (stand-ins in tests: nothing to graft)
@@ -1367,7 +1413,7 @@ class Trainer:
       self.evaluator = Evaluator(
         self.cfg.motion_files, self.cfg.heads, self.device, library_key=self.LIB_KEY, eval_clips=self.eval_clip_ids,
         num_clips_total=self.lib.num_clips, max_envs=self.cfg.eval_envs, compile_=self.cfg.compile, cache_dir=self.cfg.cache_dir,
-        robot=self.cfg.robot, robot_variant=self.cfg.robot_variant,
+        robot=self.cfg.robot, robot_variant=self.cfg.robot_variant, reference=getattr(self.cfg, "reference", "robot"),
       )
     return self.evaluator.run(self.policy)
 

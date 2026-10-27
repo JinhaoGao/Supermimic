@@ -43,6 +43,7 @@ class Evaluator:
     cache_dir: str = "",
     robot: str = "g1",
     robot_variant: str = "",
+    reference: str = "robot",
   ):
     from mjlab.envs import ManagerBasedRlEnv
 
@@ -54,9 +55,16 @@ class Evaluator:
       motion_files, self.num_envs, mode="eval", robot=robot, library_key=library_key, eval_clips=self.eval_clips, cache_dir=cache_dir,
       ee_termination=heads_cfg.ee_termination, ee_threshold=heads_cfg.ee_term_z, robot_variant=robot_variant,
       root_ori_term=heads_cfg.root_ori_term, root_ori_body=heads_cfg.root_ori_body, root_z_term=heads_cfg.root_z_term,
+      reference=reference, bone_map=getattr(heads_cfg, "bone_map", "g1"),
     )
     self.env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
-    self.sim = SimInterface(self.env, heads_cfg)
+    self.human = reference == "human"
+    if self.human:
+      from .human.sim_interface import HumanSimInterface
+
+      self.sim = HumanSimInterface(self.env, heads_cfg)
+    else:
+      self.sim = SimInterface(self.env, heads_cfg)
     self.heads = self.sim.heads
     self.cfg = heads_cfg
     self.device = device
@@ -66,10 +74,16 @@ class Evaluator:
     self._fns: StepFns | None = None
     self._fns_policy = None
     self.clip_ids = torch.tensor(self.eval_clips, dtype=torch.long, device=device)
+    # Optional extra per-step metrics (next_state [E,D], target frames [E], clip indices [E]) -> {name: [E]}, averaged per
+    # clip over its live steps like the human-reference errors.
+    self.metric_fn = None
 
   def _get_fns(self, policy) -> StepFns:
     if self._fns is None or self._fns_policy is not policy:
-      self._fns = StepFns(self.heads, policy, compile_=self.compile_)
+      cls = StepFns
+      if self.human:
+        from .human.fns import HumanStepFns as cls  # noqa: N813
+      self._fns = cls(self.heads, policy, compile_=self.compile_)
       self._fns_policy = policy
     return self._fns
 
@@ -107,6 +121,8 @@ class Evaluator:
     assigned = min(E, n)  # clips handed out so far (the first E at reset)
     clip_len = (lib.clip_end[self.clip_ids] - lib.clip_start[self.clip_ids]).float()
     limit = max_steps or int(clip_len.sum().item() / E * 2) + int(clip_len.max().item()) + 10
+    m_sum: dict[str, torch.Tensor] = {}  # human reference: per-clip sums of the tracking errors (heads.metrics)
+    m_cnt = torch.zeros(n, device=self.device)
     policy.eval()
     for _ in range(limit):
       refs = sim.goal_refs(frame, clip_end)
@@ -115,6 +131,18 @@ class Evaluator:
       env.step(a)
       next_state = sim.state()
       r, _ = fns.post(next_state, kin, a, prev_action, *ref_cur)
+      errs = None
+      if self.human:  # errors of the live (not yet terminated) steps against the target frame
+        from .human.heads import STEP_FIELDS
+
+        errs = heads.metrics(heads.kin(next_state), next_state, dict(zip(STEP_FIELDS, ref_cur)))
+      elif self.metric_fn is not None:  # e.g. human-side errors of a robot-reference policy (scripts/human/eval_paired.py)
+        errs = self.metric_fn(next_state, frame, cmd.env_clip)
+      if errs is not None:
+        live = env_active & ~env.reset_terminated.bool()
+        for k, v in errs.items():
+          m_sum.setdefault(k, torch.zeros(n, device=self.device)).index_add_(0, env_pos[live], v[live])
+        m_cnt.index_add_(0, env_pos[live], torch.ones_like(r)[live])
       ang = heads.root_ori_angle_state(next_state, ref_cur[1])
       terminated = env.reset_terminated.bool()
       timeouts = env.reset_time_outs.bool()
@@ -172,7 +200,11 @@ class Evaluator:
         "clips_done": float(done_clip.sum()),
         **({"failed_ori": float(ori_over.sum()), "failed_with_ori": float((failed | ori_over).sum())}
            if heads.root_ori is not None else {}),
+        # human reference: clip-mean tracking errors, averaged over the clips (each clip's live steps)
+        **{k: float((v / m_cnt.clamp(min=1.0)).mean()) for k, v in m_sum.items()},
       },
       "per_clip": per_clip,
+      "per_clip_failed": {names[i]: bool(failed[i]) for i in range(n)},
+      "per_clip_metrics": {k: {names[i]: float(v[i] / m_cnt[i].clamp(min=1.0)) for i in range(n)} for k, v in m_sum.items()},
       "failed_clips": [names[i] for i in range(n) if bool(failed[i])][:200],
     }

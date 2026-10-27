@@ -148,6 +148,10 @@ class HeadsCfg:
     * before either (v1, paper recipe): no end-effector key -> off.
     When off, a non-positive ee_term_z is replaced by the default threshold (only used if switched on later)."""
     d = dict(d)
+    if d.get("reference") == "human":  # human-reference checkpoints (supermimic/human)
+      from .human.heads import HumanHeadsCfg
+
+      return HumanHeadsCfg(**d)
     if "ee_term_temp" in d:  # master v2 name of the soft-term temperature
       t = d.pop("ee_term_temp")
       d.setdefault("ee_term_z_temp", t)

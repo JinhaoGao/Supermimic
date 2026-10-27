@@ -76,6 +76,7 @@ def main():
     files, heads_cfg, args.device, eval_clips=eval_clips, num_clips_total=len(files), max_envs=args.eval_envs,
     compile_=not args.no_compile, cache_dir=cfg.get("cache_dir", ""), robot=cfg.get("robot", "g1"),
     robot_variant=args.robot_variant if args.robot_variant is not None else cfg.get("robot_variant", ""),
+    reference=cfg.get("reference", "robot"),
   )
   if names_txt:
     got = [ev.lib.clips[i].name for i in ev.eval_clips]

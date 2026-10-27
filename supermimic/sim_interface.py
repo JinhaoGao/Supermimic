@@ -64,6 +64,10 @@ class SimInterface:
       root_ori_index=ro_idx,
       root_ori_is_root=self.root_ori_body == self.root_body_name,
     )
+    self._init_context(env)
+
+  def _init_context(self, env) -> None:
+    """Sim-context (xi) bookkeeping after the heads exist; shared with human.sim_interface.HumanSimInterface."""
     self.nj = self.heads.nj
     self.xi_dim = 4 + self.nj
     idx = self.robot.indexing

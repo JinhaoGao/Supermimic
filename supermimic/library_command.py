@@ -104,8 +104,6 @@ class LibraryMotionCommand(MotionCommand):
     print(f"[LibraryMotionCommand] {self.library.summary()}")
     E = self.num_envs
     lib = self.library
-    self.time_steps = torch.zeros(E, dtype=torch.long, device=self.device)
-    self.clip_end_env = torch.full((E,), int(lib.clip_end[0].item()), dtype=torch.long, device=self.device)
     nb = len(cfg.body_names)
     J = lib.nj
     self._cur = dict(
@@ -117,6 +115,19 @@ class LibraryMotionCommand(MotionCommand):
     self.body_pos_relative_w = torch.zeros(E, nb, 3, device=self.device)
     self.body_quat_relative_w = torch.zeros(E, nb, 4, device=self.device)
     self.body_quat_relative_w[:, :, 0] = 1.0
+    self._init_sampler()
+    self._ghost_model = None
+    self._ghost_color = np.array(cfg.viz.ghost_color, dtype=np.float32)
+    self._pending_forward = False
+
+  def _init_sampler(self) -> None:
+    """Frame / clip-end state, return-based reset sampler, curriculum and eval-clip state of ``self.library`` (shared
+    with the human-reference command, supermimic/human/command.py)."""
+    cfg = self.cfg
+    E = self.num_envs
+    lib = self.library
+    self.time_steps = torch.zeros(E, dtype=torch.long, device=self.device)
+    self.clip_end_env = torch.full((E,), int(lib.clip_end[0].item()), dtype=torch.long, device=self.device)
     # Return-based sampling state.
     NB = lib.num_bins
     self.bin_count = NB
@@ -163,9 +174,6 @@ class LibraryMotionCommand(MotionCommand):
       "sampling_entropy", "sampling_top1_prob", "sampling_top1_bin",
     ):
       self.metrics[k] = torch.zeros(E, device=self.device)
-    self._ghost_model = None
-    self._ghost_color = np.array(cfg.viz.ghost_color, dtype=np.float32)
-    self._pending_forward = False
 
   # ---- current-frame cache ---------------------------------------------------
 

@@ -73,6 +73,26 @@ def motion_files_from_args(args) -> list[str]:
   return files
 
 
+def human_heads_cfg(args):
+  """HumanHeadsCfg from --human_cfg key=value pairs (types from the dataclass defaults; bools: 0/1/true/false)."""
+  from dataclasses import fields
+
+  from supermimic.human.heads import HumanHeadsCfg
+
+  types = {f.name: type(f.default) for f in fields(HumanHeadsCfg)}
+  kw = {}
+  for kv in args.human_cfg.split(","):
+    if not kv.strip():
+      continue
+    k, sep, v = kv.partition("=")
+    k = k.strip()
+    if not sep or k not in types:
+      raise ValueError(f"--human_cfg {kv!r}: key=value with a HumanHeadsCfg field ({sorted(types)})")
+    t = types[k]
+    kw[k] = v.strip().lower() in ("1", "true", "yes") if t is bool else t(v)
+  return HumanHeadsCfg(**kw)
+
+
 def parse_hard_schedule(spec: str) -> tuple:
   """'it:mult,it:mult,...' -> ((it, mult), ...) (master 4314a50's format; empty -> ())."""
   out = []
@@ -101,6 +121,11 @@ def main():
   p.add_argument("--cache_dir", type=str, default="", help="where the packed motion cache lives (default ~/.cache/supermimic_motions)")
   p.add_argument("--num_workers", type=int, default=32)
   p.add_argument("--robot", type=str, default="g1", choices=["g1", "e2"])
+  p.add_argument("--reference", type=str, default="robot", choices=["robot", "human"],
+                 help="robot: retargeted robot npz + BeyondMimic rewards (default); human: raw SMPL npz (supermimic/human), "
+                      "goal = human motion features, bone-direction rewards, no retargeting")
+  p.add_argument("--human_cfg", type=str, default="",
+                 help="reference human: HumanHeadsCfg overrides key=value,... (e.g. w_heading=0,goal_rel_yaw=0,term_trunk=1.2)")
   p.add_argument("--robot_variant", type=str, default="", help="g1: eval (team eval / deploy model); e2: nodamp (no passive joint damping)")
   p.add_argument("--source_weights", type=str, default="",
                  help="reset-sampler prior per data source, e.g. noetix_kungfu=6,sportsmeeting=10 (clip '<robot>__<source>_...')")
@@ -382,7 +407,8 @@ def main():
     wm=WorldModelCfg(k=args.wm_k, lr=lr, batches_per_update=args.wm_batches, windows_per_batch=args.wm_windows,
                      body_frame=args.wm_body_frame, layernorm=args.wm_layernorm, input_clip=args.wm_input_clip,
                      min_std=args.wm_min_std, acro_weight=args.wm_acro_weight, acro_ang_vel=args.wm_acro_ang_vel),
-    heads=HeadsCfg(goal_anchor_pos=args.goal_anchor_pos, goal_ref_root=args.goal_ref_root, critic_errors=args.critic_errors,
+    reference=args.reference,
+    heads=human_heads_cfg(args) if args.reference == "human" else HeadsCfg(goal_anchor_pos=args.goal_anchor_pos, goal_ref_root=args.goal_ref_root, critic_errors=args.critic_errors,
                    ee_termination=ee_on, ee_term_z=ee_thr, root_ori_term=args.root_ori_term,
                    root_ori_term_temp=args.root_ori_term_temp, root_ori_body=args.root_ori_body,
                    root_z_term=args.root_z_term, root_z_term_temp=args.root_z_term_temp),

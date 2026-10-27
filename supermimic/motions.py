@@ -62,6 +62,20 @@ G1_ISAAC_BODY_NAMES_37 = (
 )
 # Fallback source body order by body count, for npz files without a body_names key.
 FALLBACK_BODY_NAMES: dict[int, tuple[str, ...]] = {37: G1_ISAAC_BODY_NAMES_37}
+# Joint order of the same Isaac G1 renders (29 joints). The AMASS retarget set (smplkp_full/g1_amass_retarget_npz,
+# 10-22) has neither name key; checked 10-27: mjlab FK of its joint_pos in this order reproduces its body_pos_w in
+# G1_ISAAC_BODY_NAMES_37 order to 5e-7 m (the same files' g1_smpl_kp_50hz copies carry this joint_names list).
+G1_ISAAC_JOINT_NAMES_29 = (
+  "left_hip_pitch_joint", "right_hip_pitch_joint", "waist_yaw_joint", "left_hip_roll_joint", "right_hip_roll_joint",
+  "waist_roll_joint", "left_hip_yaw_joint", "right_hip_yaw_joint", "waist_pitch_joint", "left_knee_joint",
+  "right_knee_joint", "left_shoulder_pitch_joint", "right_shoulder_pitch_joint", "left_ankle_pitch_joint",
+  "right_ankle_pitch_joint", "left_shoulder_roll_joint", "right_shoulder_roll_joint", "left_ankle_roll_joint",
+  "right_ankle_roll_joint", "left_shoulder_yaw_joint", "right_shoulder_yaw_joint", "left_elbow_joint", "right_elbow_joint",
+  "left_wrist_roll_joint", "right_wrist_roll_joint", "left_wrist_pitch_joint", "right_wrist_pitch_joint",
+  "left_wrist_yaw_joint", "right_wrist_yaw_joint",
+)
+# Fallback source joint order by (joint count, body count): only together with the G1 Isaac body fallback.
+FALLBACK_JOINT_NAMES: dict[tuple[int, int], tuple[str, ...]] = {(29, 37): G1_ISAAC_JOINT_NAMES_29}
 
 
 def npz_body_names(d, num_bodies: int | None = None) -> tuple[list[str], bool]:
@@ -127,11 +141,16 @@ def _worker_fill(job):
   # Every npz member is decompressed on each access: read each array once.
   joint_pos = d["joint_pos"]
   body_pos = d["body_pos_w"]
-  src_j = [str(x) for x in d["joint_names"]]
   try:
     src_b, fallback = npz_body_names(d, body_pos.shape[1])
   except KeyError as e:
     return (path, str(e), False)
+  if "joint_names" in d.files:
+    src_j = [str(x) for x in d["joint_names"]]
+  elif fallback and (joint_pos.shape[1], body_pos.shape[1]) in FALLBACK_JOINT_NAMES:
+    src_j = list(FALLBACK_JOINT_NAMES[(joint_pos.shape[1], body_pos.shape[1])])
+  else:
+    return (path, "no joint_names key (and no fallback joint order)", fallback)
   try:
     jperm = [src_j.index(n) for n in _W["joint_names"]]
     bperm = [src_b.index(n) for n in _W["body_names"]]
@@ -307,6 +326,13 @@ class MotionLibrary:
       self.fields[k] = torch.from_numpy(np.ascontiguousarray(arr))  # CPU RAM copy
     self.time_step_total = int(meta["frames"])
     log(f"[MotionLibrary] loaded cache {cdir} into RAM in {time.time() - t0:.0f}s")
+    self._build_tables(clips_all, bin_seconds, expected_fps, device)
+    self.nj = len(self.joint_names)
+    self.nb = len(self.body_names)
+
+  def _build_tables(self, clips_all: list[dict], bin_seconds: float, expected_fps: float, device: str) -> None:
+    """Clip list, per-frame clip-end / bin tables and the 1 s bins from clips.json entries (also used by the
+    human-reference library, supermimic/human/motions.py)."""
     self.clips = [ClipInfo(c["name"], c["start"], c["end"]) for c in clips_all if c.get("ok", True) and c["end"] > c["start"] + 1]
     self.num_clips = len(self.clips)
     cs = torch.tensor([c.start for c in self.clips], dtype=torch.long)
@@ -333,8 +359,6 @@ class MotionLibrary:
     self.bin_clip = torch.tensor(bclip, dtype=torch.long, device=device)
     self.num_bins = len(starts)
     self.bin_of_frame = bin_of_frame.to(device)
-    self.nj = len(self.joint_names)
-    self.nb = len(self.body_names)
 
   # ---- stats -----------------------------------------------------------------
 
@@ -371,7 +395,7 @@ class MotionLibrary:
   def gather(self, frames: torch.Tensor, fields=None) -> dict[str, torch.Tensor]:
     """Rows for global frame indices ``frames`` (GPU long [N]) -> dict of GPU fp32 tensors [N, ...]."""
     idx = frames.detach().to("cpu", dtype=torch.long)
-    keys = fields or list(FIELD_DTYPES)
+    keys = fields or list(self.fields)
     return {k: self._take(k, idx) for k in keys}
 
   def gather_windows(self, start: torch.Tensor, L: int, fields=None) -> dict[str, torch.Tensor]:
@@ -379,7 +403,7 @@ class MotionLibrary:
     Frames past the library end are clamped; callers clamp to clip ends themselves."""
     N = start.shape[0]
     idx = (start.detach().to("cpu", dtype=torch.long)[:, None] + torch.arange(L)[None, :]).clamp_(max=self.time_step_total - 1).reshape(-1)
-    keys = fields or list(FIELD_DTYPES)
+    keys = fields or list(self.fields)
     return {k: self._take(k, idx).view(N, L, *self.fields[k].shape[1:]) for k in keys}
 
   def root_state(self, frames: torch.Tensor) -> dict[str, torch.Tensor]:

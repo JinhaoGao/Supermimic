@@ -109,6 +109,8 @@ def make_env_cfg(
   cluster_k: int = 0,
   cluster_alpha: float = 0.3,
   cluster_mix: float = 0.5,
+  reference: str = "robot",
+  bone_map: str = "g1",
 ) -> ManagerBasedRlEnvCfg:
   """ee_termination: keep BeyondMimic's end-effector height termination (``ee_body_pos``: any end-effector body
   z error > ee_threshold; bodies per robot cfg). Must match ``HeadsCfg.ee_termination`` / ``ee_term_z`` of the
@@ -122,14 +124,22 @@ def make_env_cfg(
   empty = mjlab's terms, untouched.
   root_ori_term: > 0 adds the root-orientation termination ``root_ori`` (library_command.bad_root_ori_full: full rotation
   angle of root_ori_body, "" = ROOT_BODY[robot], against the reference > root_ori_term rad, x term_scale_env); must match
-  ``HeadsCfg.root_ori_term`` / ``root_ori_body`` (SimInterface checks). 0 (default) = no such term, as before."""
+  ``HeadsCfg.root_ori_term`` / ``root_ori_body`` (SimInterface checks). 0 (default) = no such term, as before.
+  reference: "robot" (default, everything above) | "human": motion_files are human (SMPL) npz files, the command is
+  human.command.HumanMotionCommand (bone-direction IK resets), mjlab's tracking rewards are dropped (the trainer computes
+  its own) and the terminations are the human heads' hard test + time-outs; the robot-reference options must be off."""
   assert mode in ("train", "eval")
+  assert reference in ("robot", "human"), reference
   cfg = base_tracking_cfg(robot, robot_variant)
   cfg.scene.num_envs = num_envs
   cfg.scene.sensors = ()  # self-collision sensor not needed
   cfg.auto_reset = False
 
   base = cfg.commands["motion"]
+  if reference == "human":
+    return _human_env_cfg(cfg, base, motion_files, mode, episode_length_s, bin_seconds, robot, library_key, eval_clips, cache_dir,
+                          num_workers, clamp_returns, source_weights, name_weights, softmax_cap, bone_map,
+                          robot_ori=(ee_termination, hard_names, root_ori_term, root_z_term, cluster_k))
   cfg.commands["motion"] = LibraryMotionCommandCfg(
     entity_name="robot",
     resampling_time_range=(1.0e9, 1.0e9),
@@ -156,24 +166,7 @@ def make_env_cfg(
     cluster_mix=cluster_mix,
   )
 
-  # Minimal observation group (the trainer builds policy inputs itself).
-  cfg.observations = {
-    "actor": ObservationGroupCfg(
-      terms={"joint_pos": ObservationTermCfg(func=mdp.joint_pos_rel)},
-      concatenate_terms=True,
-      enable_corruption=False,
-    )
-  }
-
-  # Events: drop pushes; per-episode sim context in training; clean physics in eval.
-  cfg.events.pop("push_robot", None)
-  if mode == "train":
-    for k in ("base_com", "encoder_bias", "foot_friction"):
-      cfg.events[k].mode = "reset"
-  else:
-    cfg.events.pop("base_com", None)
-    cfg.events.pop("encoder_bias", None)
-    cfg.events["foot_friction"].params["ranges"] = (1.0, 1.0)
+  _common_obs_events(cfg, mode)
 
   # Rewards.
   cfg.rewards.pop("self_collisions", None)
@@ -209,3 +202,72 @@ def make_env_cfg(
   )
   cfg.episode_length_s = episode_length_s if mode == "train" else 1.0e6
   return cfg
+
+
+def _common_obs_events(cfg, mode: str) -> None:
+  # Minimal observation group (the trainer builds policy inputs itself).
+  cfg.observations = {
+    "actor": ObservationGroupCfg(
+      terms={"joint_pos": ObservationTermCfg(func=mdp.joint_pos_rel)},
+      concatenate_terms=True,
+      enable_corruption=False,
+    )
+  }
+
+  # Events: drop pushes; per-episode sim context in training; clean physics in eval.
+  cfg.events.pop("push_robot", None)
+  if mode == "train":
+    for k in ("base_com", "encoder_bias", "foot_friction"):
+      cfg.events[k].mode = "reset"
+  else:
+    cfg.events.pop("base_com", None)
+    cfg.events.pop("encoder_bias", None)
+    cfg.events["foot_friction"].params["ranges"] = (1.0, 1.0)
+
+
+def _human_env_cfg(cfg, base, motion_files, mode, episode_length_s, bin_seconds, robot, library_key, eval_clips, cache_dir, num_workers,
+                   clamp_returns, source_weights, name_weights, softmax_cap, bone_map, robot_ori) -> ManagerBasedRlEnvCfg:
+  """make_env_cfg(reference="human"): see there."""
+  from .human.command import HumanMotionCommandCfg, human_failed
+
+  ee_termination, hard_names, root_ori_term, root_z_term, cluster_k = robot_ori
+  if ee_termination or hard_names or root_ori_term > 0 or root_z_term > 0 or cluster_k > 0:
+    raise ValueError("reference='human': ee / root_ori / root_z terminations, hard_names and sampler clusters do not apply")
+  train = mode == "train"
+  cfg.commands["motion"] = HumanMotionCommandCfg(
+    entity_name="robot",
+    resampling_time_range=(1.0e9, 1.0e9),
+    debug_vis=False,
+    pose_range=dict(base.pose_range) if train else {},
+    velocity_range=dict(base.velocity_range) if train else {},
+    joint_position_range=base.joint_position_range if train else (0.0, 0.0),
+    motion_files=tuple(motion_files),
+    anchor_body_name=base.anchor_body_name,  # COM randomization body of the sim context (SimInterface)
+    body_names=(),
+    bin_seconds=bin_seconds,
+    sampling_mode="return" if train else "start",
+    cache_dir=cache_dir,
+    num_workers=num_workers,
+    library_key=library_key,
+    eval_clips=tuple(eval_clips),
+    clamp_returns=clamp_returns,
+    source_weights=tuple(tuple(kv) for kv in source_weights) if train else (),
+    name_weights=tuple(tuple(kv) for kv in name_weights) if train else (),
+    softmax_cap=softmax_cap if train else 0.0,
+    robot_name=robot,
+    bone_map=bone_map,
+    foot_geom_regex=_regex(cfg.events["foot_friction"].params["asset_cfg"].geom_names),
+  )
+  _common_obs_events(cfg, mode)
+  cfg.rewards = {}  # mjlab's tracking rewards read robot-reference fields; the trainer computes the human reward itself
+  cfg.terminations = {
+    **({"time_out": cfg.terminations["time_out"]} if "time_out" in cfg.terminations else {}),
+    "human_fail": TerminationTermCfg(func=human_failed, params={"command_name": "motion"}),
+    "clip_end": TerminationTermCfg(func=motion_clip_end, params={"command_name": "motion"}, time_out=True),
+  }
+  cfg.episode_length_s = episode_length_s if train else 1.0e6
+  return cfg
+
+
+def _regex(names) -> str:
+  return names if isinstance(names, str) else "|".join(f"(?:{n})" for n in names)
