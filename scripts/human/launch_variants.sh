@@ -10,6 +10,8 @@
 #   human2  legs: leg kernel 0.35 -> 0.6, global leg weight 0.5 -> 1.5, foot-lift term 1.0
 #   human3  legs + motion: human2 and root velocity 1 -> 2, heading 0.5 -> 1, yaw rate 0.5 -> 1
 # Override any arm's --human_cfg with HUMAN1_CFG / HUMAN2_CFG / HUMAN3_CFG. Logs: $ROOT/<tag>_<arm>.out, pids .pid.
+# ARMS="human2 human3" starts only those (each keeps its GPU slot). The human arms share one library cache: start one
+# first when the cache does not exist yet (concurrent builds race), e.g. ARMS="robot human1", then the others.
 set -euo pipefail
 TAG="${1:?usage: launch_variants.sh <tag> [extra train.py args]}"
 shift
@@ -28,9 +30,11 @@ COMMON=(--robot g1 --robot_variant eval+evalcontact --H 48 --fixes --sampler_cla
   --log_interval 50 --wd_sustain 200 --wd_warmup 1500 --wd_baseline_after_warmup --wd_signal imagined_reward_robust
   --log_root "$ROOT/logs" --cache_dir "$ROOT/cache")
 
+ARMS="${ARMS:-robot human1 human2 human3}"
 launch() {  # arm gpu args...
   local arm=$1 gpu=$2
   shift 2
+  [[ " $ARMS " == *" $arm "* ]] || return 0
   cd "$MJLAB"
   CUDA_VISIBLE_DEVICES=$gpu PYTHONPATH="$REPO" setsid nohup uv run python "$REPO/scripts/train.py" --run_name "${TAG}_$arm" \
     "${COMMON[@]}" "$@" > "$ROOT/${TAG}_$arm.out" 2>&1 < /dev/null &
