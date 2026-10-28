@@ -168,6 +168,8 @@ def main():
       if failed_at is None and bool(env.reset_terminated[0]):
         failed_at = t
         print(f"[play] training termination at step {t} ({t / 50.0:.2f} s); playing on")
+      if bool(env.reset_terminated[0]):  # playback only: keep simulating past the termination (no reset)
+        env._manual_reset_pending[0] = False
       data.qpos[:] = env.sim.data.qpos[0].cpu().numpy()
       data.qvel[:] = env.sim.data.qvel[0].cpu().numpy()
       mujoco.mj_forward(model, data)

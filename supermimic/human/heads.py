@@ -24,7 +24,8 @@ plus action rate and joint limits. Bone errors are squared chords |d_h - d_r|^2 
 at 0 (an atan2 angle has an infinite gradient there, which the BPTT would turn into NaN).
 
 Termination (hard test in the simulator, sigmoid soft term in imagination, noisy-OR like AnalyticHeads): angle of the
-pelvis_up / torso_up bones (heading frames) > term_trunk, normalized pelvis height error > term_height.
+pelvis_up / torso_up bones (heading frames) > term_trunk, normalized pelvis height error > term_height, optionally
+(term_foot_lift > 0) an ankle-lift error > term_foot_lift on either foot.
 """
 
 from __future__ import annotations
@@ -82,6 +83,12 @@ class HumanHeadsCfg(HeadsCfg):
   term_trunk_temp: float = 0.05
   term_height: float = 0.3  # |pelvis height / rest height| error
   term_height_temp: float = 0.02
+  # Foot-lift termination (0 = off): |robot ankle lift - k x human ankle lift| > term_foot_lift m on either foot -- the
+  # human-side analogue of the baseline's end-effector height test (0.25 m). ma1 (10-28): without it the human runs
+  # skipped fast kicks (robot foot peak / human peak 0.17-0.26, baseline 1.08) -- a skipped kick only cost the leg
+  # terms of those frames, while the baseline's termination costs every future reward.
+  term_foot_lift: float = 0.0
+  term_foot_lift_temp: float = 0.02
 
   def __post_init__(self):
     super().__post_init__()
@@ -253,6 +260,10 @@ class HumanHeads(AnalyticHeads):
     hard = (ang > c.term_trunk).any(-1) | (dh > c.term_height)
     alive = torch.prod(1.0 - torch.sigmoid((ang - c.term_trunk) / c.term_trunk_temp), dim=-1)
     alive = alive * (1.0 - torch.sigmoid((dh - c.term_height) / c.term_height_temp))
+    if c.term_foot_lift > 0:
+      fl = self.foot_lift_err(kin_next, ref).abs()  # [B,2]
+      hard = hard | (fl > c.term_foot_lift).any(-1)
+      alive = alive * torch.prod(1.0 - torch.sigmoid((fl - c.term_foot_lift) / c.term_foot_lift_temp), dim=-1)
     return hard, 1.0 - alive
 
   # ---- evaluation metrics (no grad) ----------------------------------------------
