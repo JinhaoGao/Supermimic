@@ -11,6 +11,10 @@ robot heading (goal_rel_yaw), the only robot-relative input -- without it headin
 
 Reward (x dt, like AnalyticHeads): exp kernels on
   bone_global_torso    torso bones (pelvis / torso up and left) in each skeleton's heading frame
+  bone_global_<limb>   optional (w_bone_global_arm / _leg, default 0): limb bones in the heading frame too. The local
+                       terms alone leave the twist of a parent link free -- on ab1 (10-27) the policy rotated the upper
+                       arms about their own axis so that forearm / hand / palm matched in the twisted shoulder frames
+                       (local 3-17 deg) while pointing 45-105 deg away in the world (arms swung out)
   bone_local_<group>   every bone in its parent's frame (torso / leg / arm)
   root_vel             robot pelvis velocity (robot heading frame) vs k x human root velocity (human heading frame)
   yaw_rate, heading    pelvis yaw rate; heading (hip-line yaw) difference, 2 - 2 cos (smooth at 0)
@@ -50,6 +54,8 @@ class HumanHeadsCfg(HeadsCfg):
   goal_rel_yaw: bool = True
   # Reward weights / kernel widths (bone std in chord units ~ radians for small angles); start values from RGMT P1.
   w_bone_global_torso: float = 1.0
+  w_bone_global_arm: float = 0.0  # 0 = RGMT P1 (limbs local only); see the module docstring
+  w_bone_global_leg: float = 0.0
   w_bone_local_torso: float = 0.5
   w_bone_local_leg: float = 1.5
   w_bone_local_arm: float = 1.0
@@ -80,7 +86,7 @@ class HumanHeadsCfg(HeadsCfg):
 
   @property
   def reward_max_per_step(self) -> float:
-    w = (self.w_bone_global_torso, self.w_bone_local_torso, self.w_bone_local_leg, self.w_bone_local_arm, self.w_root_vel,
+    w = (self.w_bone_global_torso, self.w_bone_global_arm, self.w_bone_global_leg, self.w_bone_local_torso, self.w_bone_local_leg, self.w_bone_local_arm, self.w_root_vel,
          self.w_yaw_rate, self.w_heading, self.w_height, self.w_contact)
     return sum(x for x in w if x > 0) * self.dt
 
@@ -135,6 +141,7 @@ class HumanHeads(AnalyticHeads):
     self.feat_dim = 13 + 2 * self.nj
     bt = self.bt
     self.w_global = bt.weights * bt.group_mask("torso")
+    self.w_global_limb = {g: bt.weights * bt.group_mask(g) for g in ("arm", "leg")}
     self.w_local = {g: bt.weights * bt.group_mask(g, local=True) for g in GROUPS}
     self.trunk = torch.tensor([bt.names.index(s) for s in TRUNK_SEGMENTS], dtype=torch.long, device=self.device)
     self.feet = torch.tensor(bt.r_feet, dtype=torch.long, device=self.device)
@@ -192,6 +199,10 @@ class HumanHeads(AnalyticHeads):
     sl = torch.exp(-e["bone_l"] / c.std_bone**2)
     wg = self.w_global
     terms = {"bone_global_torso": c.w_bone_global_torso * (sb * wg).sum(-1) / wg.sum()}
+    for g, wl in (("arm", c.w_bone_global_arm), ("leg", c.w_bone_global_leg)):
+      if wl:
+        m = self.w_global_limb[g]
+        terms[f"bone_global_{g}"] = wl * (sb * m).sum(-1) / m.sum()
     for g, wl in zip(GROUPS, (c.w_bone_local_torso, c.w_bone_local_leg, c.w_bone_local_arm)):
       m = self.w_local[g]
       terms[f"bone_local_{g}"] = wl * (sl * m).sum(-1) / m.sum()
@@ -238,6 +249,8 @@ class HumanHeads(AnalyticHeads):
     deg_g = torch.rad2deg(chord_angle(e["bone_g"]))
     deg_l = torch.rad2deg(chord_angle(e["bone_l"]))
     out = {"bone_global_torso_deg": (deg_g * self.w_global).sum(-1) / self.w_global.sum()}
+    for g, m in self.w_global_limb.items():  # limbs in the heading frame (the world-space pose a viewer sees)
+      out[f"bone_global_{g}_deg"] = (deg_g * m).sum(-1) / m.sum()
     for g in GROUPS:
       m = self.w_local[g]
       out[f"bone_local_{g}_deg"] = (deg_l * m).sum(-1) / m.sum()
