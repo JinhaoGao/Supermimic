@@ -11,6 +11,10 @@
 #   human3  legs + motion: human2 and root velocity 1 -> 2, heading 0.5 -> 1, yaw rate 0.5 -> 1
 #   human4  human2 + foot-lift termination 0.25 m (the baseline's end-effector test, against k x the human lift)
 #   human5  human3 + foot-lift termination 0.25 m
+#   ablations of human4 / human5 (ma1, 10-29):
+#   human6  human1 + foot-lift termination 0.25 (the termination without the leg reward changes)
+#   human7  human4 with the termination at 0.15 m      human8  human5 with the termination at 0.15 m
+#   human9  human4 + stronger foot-lift reward (2.0, width 0.05 m)   human10  human4 with the leg kernel back at 0.35
 # (GPUS: one entry per arm in this order; arms beyond the given GPUs need ARMS + GPUS of their own, see below)
 # Override any arm's --human_cfg with HUMAN1_CFG / HUMAN2_CFG / HUMAN3_CFG. Logs: $ROOT/<tag>_<arm>.out, pids .pid.
 # ARMS="human2 human3" starts only those (each keeps its GPU slot). The human arms share one library cache: start one
@@ -29,13 +33,18 @@ H2="${HUMAN2_CFG:-w_bone_global_arm=1.0,w_bone_global_leg=1.5,std_bone_leg=0.6,w
 H3="${HUMAN3_CFG:-w_bone_global_arm=1.0,w_bone_global_leg=1.5,std_bone_leg=0.6,w_foot_lift=1.0,w_root_vel=2.0,w_heading=1.0,w_yaw_rate=1.0}"
 H4="${HUMAN4_CFG:-$H2,term_foot_lift=0.25}"
 H5="${HUMAN5_CFG:-$H3,term_foot_lift=0.25}"
+H6="${HUMAN6_CFG:-$H1,term_foot_lift=0.25}"
+H7="${HUMAN7_CFG:-$H2,term_foot_lift=0.15}"
+H8="${HUMAN8_CFG:-$H3,term_foot_lift=0.15}"
+H9="${HUMAN9_CFG:-$H2,term_foot_lift=0.25,w_foot_lift=2.0,std_foot_lift=0.05}"
+H10="${HUMAN10_CFG:-w_bone_global_arm=1.0,w_bone_global_leg=1.5,w_foot_lift=1.0,term_foot_lift=0.25}"
 mkdir -p "$ROOT/logs" "$ROOT/cache"
 COMMON=(--robot g1 --robot_variant eval+evalcontact --H 48 --fixes --sampler_clamp_returns --sampler_cap 50 --sampler_boot_mean
   --num_workers 16 --iterations "$ITERS" --eval_interval 2000 --eval_clips 512 --eval_envs 512 --ckpt_interval 500
   --log_interval 50 --wd_sustain 200 --wd_warmup 1500 --wd_baseline_after_warmup --wd_signal imagined_reward_robust
   --log_root "$ROOT/logs" --cache_dir "$ROOT/cache")
 
-ARMS="${ARMS:-robot human1 human2 human3}"  # human4 / human5 only when named here (GPUS slots 4 / 5)
+ARMS="${ARMS:-robot human1 human2 human3}"  # human4..human10 only when named here (GPUS slots 4..10; "-" = unused)
 launch() {  # arm gpu args...
   local arm=$1 gpu=$2
   shift 2
@@ -54,3 +63,7 @@ launch human2 "${G[2]}" --motion_list "$PAIRS/human_list.txt" --reference human 
 launch human3 "${G[3]}" --motion_list "$PAIRS/human_list.txt" --reference human --human_cfg "$H3" "$@"
 launch human4 "$(slot 4)" --motion_list "$PAIRS/human_list.txt" --reference human --human_cfg "$H4" "$@"
 launch human5 "$(slot 5)" --motion_list "$PAIRS/human_list.txt" --reference human --human_cfg "$H5" "$@"
+for i in 6 7 8 9 10; do
+  v="H$i"
+  launch "human$i" "$(slot $i)" --motion_list "$PAIRS/human_list.txt" --reference human --human_cfg "${!v}" "$@"
+done
