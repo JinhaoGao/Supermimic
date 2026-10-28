@@ -208,7 +208,7 @@ def main():
   if args.skip_existing:
     def done(f):
       out = os.path.join(args.output_dir, os.path.basename(f)) if args.output_dir else f
-      return os.path.exists(out) and f"init_{args.robot}_ik_err_deg.npy" in np.load(out).files
+      return os.path.exists(out) and f"init_{args.robot}_ik_err_deg" in np.load(out).files  # npz keys have no .npy
     files = [f for f in files if not done(f)]
   print(f"{len(files)} clips")
   jobs = [(f, args) for f in files]
