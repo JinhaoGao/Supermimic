@@ -21,8 +21,8 @@ class HumanStepFns(StepFns):
     return goal, self.policy(obs_hist, goal)
 
   def _post(self, next_state, kin, a_exec, prev_action, h_dir, h_dir_local, h_root_vel, h_yaw, h_yaw_rate, h_height, h_rest,
-            h_contact, term_scale=None):
-    ref = dict(zip(STEP_FIELDS, (h_dir, h_dir_local, h_root_vel, h_yaw, h_yaw_rate, h_height, h_rest, h_contact)))
+            h_contact, h_foot_lift, term_scale=None):
+    ref = dict(zip(STEP_FIELDS, (h_dir, h_dir_local, h_root_vel, h_yaw, h_yaw_rate, h_height, h_rest, h_contact, h_foot_lift)))
     kin_next = self.heads.kin(next_state)
     r = self.heads.reward(kin, kin_next, next_state, a_exec, prev_action, ref)
     hard, _ = self.heads.termination(kin_next, next_state, ref)
@@ -37,7 +37,7 @@ class HumanStepFns(StepFns):
     return self.heads.goal(kin, p_feat[ar, idx], p_yaw[ar, idx])
 
   def _imagine_step(self, s, obs_hist, prev_a, f_loc, clip_end_loc, xi, bias, kin, p_feat, p_dir, p_dir_local, p_root_vel, p_yaw,
-                    p_yaw_rate, p_height, p_rest, p_contact, term_scale=None):
+                    p_yaw_rate, p_height, p_rest, p_contact, p_foot_lift, term_scale=None):
     heads = self.heads
     ar = torch.arange(s.shape[0], device=s.device)
     goal = self.goal_from_pack(kin, f_loc, clip_end_loc, p_feat, p_dir, p_dir_local, p_root_vel, p_yaw)
@@ -45,7 +45,7 @@ class HumanStepFns(StepFns):
     a = self.policy(obs_hist, goal)
     s_next = self.wm.step(s, a, xi)
     kin_next = heads.kin(s_next)
-    ref = dict(zip(STEP_FIELDS, (p[ar, f_loc] for p in (p_dir, p_dir_local, p_root_vel, p_yaw, p_yaw_rate, p_height, p_rest, p_contact))))
+    ref = dict(zip(STEP_FIELDS, (p[ar, f_loc] for p in (p_dir, p_dir_local, p_root_vel, p_yaw, p_yaw_rate, p_height, p_rest, p_contact, p_foot_lift))))
     r = heads.reward(kin, kin_next, s_next, a, prev_a, ref)
     _, d = heads.termination(kin_next, s_next, ref)
     f_next = torch.minimum(f_loc + 1, clip_end_loc - 1)

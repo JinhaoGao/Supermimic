@@ -39,7 +39,7 @@ from . import bone_map as bone
 from .motions import GOAL_FEAT_DIM
 
 # Reference fields per step (reward / termination), in the positional order of HumanStepFns._post / the pack tuple.
-STEP_FIELDS = ("h_dir", "h_dir_local", "h_root_vel", "h_yaw", "h_yaw_rate", "h_height", "h_rest", "h_contact")
+STEP_FIELDS = ("h_dir", "h_dir_local", "h_root_vel", "h_yaw", "h_yaw_rate", "h_height", "h_rest", "h_contact", "h_foot_lift")
 GOAL_FIELDS = ("h_feat", "h_yaw")
 PACK_FIELDS = ("h_feat",) + STEP_FIELDS  # imagination window pack (h_yaw is in STEP_FIELDS)
 TRUNK_SEGMENTS = ("pelvis_up", "torso_up")
@@ -60,6 +60,11 @@ class HumanHeadsCfg(HeadsCfg):
   w_bone_local_leg: float = 1.5
   w_bone_local_arm: float = 1.0
   std_bone: float = 0.35
+  std_bone_leg: float = 0.0  # kernel width of the leg terms (global + local); 0 = std_bone. ab2 (10-28): with 0.35 a leg
+  #                            40 deg off (lifts) scores exp(-4) ~ 0.02 -- almost no gradient back towards the lift
+  # Foot lift: robot ankle-link height above its standing height vs k x the human ankle lift (h_foot_lift), both feet.
+  w_foot_lift: float = 0.0
+  std_foot_lift: float = 0.1
   w_root_vel: float = 1.0
   std_root_vel: float = 0.5
   w_yaw_rate: float = 0.5
@@ -87,7 +92,7 @@ class HumanHeadsCfg(HeadsCfg):
   @property
   def reward_max_per_step(self) -> float:
     w = (self.w_bone_global_torso, self.w_bone_global_arm, self.w_bone_global_leg, self.w_bone_local_torso, self.w_bone_local_leg, self.w_bone_local_arm, self.w_root_vel,
-         self.w_yaw_rate, self.w_heading, self.w_height, self.w_contact)
+         self.w_yaw_rate, self.w_heading, self.w_height, self.w_contact, self.w_foot_lift)
     return sum(x for x in w if x > 0) * self.dt
 
 
@@ -145,6 +150,7 @@ class HumanHeads(AnalyticHeads):
     self.w_local = {g: bt.weights * bt.group_mask(g, local=True) for g in GROUPS}
     self.trunk = torch.tensor([bt.names.index(s) for s in TRUNK_SEGMENTS], dtype=torch.long, device=self.device)
     self.feet = torch.tensor(bt.r_feet, dtype=torch.long, device=self.device)
+    self.leg_mask = bt.group_mask("leg")
 
   def goal_layout(self, cfg: HeadsCfg | None = None) -> list[tuple[str, int]]:
     c = cfg or self.cfg
@@ -186,6 +192,11 @@ class HumanHeads(AnalyticHeads):
       heading=2.0 - 2.0 * torch.cos(ref["h_yaw"] - kin["yaw"]), height=(s[:, 2] / self.rest_h - ref["h_height"]) ** 2,
     )
 
+  def foot_lift_err(self, kin: dict, ref: dict) -> torch.Tensor:
+    """[B,2] robot ankle lift (above the standing ankle height) minus k x the human ankle lift."""
+    k = (self.rest_h / ref["h_rest"])[:, None]
+    return (kin["link_pos"][:, self.feet, 2] - self.ankle_h) - k * ref["h_foot_lift"]
+
   def soft_contact(self, kin: dict) -> torch.Tensor:
     """[B,2] soft contact of the (left, right) ankle links from their lift above the standing ankle height."""
     lift = kin["link_pos"][:, self.feet, 2] - self.ankle_h
@@ -195,8 +206,11 @@ class HumanHeads(AnalyticHeads):
              ref: dict, return_terms: bool = False):
     c = self.cfg
     e = self._errors(kin_next, s_next, ref)
-    sb = torch.exp(-e["bone_g"] / c.std_bone**2)
-    sl = torch.exp(-e["bone_l"] / c.std_bone**2)
+    std = torch.full((e["bone_g"].shape[-1],), c.std_bone, device=e["bone_g"].device)
+    if c.std_bone_leg > 0:
+      std = torch.where(self.leg_mask, torch.full_like(std, c.std_bone_leg), std)
+    sb = torch.exp(-e["bone_g"] / std**2)
+    sl = torch.exp(-e["bone_l"] / std**2)
     wg = self.w_global
     terms = {"bone_global_torso": c.w_bone_global_torso * (sb * wg).sum(-1) / wg.sum()}
     for g, wl in (("arm", c.w_bone_global_arm), ("leg", c.w_bone_global_leg)):
@@ -211,6 +225,8 @@ class HumanHeads(AnalyticHeads):
     if c.w_heading:
       terms["heading"] = c.w_heading * torch.exp(-e["heading"] / c.std_heading**2)
     terms["height"] = c.w_height * torch.exp(-e["height"] / c.std_height**2)
+    if c.w_foot_lift:
+      terms["foot_lift"] = c.w_foot_lift * torch.exp(-(self.foot_lift_err(kin_next, ref) ** 2) / c.std_foot_lift**2).mean(-1)
     if c.w_contact or c.w_slip:
       pc = self.soft_contact(kin_next)
       if c.w_contact:
@@ -258,4 +274,5 @@ class HumanHeads(AnalyticHeads):
     out["yaw_rate_err"] = e["yaw_rate"].sqrt()
     out["heading_err_deg"] = torch.rad2deg(chord_angle(e["heading"]))
     out["height_err"] = e["height"].sqrt()
+    out["foot_lift_err"] = self.foot_lift_err(kin, ref).abs().mean(-1)
     return out

@@ -17,6 +17,7 @@ heads only gather:
   h_yaw, h_yaw_rate    [T] human heading (hip line) yaw and pelvis yaw rate
   h_height [T]         pelvis height / rest pelvis height;  h_rest [T]: rest pelvis height of the clip's subject
   h_contact [T,2]      foot contact labels (left, right)
+  h_foot_lift [T,2]    ankle height above its standing height (median over the side's contact frames), metres
   init_*               robot reset state from bone-direction IK (joint order of the robot entity); used only by resets
 Nothing here depends on the robot except the init_* fields (and the bone map that defines the segments).
 """
@@ -35,14 +36,14 @@ from ..motions import MotionLibrary
 from . import bone_map as bone
 
 GOAL_FEAT_DIM = 138
-CACHE_VERSION = "human-v1"
+CACHE_VERSION = "human-v2"  # v2: + h_foot_lift
 
 
 def field_shapes(num_segments: int, num_joints: int) -> dict[str, tuple[int, ...]]:
   S, J = num_segments, num_joints
   return {
     "h_feat": (GOAL_FEAT_DIM,), "h_dir": (S, 3), "h_dir_local": (S, 3), "h_root_vel": (3,), "h_yaw": (), "h_yaw_rate": (),
-    "h_height": (), "h_rest": (), "h_contact": (2,), "init_joint_pos": (J,), "init_joint_vel": (J,), "init_root_quat": (4,),
+    "h_height": (), "h_rest": (), "h_contact": (2,), "h_foot_lift": (2,), "init_joint_pos": (J,), "init_joint_vel": (J,), "init_root_quat": (4,),
     "init_root_height": (), "init_ik_err": (),
   }
 
@@ -66,6 +67,9 @@ def derive_fields(d, bt: bone.BoneMapTensors, robot: str, joint_names: tuple[str
   v_h = torch.einsum("tji,tj->ti", heading, v)
   height = f64("root_pos_w")[:, 2]
   contact = f64("foot_contact")
+  ankle_z = joints[:, [7, 8], 2]
+  down = contact > 0.5
+  stance = torch.stack([ankle_z[down[:, i], i].median() if bool(down[:, i].any()) else ankle_z[:, i].min() for i in (0, 1)])
   feat = torch.cat([gravity_b, v_h / rest, ang_vel_b, (height / rest)[:, None], f64("smpl_local_rot6d").reshape(T, -1), contact], -1)
   assert feat.shape[1] == GOAL_FEAT_DIM, feat.shape
   src = [str(n) for n in d[f"init_{robot}_joint_names"]]
@@ -74,7 +78,7 @@ def derive_fields(d, bt: bone.BoneMapTensors, robot: str, joint_names: tuple[str
   out = {
     "h_feat": feat, "h_dir": bone.to_frame(h_w, heading), "h_dir_local": bone.human_bone_dirs_local(h_w, rot, bt),
     "h_root_vel": v_h, "h_yaw": torch.atan2(heading[:, 1, 0], heading[:, 0, 0]), "h_yaw_rate": w[:, 2],
-    "h_height": height / rest, "h_rest": torch.full((T,), rest, dtype=torch.float64), "h_contact": contact,
+    "h_height": height / rest, "h_rest": torch.full((T,), rest, dtype=torch.float64), "h_contact": contact, "h_foot_lift": ankle_z - stance,
     "init_joint_pos": np.asarray(d[f"init_{robot}_joint_pos"])[:, perm], "init_joint_vel": np.asarray(d[f"init_{robot}_joint_vel"])[:, perm],
     "init_root_quat": np.asarray(d[f"init_{robot}_root_quat"]), "init_root_height": np.asarray(d[f"init_{robot}_root_height"]),
     "init_ik_err": ik_err,
