@@ -26,6 +26,20 @@ at 0 (an atan2 angle has an infinite gradient there, which the BPTT would turn i
 Termination (hard test in the simulator, sigmoid soft term in imagination, noisy-OR like AnalyticHeads): angle of the
 pelvis_up / torso_up bones (heading frames) > term_trunk, normalized pelvis height error > term_height, optionally
 (term_foot_lift > 0) an ankle-lift error > term_foot_lift on either foot.
+
+End-effector world tracking (ee_mode, docs/ee_world_tracking_plan.md; after Workhorse, arXiv 2610.09117): the task links
+of the bone map (torso, wrists, feet) as world poses, unscaled, mapped onto the episode by a per-env condition
+cond = [alpha, ee_valid, anchor xy (2), drift (dx, dy, dyaw), drift rate (3)] (COND_DIM) that the command samples:
+  target = drift o (human task pose - anchor xy): the drift is a rigid yaw about the frame's own torso point plus an xy
+  shift, extrapolated to each sample's own time (rate x steps, clamped to the drift box).
+  goal       + EE block (task links in the robot's current torso_link frame: position, rot6d; zeroed when ee_valid = 0),
+             alpha, ee_valid
+  reward     (1 - (1 - ee_style) alpha) x the positive H4 terms + alpha x task kernels: torso xy / rotation (wide and
+             narrow), wrist position (wide and narrow) / rotation (world), feet xy / rotation relative to the torso point
+             in the heading frame, swing-foot clearance; penalties unchanged. The torso height is not a target: the
+             human shoulder line (median 1.30 m on AMASS) is out of the G1's reach (1.08 m standing straight).
+  termination + wrist / torso-xy world error > term_ee_* / alpha (off at alpha = 0)
+With ee_mode off everything is as before (same goal, reward, termination and compiled graphs).
 """
 
 from __future__ import annotations
@@ -43,6 +57,9 @@ from .motions import GOAL_FEAT_DIM
 STEP_FIELDS = ("h_dir", "h_dir_local", "h_root_vel", "h_yaw", "h_yaw_rate", "h_height", "h_rest", "h_contact", "h_foot_lift")
 GOAL_FIELDS = ("h_feat", "h_yaw")
 PACK_FIELDS = ("h_feat",) + STEP_FIELDS  # imagination window pack (h_yaw is in STEP_FIELDS)
+EE_STEP_FIELDS = ("h_task_pos", "h_task_rot6d")  # ee_mode: appended to STEP_FIELDS / GOAL_FIELDS / PACK_FIELDS
+COND_DIM = 10  # alpha, ee_valid, anchor x, y, drift dx, dy, dyaw, drift rate x 3 (per step)
+TASK_TORSO, TASK_WRISTS, TASK_FEET = 0, (1, 2), (3, 4)  # bone_map.task_links order
 TRUNK_SEGMENTS = ("pelvis_up", "torso_up")
 GROUPS = ("torso", "leg", "arm")
 
@@ -89,6 +106,49 @@ class HumanHeadsCfg(HeadsCfg):
   # terms of those frames, while the baseline's termination costs every future reward.
   term_foot_lift: float = 0.0
   term_foot_lift_temp: float = 0.02
+  # End-effector world tracking (module docstring). The task weights below are relative: they are rescaled so that they
+  # sum to (1 - ee_style) x the H4 sum (ee_task_scale), so the reward scale is the same for every alpha and every
+  # ablation of them (the defaults sum to 7 = 0.7 x 10: scale 1 with the H4 recipe).
+  ee_mode: bool = False
+  ee_style: float = 0.3  # share of the positive H4 terms kept at alpha = 1
+  w_ee_torso_wide: float = 1.0
+  std_ee_torso_wide_pos: float = 0.3
+  std_ee_torso_wide_rot: float = 0.4
+  w_ee_torso: float = 1.0
+  std_ee_torso_pos: float = 0.06
+  std_ee_torso_rot: float = 0.15
+  w_ee_wrist_wide: float = 1.0  # not in Workhorse: a narrow kernel alone has no gradient far from the target (BPTT)
+  std_ee_wrist_wide: float = 0.3
+  w_ee_wrist: float = 2.0
+  std_ee_wrist: float = 0.06
+  w_ee_wrist_rot: float = 0.5
+  std_ee_wrist_rot: float = 0.15
+  w_ee_foot: float = 1.0
+  std_ee_foot_pos: float = 0.06
+  std_ee_foot_rot: float = 0.1
+  w_ee_clear: float = 0.5
+  ee_clear_height: float = 0.10  # ankle lift asked for while the human foot swings
+  std_ee_clear: float = 0.035
+  term_ee_wrist: float = 0.4  # m at alpha = 1 (threshold / alpha); 0 = off
+  term_ee_torso: float = 0.5
+  term_ee_temp: float = 0.02
+  # Condition sampling (human.command): alpha at reset 0 w.p. alpha_p0, 1 w.p. alpha_p1, else U(0, 1); mid-episode
+  # switch to a new alpha w.p. alpha_switch_p per episode (linear ramp alpha_ramp_s); alpha = 0 episodes drop the EE
+  # block (ee_valid = 0) w.p. ee_dropout. Drift: piecewise-linear random walk in the box (drift_xy, drift_yaw), the rate
+  # resampled every U(drift_tmin, drift_tmax) s towards a uniform point of the box; drift_xy = drift_yaw = 0: off.
+  alpha_p0: float = 0.25
+  alpha_p1: float = 0.25
+  alpha_switch_p: float = 0.3
+  alpha_ramp_s: float = 0.5
+  ee_dropout: float = 0.5
+  drift_xy: float = 0.10
+  drift_yaw: float = 0.1745
+  drift_tmin: float = 0.2
+  drift_tmax: float = 1.0
+  eval_alpha: float = 1.0  # evaluation episodes: this alpha, ee_valid = 1, no drift
+  # Clips the G1 can track in the world (scripts/human/prepare_ee_ik.py ee_list.txt: paths or basenames, one per line):
+  # training episodes of the other clips keep alpha = 0 (H4 only). "" = every clip.
+  ee_clip_list: str = ""
 
   def __post_init__(self):
     super().__post_init__()
@@ -97,10 +157,24 @@ class HumanHeadsCfg(HeadsCfg):
                        "goal_ref_root, critic_errors) do not apply")
 
   @property
-  def reward_max_per_step(self) -> float:
+  def h4_weight_sum(self) -> float:
     w = (self.w_bone_global_torso, self.w_bone_global_arm, self.w_bone_global_leg, self.w_bone_local_torso, self.w_bone_local_leg, self.w_bone_local_arm, self.w_root_vel,
          self.w_yaw_rate, self.w_heading, self.w_height, self.w_contact, self.w_foot_lift)
-    return sum(x for x in w if x > 0) * self.dt
+    return sum(x for x in w if x > 0)
+
+  @property
+  def ee_weight_sum(self) -> float:
+    w = (self.w_ee_torso_wide, self.w_ee_torso, self.w_ee_wrist_wide, self.w_ee_wrist, self.w_ee_wrist_rot, self.w_ee_foot, self.w_ee_clear)
+    return sum(x for x in w if x > 0)
+
+  @property
+  def ee_task_scale(self) -> float:
+    """Multiplier of the w_ee_* weights: their sum becomes (1 - ee_style) x the H4 sum."""
+    return (1.0 - self.ee_style) * self.h4_weight_sum / max(self.ee_weight_sum, 1e-9)
+
+  @property
+  def reward_max_per_step(self) -> float:
+    return self.h4_weight_sum * self.dt  # ee_mode: the same for every alpha (ee_task_scale)
 
 
 def robot_heading(link_pos: torch.Tensor, bt: bone.BoneMapTensors, eps: float = 0.05) -> torch.Tensor:
@@ -113,6 +187,26 @@ def robot_heading(link_pos: torch.Tensor, bt: bone.BoneMapTensors, eps: float = 
   up = torch.zeros_like(left)
   up[..., 2] = 1.0
   return torch.stack([torch.cross(left, up, dim=-1), left, up], dim=-1)
+
+
+def rot6d_to_matrix(r6: torch.Tensor) -> torch.Tensor:
+  """[..., 6] (first two columns, math_utils.rot6d_from_quat layout) -> [..., 3, 3] (Gram-Schmidt)."""
+  m = r6.unflatten(-1, (3, 2))
+  a = m[..., 0] / m[..., 0].norm(dim=-1, keepdim=True).clamp(min=1e-6)
+  b = m[..., 1] - (a * m[..., 1]).sum(-1, keepdim=True) * a
+  b = b / b.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+  return torch.stack([a, b, torch.cross(a, b, dim=-1)], dim=-1)
+
+
+def rot_z(yaw: torch.Tensor) -> torch.Tensor:
+  c, s = torch.cos(yaw), torch.sin(yaw)
+  z, o = torch.zeros_like(yaw), torch.ones_like(yaw)
+  return torch.stack([c, -s, z, s, c, z, z, z, o], dim=-1).unflatten(-1, (3, 3))
+
+
+def rot_err2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+  """|A - B|_F^2 / 2 = 2 - 2 cos(angle) (~ angle^2), smooth at 0 like chord2; [..., 3, 3] -> [...]."""
+  return ((a - b) ** 2).sum((-1, -2)) * 0.5
 
 
 def chord2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -147,7 +241,9 @@ class HumanHeads(AnalyticHeads):
     self.soft_lim = soft_joint_limits.to(self.device).reshape(self.nj, 2)
     self.gravity = torch.tensor([0.0, 0.0, -1.0], device=self.device)
     self.proprio_dim = 3 * self.nj + 6
-    self.goal_frame_dim = GOAL_FEAT_DIM + (2 if cfg.goal_rel_yaw else 0)
+    self.ee_on = bool(cfg.ee_mode)
+    self.n_task = len(self.bone_map.task_links)
+    self.goal_frame_dim = sum(n for _, n in self.goal_layout())
     self.critic_err_dim = 0
     self.state_dim = 13 + 2 * self.nj
     self.feat_dim = 13 + 2 * self.nj
@@ -158,10 +254,29 @@ class HumanHeads(AnalyticHeads):
     self.trunk = torch.tensor([bt.names.index(s) for s in TRUNK_SEGMENTS], dtype=torch.long, device=self.device)
     self.feet = torch.tensor(bt.r_feet, dtype=torch.long, device=self.device)
     self.leg_mask = bt.group_mask("leg")
+    self.drift_box = torch.tensor([cfg.drift_xy, cfg.drift_xy, cfg.drift_yaw], device=self.device)
+
+  @property
+  def step_fields(self) -> tuple[str, ...]:
+    """Positional step reference of the simulator side (current_ref) / reward: STEP_FIELDS (+ EE fields, cond)."""
+    return STEP_FIELDS + (EE_STEP_FIELDS + ("cond",) if self.ee_on else ())
+
+  @property
+  def goal_fields(self) -> tuple[str, ...]:
+    """Library fields of the goal window (cond is per env, appended by the caller)."""
+    return GOAL_FIELDS + (EE_STEP_FIELDS if self.ee_on else ())
+
+  @property
+  def pack_fields(self) -> tuple[str, ...]:
+    """Positional imagination pack (trainer: Trainer._pack_args): library windows, then cond [N,C] of the start."""
+    return PACK_FIELDS + (EE_STEP_FIELDS + ("cond",) if self.ee_on else ())
 
   def goal_layout(self, cfg: HeadsCfg | None = None) -> list[tuple[str, int]]:
     c = cfg or self.cfg
-    return [("h_feat", GOAL_FEAT_DIM)] + ([("rel_yaw", 2)] if getattr(c, "goal_rel_yaw", False) else [])
+    out = [("h_feat", GOAL_FEAT_DIM)] + ([("rel_yaw", 2)] if getattr(c, "goal_rel_yaw", False) else [])
+    if getattr(c, "ee_mode", False):
+      out += [("ee", 9 * len(self.bone_map.task_links)), ("alpha", 1), ("ee_valid", 1)]
+    return out
 
   # ---- kinematics ------------------------------------------------------------
 
@@ -173,19 +288,62 @@ class HumanHeads(AnalyticHeads):
     rot = bone.quat_wxyz_to_matrix(lq)
     heading = robot_heading(lp, self.bt)
     r_w = bone.robot_bone_dirs_w(lp, rot, self.bt)
-    return dict(
+    out = dict(
       link_pos=lp, link_lin_vel=lin[:, self.links], heading=heading, yaw=torch.atan2(heading[:, 1, 0], heading[:, 0, 0]),
       dirs=bone.to_frame(r_w, heading), dirs_local=bone.robot_bone_dirs_local(r_w, rot, self.bt),
     )
+    if self.ee_on:  # task link poses (env-local world frame, the state's p)
+      out["task_pos"], out["task_rot"] = bone.robot_task_poses(lp, rot, self.bt)
+    return out
+
+  # ---- end-effector targets ------------------------------------------------------
+
+  def cond_at(self, cond: torch.Tensor, steps: torch.Tensor) -> torch.Tensor:
+    """cond [B,C] with its drift advanced by steps [B] (rate x steps x dt, clamped to the drift box)."""
+    d = cond[:, 4:7] + cond[:, 7:10] * (steps.to(cond.dtype) * self.cfg.dt)[:, None]
+    d = torch.maximum(torch.minimum(d, self.drift_box), -self.drift_box)
+    return torch.cat([cond[:, :4], d, cond[:, 7:]], dim=-1)
+
+  def ee_targets(self, h_task_pos: torch.Tensor, h_task_rot6d: torch.Tensor, cond: torch.Tensor, steps=None):
+    """World targets of the task links: h_task_pos [B,(K,)L,3], h_task_rot6d [B,(K,)L,6], cond [B,C] at the first
+    sample; steps [K] (optional): each sample's offset in steps, its drift extrapolated to its own time.
+    -> positions [B,(K,)L,3], rotations [B,(K,)L,3,3], drift yaw [B,(K,)]."""
+    c = self.cfg
+    d = cond[:, 4:7]
+    if steps is not None:
+      d = d[:, None] + cond[:, None, 7:10] * (steps.to(cond.dtype) * c.dt)[None, :, None]
+      d = torch.maximum(torch.minimum(d, self.drift_box), -self.drift_box)  # [B,K,3]
+      anchor = cond[:, None, 2:4]
+    else:
+      anchor = cond[:, 2:4]
+    R = rot_z(d[..., 2])  # [B,(K,)3,3]
+    pivot = h_task_pos[..., TASK_TORSO : TASK_TORSO + 1, :2]  # each frame's own torso point
+    rel = h_task_pos[..., :2] - pivot
+    xy = torch.einsum("...ij,...lj->...li", R[..., :2, :2], rel) + pivot - anchor[..., None, :] + d[..., None, :2]
+    pos = torch.cat([xy, h_task_pos[..., 2:]], dim=-1)
+    rot = R[..., None, :, :] @ rot6d_to_matrix(h_task_rot6d)
+    return pos, rot, d[..., 2]
 
   # ---- goal --------------------------------------------------------------------
 
-  def goal(self, kin: dict, h_feat: torch.Tensor, h_yaw: torch.Tensor) -> torch.Tensor:
-    """h_feat [B,K,138], h_yaw [B,K] -> goal [B,K,G]."""
-    if not self.cfg.goal_rel_yaw:
-      return h_feat
-    d = h_yaw - kin["yaw"][:, None]
-    return torch.cat([h_feat, torch.cos(d)[..., None], torch.sin(d)[..., None]], dim=-1)
+  def goal(self, kin: dict, h_feat: torch.Tensor, h_yaw: torch.Tensor, h_task_pos=None, h_task_rot6d=None, cond=None) -> torch.Tensor:
+    """h_feat [B,K,138], h_yaw [B,K] (ee_mode: h_task_pos [B,K,L,3], h_task_rot6d [B,K,L,6], cond [B,C] at the first
+    sample) -> goal [B,K,G]."""
+    parts = [h_feat]
+    if self.cfg.goal_rel_yaw:
+      d = h_yaw - kin["yaw"][:, None]
+      parts += [torch.cos(d)[..., None], torch.sin(d)[..., None]]
+    if self.ee_on:
+      B, K = h_feat.shape[:2]
+      steps = torch.arange(K, device=h_feat.device)
+      pos, rot, _ = self.ee_targets(h_task_pos, h_task_rot6d, cond, steps)  # [B,K,L,3], [B,K,L,3,3]
+      tp, tr = kin["task_pos"][:, TASK_TORSO], kin["task_rot"][:, TASK_TORSO]  # robot torso_link frame [B,3], [B,3,3]
+      p_rel = torch.einsum("bji,bklj->bkli", tr, pos - tp[:, None, None, :])
+      r_rel = torch.einsum("bji,bkljm->bklim", tr, rot)
+      valid = cond[:, 1][:, None, None]
+      ee = torch.cat([p_rel, r_rel[..., :, :2].flatten(-2)], dim=-1).flatten(-2) * valid
+      parts += [ee, cond[:, None, 0:1].expand(B, K, 1), cond[:, None, 1:2].expand(B, K, 1)]
+    return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
 
   # ---- reward ------------------------------------------------------------------
 
@@ -198,6 +356,47 @@ class HumanHeads(AnalyticHeads):
       root_vel=((k * ref["h_root_vel"] - v_h) ** 2).sum(-1), yaw_rate=(ref["h_yaw_rate"] - s[:, 12]) ** 2,
       heading=2.0 - 2.0 * torch.cos(ref["h_yaw"] - kin["yaw"]), height=(s[:, 2] / self.rest_h - ref["h_height"]) ** 2,
     )
+
+  def ee_errors(self, kin: dict, ref: dict) -> dict:
+    """Squared task-link errors of kin against the (drifted) targets of ref (h_task_pos, h_task_rot6d, cond, h_yaw)."""
+    pos, rot, dyaw = self.ee_targets(ref["h_task_pos"], ref["h_task_rot6d"], ref["cond"])
+    rp, rr = kin["task_pos"], kin["task_rot"]
+    w, f, t = list(TASK_WRISTS), list(TASK_FEET), TASK_TORSO
+    hh = rot_z(ref["h_yaw"] + dyaw)  # human heading frame (drifted), robot: hip-line heading
+    rh = kin["heading"]
+    f_h = torch.einsum("bji,blj->bli", hh, pos[:, f] - pos[:, t : t + 1])[..., :2]
+    f_r = torch.einsum("bji,blj->bli", rh, rp[:, f] - rp[:, t : t + 1])[..., :2]
+    return dict(
+      torso_xy=((rp[:, t, :2] - pos[:, t, :2]) ** 2).sum(-1), torso_rot=rot_err2(rr[:, t], rot[:, t]),
+      wrist_pos=((rp[:, w] - pos[:, w]) ** 2).sum(-1), wrist_rot=rot_err2(rr[:, w], rot[:, w]),
+      foot_xy=((f_r - f_h) ** 2).sum(-1),
+      foot_rot=rot_err2(rh.transpose(-1, -2)[:, None] @ rr[:, f], hh.transpose(-1, -2)[:, None] @ rot[:, f]),
+    )
+
+  def ee_terms(self, kin: dict, ref: dict) -> dict:
+    """Task kernels (unweighted by alpha, x their w_ee_* weight)."""
+    c = self.cfg
+    e = self.ee_errors(kin, ref)
+    k = lambda x, s: torch.exp(-x / s**2)  # noqa: E731
+    out = {}
+    if c.w_ee_torso_wide:
+      out["ee_torso_wide"] = c.w_ee_torso_wide * 0.5 * (k(e["torso_xy"], c.std_ee_torso_wide_pos) + k(e["torso_rot"], c.std_ee_torso_wide_rot))
+    if c.w_ee_torso:
+      out["ee_torso"] = c.w_ee_torso * 0.5 * (k(e["torso_xy"], c.std_ee_torso_pos) + k(e["torso_rot"], c.std_ee_torso_rot))
+    if c.w_ee_wrist_wide:
+      out["ee_wrist_wide"] = c.w_ee_wrist_wide * k(e["wrist_pos"], c.std_ee_wrist_wide).mean(-1)
+    if c.w_ee_wrist:
+      out["ee_wrist"] = c.w_ee_wrist * k(e["wrist_pos"], c.std_ee_wrist).mean(-1)
+    if c.w_ee_wrist_rot:
+      out["ee_wrist_rot"] = c.w_ee_wrist_rot * k(e["wrist_rot"], c.std_ee_wrist_rot).mean(-1)
+    if c.w_ee_foot:
+      out["ee_foot"] = c.w_ee_foot * 0.5 * (k(e["foot_xy"], c.std_ee_foot_pos) + k(e["foot_rot"], c.std_ee_foot_rot)).mean(-1)
+    if c.w_ee_clear:
+      lift = kin["link_pos"][:, self.feet, 2] - self.ankle_h
+      short = (c.ee_clear_height - lift).clamp(min=0.0)
+      swing = 1.0 - ref["h_contact"]
+      out["ee_clear"] = c.w_ee_clear * (1.0 - swing * (1.0 - k(short**2, c.std_ee_clear))).mean(-1)
+    return out
 
   def foot_lift_err(self, kin: dict, ref: dict) -> torch.Tensor:
     """[B,2] robot ankle lift (above the standing ankle height) minus k x the human ankle lift."""
@@ -241,6 +440,12 @@ class HumanHeads(AnalyticHeads):
       if c.w_slip:
         vxy = (kin_next["link_lin_vel"][:, self.feet, :2] ** 2).sum(-1)
         terms["slip"] = -c.w_slip * (pc * vxy).sum(-1)
+    if self.ee_on:  # alpha blend: positive H4 terms x (1 - (1 - ee_style) alpha), task kernels x alpha
+      a = ref["cond"][:, 0]
+      keep = 1.0 - (1.0 - c.ee_style) * a
+      terms = {n: v * keep for n, v in terms.items()}
+      ts = c.ee_task_scale
+      terms.update({n: v * (a * ts) for n, v in self.ee_terms(kin_next, ref).items()})
     _, _, _, _, q, _ = self.split(s_next)
     lim = (-(q - self.soft_lim[:, 0]).clamp(max=0.0) + (q - self.soft_lim[:, 1]).clamp(min=0.0)).sum(-1)
     terms["action_rate"] = c.w_action_rate * ((action - prev_action) ** 2).sum(-1)
@@ -264,6 +469,14 @@ class HumanHeads(AnalyticHeads):
       fl = self.foot_lift_err(kin_next, ref).abs()  # [B,2]
       hard = hard | (fl > c.term_foot_lift).any(-1)
       alive = alive * torch.prod(1.0 - torch.sigmoid((fl - c.term_foot_lift) / c.term_foot_lift_temp), dim=-1)
+    if self.ee_on and (c.term_ee_wrist > 0 or c.term_ee_torso > 0):
+      e = self.ee_errors(kin_next, ref)
+      inv_a = 1.0 / ref["cond"][:, 0].clamp(min=1e-3)  # threshold / alpha: off at alpha = 0
+      for err2, th in ((e["wrist_pos"].amax(-1), c.term_ee_wrist), (e["torso_xy"], c.term_ee_torso)):
+        if th > 0:
+          err, thr = torch.sqrt(err2 + 1e-12), th * inv_a
+          hard = hard | (err > thr)
+          alive = alive * (1.0 - torch.sigmoid((err - thr) / c.term_ee_temp))
     return hard, 1.0 - alive
 
   # ---- evaluation metrics (no grad) ----------------------------------------------
@@ -286,4 +499,14 @@ class HumanHeads(AnalyticHeads):
     out["heading_err_deg"] = torch.rad2deg(chord_angle(e["heading"]))
     out["height_err"] = e["height"].sqrt()
     out["foot_lift_err"] = self.foot_lift_err(kin, ref).abs().mean(-1)
+    if self.ee_on:  # world task-link errors against the (drifted) targets: metres / degrees
+      ee = self.ee_errors(kin, ref)
+      deg = lambda x: torch.rad2deg(chord_angle(x))  # noqa: E731  (2 - 2 cos is a squared chord)
+      out["ee_torso_xy_err"] = ee["torso_xy"].sqrt()
+      out["ee_torso_rot_deg"] = deg(ee["torso_rot"])
+      out["ee_wrist_err"] = ee["wrist_pos"].sqrt().mean(-1)
+      out["ee_wrist_rot_deg"] = deg(ee["wrist_rot"]).mean(-1)
+      out["ee_wrist_5cm"] = (ee["wrist_pos"].sqrt() < 0.05).float().mean(-1)
+      out["ee_foot_xy_err"] = ee["foot_xy"].sqrt().mean(-1)
+      out["alpha"] = ref["cond"][:, 0]
     return out

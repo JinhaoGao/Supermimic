@@ -394,7 +394,8 @@ class Trainer:
     self.sched = [torch.optim.lr_scheduler.LambdaLR(o, lam) for o in (self.opt_wm, self.opt_pi, self.opt_v)]
     self._base_lrs0 = [list(sch.base_lrs) for sch in self.sched]
     self.lr_scale = 1.0
-    self.buffer = ReplayBuffer(self.E, cfg.replay_capacity, self.heads.state_dim, self.nj, self.xi_dim, self.device)
+    self.buffer = ReplayBuffer(self.E, cfg.replay_capacity, self.heads.state_dim, self.nj, self.xi_dim, self.device,
+                               extra=self.sim.replay_extra_dims() if hasattr(self.sim, "replay_extra_dims") else None)
     self.evaluator: Evaluator | None = None
     self.it = 0
     self.env_steps = 0
@@ -512,6 +513,7 @@ class Trainer:
     cfg = self.cfg
     refs = self.sim.goal_refs(self.frame, self.clip_end)
     ref_cur = self.sim.current_ref()  # reference at frame f_t: reward target of this step
+    extra = self.sim.replay_extra() if hasattr(self.sim, "replay_extra") else {}  # per-step replay fields (human ee_mode: the condition)
     goal, a = self.fns.act(self.hist.buf, self.kin, *refs)
     self.dist.rms_update([(self.policy.obs_norm, self.hist.buf[:, -1]), (self.policy.goal_norm, goal)])
     a_exec = a + cfg.action_noise_std * torch.randn_like(a)
@@ -541,7 +543,7 @@ class Trainer:
 
     self.buffer.add(
       state=self.state, next_state=next_state, action=a_exec, prev_action=self.prev_action, xi=self.xi, reward=r,
-      frame=self.frame, clip_end=self.clip_end, ep_step=self.ep_step, term=terminated, done=done,
+      frame=self.frame, clip_end=self.clip_end, ep_step=self.ep_step, term=terminated, done=done, **extra,
     )
     self.ep_bins[self._ar, self.ep_step] = self.lib.bin_of_frame[self.frame].long()
     self.ep_rews[self._ar, self.ep_step] = r
@@ -684,6 +686,8 @@ class Trainer:
       Lw = H + K
       pf = self._pack_fields()
       pack = self.lib.gather_windows(st["frame"], Lw) if pf is None else self.lib.gather_windows(st["frame"], Lw, fields=pf)
+      if "cond" in st:  # human ee_mode: the start's condition (its drift is advanced by the imagined steps)
+        pack["cond"] = st["cond"]
       if getattr(heads, "critic_err_dim", 0):  # error normalizer statistics from the rollout start states (real replay states)
         self.dist.rms_update([(self.critic.err_norm, heads.critic_errors(kin, pack["body_pos"][:, 0], pack["body_quat"][:, 0]))])
       f_loc = torch.zeros(N, dtype=torch.long, device=self.device)
@@ -772,15 +776,13 @@ class Trainer:
 
   def _pack_fields(self):
     """Library fields of the imagination window pack (None = all: the robot library holds exactly ROBOT_PACK)."""
-    from .human.heads import PACK_FIELDS
-
-    return PACK_FIELDS if getattr(self, "human", False) else None
+    if getattr(self, "human", False):
+      return tuple(k for k in self.heads.pack_fields if k != "cond")
+    return None
 
   def _pack_args(self, pack: dict) -> tuple:
     """Pack tensors in the positional order of fns.imagine_step / goal_from_pack."""
-    from .human.heads import PACK_FIELDS
-
-    return tuple(pack[k] for k in (PACK_FIELDS if getattr(self, "human", False) else self.ROBOT_PACK))
+    return tuple(pack[k] for k in (self.heads.pack_fields if getattr(self, "human", False) else self.ROBOT_PACK))
 
   @torch.no_grad()
   def _imagined_root_ori(self, ang: torch.Tensor, c: torch.Tensor, d: torch.Tensor, term_scale: torch.Tensor | None) -> dict:
@@ -1027,6 +1029,8 @@ class Trainer:
       self._set_lr_scale(float(ck.get("lr_scale", 1.0)))
       if self.lr_scale != 1.0:
         self._print(f"[Trainer] lr_scale {self.lr_scale} restored from checkpoint")
+    # Robot-relative / condition segments (human ee_mode: ee, alpha, ee_valid) keep mean 0 / var 1 (bounded, O(1) inputs)
+    new_goal = [n for n in new_goal if n == "ref_root"]
     if new_goal:
       self._calibrate_goal_norm(new_goal)
     self.wd_healthy_ckpt = path
@@ -1080,15 +1084,18 @@ class Trainer:
     get zero weights, so the grafted networks compute exactly what they computed before (the critic only approximately
     when the WM representation changed). Returns the goal segments that are new (their normalizer statistics still need
     calibrating)."""
-    if getattr(self, "human", False):  # no input grafting for the human goal: the layout must match
-      if ck.get("dims", {}).get("goal_frame", self.heads.goal_frame_dim) != self.heads.goal_frame_dim:
-        raise ValueError(f"goal frame {ck['dims']['goal_frame']} in the checkpoint vs {self.heads.goal_frame_dim} (goal_rel_yaw?)")
-      return []
-    known = {f.name for f in fields(HeadsCfg)} | {"ee_term_temp"}  # from_dict maps master's v2 EE keys
-    old_h = HeadsCfg.from_dict({k: v for k, v in ck["cfg"]["heads"].items() if k in known})
+    human = getattr(self, "human", False)
+    if human:  # human goal: grafts add segments of the layout (ee_mode: an H4 checkpoint -> EE goal, new inputs zero)
+      from .human.heads import HumanHeadsCfg
+
+      known_h = {f.name for f in fields(HumanHeadsCfg)}
+      old_h = HumanHeadsCfg(**{k: v for k, v in ck["cfg"]["heads"].items() if k in known_h})
+    else:
+      known = {f.name for f in fields(HeadsCfg)} | {"ee_term_temp"}  # from_dict maps master's v2 EE keys
+      old_h = HeadsCfg.from_dict({k: v for k, v in ck["cfg"]["heads"].items() if k in known})
     if "dims" not in ck or not hasattr(self.heads, "goal_layout"):  # (stand-ins in tests: nothing to graft)
       return []
-    if ck["dims"]["goal_frame"] == 2 * self.nj + 9:  # checkpoints from before the goal_anchor_pos flag
+    if not human and ck["dims"]["goal_frame"] == 2 * self.nj + 9:  # checkpoints from before the goal_anchor_pos flag
       old_h.goal_anchor_pos = True
     old_seg, new_seg = self.heads.goal_layout(old_h), self.heads.goal_layout()
     old_err = 4 * len(self.heads.tracked) + 1 if old_h.critic_errors else 0

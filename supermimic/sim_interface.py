@@ -199,6 +199,13 @@ class SimInterface:
       g["body_ang_vel"].view(E, K, -1, 3)[:, :, a] if vel else None,
     )
 
+  def replay_extra_dims(self) -> dict[str, int]:
+    """Optional per-step replay fields {name: dim} (none for the robot reference)."""
+    return {}
+
+  def replay_extra(self) -> dict:
+    return {}
+
   def current_ref(self) -> tuple:
     """Reference body fields at the command's current frame (for the reward of the next step)."""
     c = self.cmd.current_ref()

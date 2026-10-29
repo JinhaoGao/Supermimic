@@ -12,7 +12,8 @@ import torch
 
 
 class ReplayBuffer:
-  def __init__(self, num_envs: int, capacity: int, state_dim: int, action_dim: int, xi_dim: int, device: str):
+  def __init__(self, num_envs: int, capacity: int, state_dim: int, action_dim: int, xi_dim: int, device: str,
+               extra: dict[str, int] | None = None):
     E, C = num_envs, capacity
     self.E, self.C, self.device = E, C, device
     z = lambda *shape, dtype=torch.float32: torch.zeros(*shape, dtype=dtype, device=device)  # noqa: E731
@@ -27,6 +28,10 @@ class ReplayBuffer:
     self.ep_step = z(E, C, dtype=torch.long)  # steps since episode start (0 = first obs)
     self.term = z(E, C, dtype=torch.bool)  # failure termination after this step
     self.done = z(E, C, dtype=torch.bool)  # term or time-out after this step
+    # Optional per-step float fields {name: dim} (human ee_mode: the episode condition "cond"); returned by sample_starts.
+    self.extra = dict(extra or {})
+    for k, d in self.extra.items():
+      setattr(self, k, z(E, C, d))
     self.ptr = 0
     self.size = 0
     self._env_ar = torch.arange(E, device=device)
@@ -107,4 +112,5 @@ class ReplayBuffer:
       clip_end=self.clip_end[env, slot],
       hist_states=self.state[env_h, hslots],
       hist_prev_action=self.prev_action[env_h, hslots],
+      **{k: getattr(self, k)[env, slot] for k in self.extra},
     )

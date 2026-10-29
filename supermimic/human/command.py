@@ -6,6 +6,9 @@ trainer's bookkeeping, checkpoints and DDP sampler sync are the same), but
   * resets write the bone-direction IK reset state (init_* fields) at the env origin: height from the IK, heading =
     the human heading, root velocity = k x the human root velocity, plus the usual pose / joint / velocity noise,
   * the simulator termination is the heads' own hard test (human_failed), so simulator and imagination agree.
+  * ee_mode (attach_heads): a per-env condition ``cond`` (human.heads.COND_DIM: alpha, ee_valid, anchor xy, drift,
+    drift rate) sampled at resets and advanced every step (alpha switches, drift random walk); "start" (evaluation) mode
+    uses alpha = eval_alpha, ee_valid = 1, no drift.
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ from mjlab.utils.lab_api.math import quat_from_euler_xyz, quat_mul, sample_unifo
 
 from ..library_command import LIBRARY_REGISTRY, LibraryMotionCommand, LibraryMotionCommandCfg
 from . import bone_map as bone
-from .heads import STEP_FIELDS
+from .heads import COND_DIM, EE_STEP_FIELDS, STEP_FIELDS
 from .motions import HumanMotionLibrary
 
 if TYPE_CHECKING:
@@ -102,20 +105,120 @@ class HumanMotionCommand(LibraryMotionCommand):
     self._cur = {k: torch.zeros(E, *lib.fields[k].shape[1:], device=self.device) for k in STEP_FIELDS}
     self._cur["h_rest"].fill_(1.0)
     self._init_sampler()
-    self.heads = None  # HumanHeads, attached by HumanSimInterface (used by the simulator termination term)
+    self.heads = None  # HumanHeads, attached by HumanSimInterface (attach_heads; used by the simulator termination term)
+    self.ee_on = False
+    self.cond = torch.zeros(E, COND_DIM, device=self.device)
     self._term_cache: tuple[int, torch.Tensor] | None = None
     self._pending_forward = False
+
+  def attach_heads(self, heads) -> None:
+    """Heads of the simulator termination; ee_mode: EE library fields, their current-frame cache and the condition."""
+    self.heads = heads
+    if not heads.ee_on:
+      return
+    self.ee_on = True
+    lib = self.library
+    lib.ensure_ee(self.bone_map)
+    E = self.num_envs
+    for k in EE_STEP_FIELDS:
+      self._cur[k] = torch.zeros(E, *lib.fields[k].shape[1:], device=self.device)
+    self._alpha_tgt = torch.zeros(E, device=self.device)
+    self._alpha_rate = torch.zeros(E, device=self.device)  # per step
+    self._alpha_switch = torch.full((E,), -1, dtype=torch.long, device=self.device)  # steps until the switch (-1: none)
+    self._drift_left = torch.zeros(E, dtype=torch.long, device=self.device)  # steps until the next drift rate
+    self.ee_clip_ok = torch.ones(lib.num_clips, dtype=torch.bool, device=self.device)
+    if heads.cfg.ee_clip_list:
+      import os
+
+      ok = {os.path.basename(ln.strip()) for ln in open(os.path.expanduser(heads.cfg.ee_clip_list)) if ln.strip()}
+      self.ee_clip_ok = torch.tensor([c.name in ok for c in lib.clips], dtype=torch.bool, device=self.device)
+      print(f"[HumanMotionCommand] ee_clip_list: {int(self.ee_clip_ok.sum())}/{lib.num_clips} clips with alpha > 0")
+    self.refresh_current()
+    self._sample_cond(torch.arange(E, device=self.device), self.time_steps)
+
+  def _fields(self) -> tuple[str, ...]:
+    return STEP_FIELDS + (EE_STEP_FIELDS if self.ee_on else ())
+
+  def current_ref(self) -> dict:
+    return {**self._cur, "cond": self.cond} if self.ee_on else dict(self._cur)
+
+  # ---- end-effector condition ----------------------------------------------------
+
+  def _sample_alpha(self, n: int) -> torch.Tensor:
+    c = self.heads.cfg
+    u = torch.rand(n, device=self.device)
+    a = torch.rand(n, device=self.device)
+    a = torch.where(u < c.alpha_p0, torch.zeros_like(a), a)
+    return torch.where((u >= c.alpha_p0) & (u < c.alpha_p0 + c.alpha_p1), torch.ones_like(a), a)
+
+  def _drift_rate(self, env_ids: torch.Tensor) -> None:
+    """New drift rate of env_ids: towards a uniform point of the drift box, reached after U(tmin, tmax) s."""
+    c, n, dt = self.heads.cfg, len(env_ids), self._env.step_dt
+    box = self.heads.drift_box
+    steps = torch.clamp((torch.empty(n, device=self.device).uniform_(c.drift_tmin, c.drift_tmax) / dt).round().long(), min=1)
+    target = (torch.rand(n, 3, device=self.device) * 2.0 - 1.0) * box
+    self.cond[env_ids, 7:10] = (target - self.cond[env_ids, 4:7]) / (steps.float()[:, None] * dt)
+    self._drift_left[env_ids] = steps
+
+  @torch.no_grad()
+  def _sample_cond(self, env_ids: torch.Tensor, frames: torch.Tensor) -> None:
+    c, n = self.heads.cfg, len(env_ids)
+    cond = torch.zeros(n, COND_DIM, device=self.device)
+    cond[:, 2:4] = self.library.gather(frames, fields=("h_root_xy",))["h_root_xy"]
+    if self.cfg.sampling_mode == "start":  # evaluation: fixed alpha, no drift, no switch
+      cond[:, 0] = c.eval_alpha
+      cond[:, 1] = 1.0
+      self.cond[env_ids] = cond
+      self._alpha_tgt[env_ids] = c.eval_alpha
+      self._alpha_switch[env_ids] = -1
+      self._drift_left[env_ids] = 1 << 40
+      return
+    a = self._sample_alpha(n) * self.ee_clip_ok[self.library.clip_of_frame(frames)]
+    cond[:, 0] = a
+    cond[:, 1] = torch.where((a == 0) & (torch.rand(n, device=self.device) < c.ee_dropout), 0.0, 1.0)
+    self.cond[env_ids] = cond
+    self._alpha_tgt[env_ids] = a
+    self._alpha_rate[env_ids] = 0.0
+    T = 10.0 / self._env.step_dt  # switch time: uniform over the first 10 s (episode length)
+    sw = (torch.rand(n, device=self.device) * T).long() + 1
+    self._alpha_switch[env_ids] = torch.where(torch.rand(n, device=self.device) < c.alpha_switch_p, sw, torch.full_like(sw, -1))
+    if c.drift_xy > 0 or c.drift_yaw > 0:
+      self._drift_rate(env_ids)
+    else:
+      self._drift_left[env_ids] = 1 << 40
+
+  @torch.no_grad()
+  def _advance_cond(self) -> None:
+    c, dt = self.heads.cfg, self._env.step_dt
+    box = self.heads.drift_box
+    d = self.cond[:, 4:7] + self.cond[:, 7:10] * dt
+    self.cond[:, 4:7] = torch.maximum(torch.minimum(d, box), -box)
+    self._drift_left -= 1
+    due = (self._drift_left <= 0).nonzero(as_tuple=False).squeeze(-1)
+    if due.numel():
+      self._drift_rate(due)
+    # alpha: scheduled switch -> linear ramp towards a new alpha (ee_valid back on when it leaves 0)
+    self._alpha_switch = torch.where(self._alpha_switch > 0, self._alpha_switch - 1, self._alpha_switch)
+    sw = (self._alpha_switch == 0).nonzero(as_tuple=False).squeeze(-1)
+    if sw.numel():
+      new = self._sample_alpha(sw.numel()) * self.ee_clip_ok[self.library.clip_of_frame(self.time_steps[sw])]
+      self._alpha_tgt[sw] = new
+      self._alpha_rate[sw] = (new - self.cond[sw, 0]).abs() / max(c.alpha_ramp_s / dt, 1.0)
+      self._alpha_switch[sw] = -1
+      self.cond[sw, 1] = torch.where(new > 0, torch.ones_like(new), self.cond[sw, 1])
+    a, tgt = self.cond[:, 0], self._alpha_tgt
+    self.cond[:, 0] = torch.where(a < tgt, torch.minimum(a + self._alpha_rate, tgt), torch.maximum(a - self._alpha_rate, tgt))
 
   # ---- current-frame cache ---------------------------------------------------
 
   @torch.no_grad()
   def refresh_current(self, env_ids: torch.Tensor | None = None) -> None:
     if env_ids is None:
-      g = self.library.gather(self.time_steps, fields=STEP_FIELDS)
+      g = self.library.gather(self.time_steps, fields=self._fields())
       for k in self._cur:
         self._cur[k] = g[k]
     elif env_ids.numel() > 0:
-      g = self.library.gather(self.time_steps[env_ids], fields=STEP_FIELDS)
+      g = self.library.gather(self.time_steps[env_ids], fields=self._fields())
       for k in self._cur:
         self._cur[k][env_ids] = g[k]
 
@@ -155,6 +258,8 @@ class HumanMotionCommand(LibraryMotionCommand):
       joint_pos += sample_uniform(lower=lo, upper=hi, size=joint_pos.shape, device=joint_pos.device)  # type: ignore
     self._write_reference_state_to_sim(env_ids, root_pos, root_ori, lin + r2[:, :3], ang + r2[:, 3:], joint_pos, g["init_joint_vel"])
     self._pending_forward = True
+    if self.ee_on:
+      self._sample_cond(env_ids, frames)
 
   def _update_command(self, env_ids: torch.Tensor | None = None):
     if env_ids is None:
@@ -163,6 +268,8 @@ class HumanMotionCommand(LibraryMotionCommand):
       self.time_steps[env_ids] += 1
     self.time_steps = torch.minimum(self.time_steps, self.clip_end_env - 1)
     self.refresh_current(env_ids)
+    if self.ee_on and env_ids is None:
+      self._advance_cond()
     if self._pending_forward:
       self._pending_forward = False
       self._env.sim.forward()
@@ -182,7 +289,7 @@ class HumanMotionCommand(LibraryMotionCommand):
       pose, vel = d.root_link_pose_w, d.root_link_vel_w
       s = torch.cat([pose[:, :3] - self._env.scene.env_origins, pose[:, 3:7], vel[:, :3], vel[:, 3:6], d.joint_pos, d.joint_vel], dim=-1)
       kin = self.heads.kin(s)
-      out, _ = self.heads.termination(kin, s, self._cur)
+      out, _ = self.heads.termination(kin, s, self.current_ref())
     self._term_cache = (step, out)
     return out
 

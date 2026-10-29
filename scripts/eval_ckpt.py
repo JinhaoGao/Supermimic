@@ -32,6 +32,8 @@ def main():
   p.add_argument("--ee_term_z", type=float, default=None,
                  help="master's v2 spelling: override the end-effector height termination (m, 0 = off); default: the run's")
   p.add_argument("--robot_variant", type=str, default=None, help="override the robot model variant; default: the run's")
+  p.add_argument("--human_cfg", type=str, default="",
+                 help="human reference: HumanHeadsCfg overrides key=value,... (e.g. eval_alpha=0 for the H4 end of an ee_mode policy)")
   args = p.parse_args()
 
   from supermimic.evaluate import Evaluator
@@ -57,6 +59,14 @@ def main():
     p.error(str(e))
   heads_cfg = dataclasses.replace(heads_cfg, ee_termination=ee_on, ee_term_z=ee_thr)
   print(f"[eval_ckpt] end-effector termination: " + (f"on, z error > {ee_thr:g}" if ee_on else "off"))
+  if args.human_cfg:  # values typed like the checkpoint's (bools: 0/1/true/false)
+    over = {}
+    for kv in args.human_cfg.split(","):
+      k, v = kv.split("=", 1)
+      cur = getattr(heads_cfg, k)
+      over[k] = v.lower() in ("1", "true", "yes") if isinstance(cur, bool) else type(cur)(v)
+    heads_cfg = dataclasses.replace(heads_cfg, **over)
+    print(f"[eval_ckpt] heads overrides: {over}")
   kw = {"input_clip": float(ck["cfg"]["input_clip"])} if "input_clip" in ck["cfg"] else {}  # master v2 cfgs record it
   policy = Policy(d["proprio"], d["hist"], d["goal_frame"], d["K"], d["nj"], **kw).to(args.device)
   policy.load_state_dict(ck["policy"])

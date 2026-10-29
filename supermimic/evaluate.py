@@ -133,9 +133,7 @@ class Evaluator:
       r, _ = fns.post(next_state, kin, a, prev_action, *ref_cur)
       errs = None
       if self.human:  # errors of the live (not yet terminated) steps against the target frame
-        from .human.heads import STEP_FIELDS
-
-        errs = heads.metrics(heads.kin(next_state), next_state, dict(zip(STEP_FIELDS, ref_cur)))
+        errs = heads.metrics(heads.kin(next_state), next_state, dict(zip(heads.step_fields, ref_cur)))
       elif self.metric_fn is not None:  # e.g. human-side errors of a robot-reference policy (scripts/human/eval_paired.py)
         errs = self.metric_fn(next_state, frame, cmd.env_clip)
       if errs is not None:

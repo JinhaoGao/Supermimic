@@ -20,6 +20,12 @@ heads only gather:
   h_foot_lift [T,2]    ankle height above its standing height (median over the side's contact frames), metres
   init_*               robot reset state from bone-direction IK (joint order of the robot entity); used only by resets
 Nothing here depends on the robot except the init_* fields (and the bone map that defines the segments).
+
+End-effector world tracking (``ensure_ee``, HumanHeadsCfg.ee_mode) adds EE_FIELDS as extra files of the same cache
+directory (built on first use, marker meta_ee.json), so the cache of a run without it is untouched:
+  h_task_pos [T,L,3]   task points (bone_map task_links: torso, wrists, feet) in the human world frame, metres, unscaled
+  h_task_rot6d [T,L,6] the robot link rotation each task link asks for (human joint rotation @ calibrated offset), rot6d
+  h_root_xy [T,2]      human pelvis xy (world): the anchor that maps the human world onto an episode's start
 """
 
 from __future__ import annotations
@@ -37,6 +43,8 @@ from . import bone_map as bone
 
 GOAL_FEAT_DIM = 138
 CACHE_VERSION = "human-v2"  # v2: + h_foot_lift
+EE_FIELDS = ("h_task_pos", "h_task_rot6d", "h_root_xy")
+EE_VERSION = "ee-v1"
 
 
 def field_shapes(num_segments: int, num_joints: int) -> dict[str, tuple[int, ...]]:
@@ -133,6 +141,49 @@ def build_human_cache(files, robot, joint_names, bone_map, cache_dir, expected_f
   log(f"[human cache] {len(clips)} clips, {start} frames in {time.time() - t0:.0f}s -> {cache_dir}")
 
 
+def ee_field_shapes(num_task_links: int) -> dict[str, tuple[int, ...]]:
+  return {"h_task_pos": (num_task_links, 3), "h_task_rot6d": (num_task_links, 6), "h_root_xy": (2,)}
+
+
+@torch.no_grad()
+def derive_ee_fields(d, bt: bone.BoneMapTensors) -> dict[str, np.ndarray]:
+  """EE_FIELDS of one human npz (see module docstring)."""
+  joints = torch.as_tensor(np.asarray(d["smpl_joints_w"]), dtype=torch.float64)
+  rot = bone.quat_wxyz_to_matrix(torch.as_tensor(np.asarray(d["smpl_global_quat"]), dtype=torch.float64))
+  pos, trot = bone.human_task_poses(joints, rot, bt)
+  out = {"h_task_pos": pos, "h_task_rot6d": trot[..., :, :2].reshape(*trot.shape[:-2], 6),
+         "h_root_xy": torch.as_tensor(np.asarray(d["root_pos_w"]), dtype=torch.float64)[:, :2]}
+  return {k: np.asarray(v, dtype=np.float32) for k, v in out.items()}
+
+
+def build_ee_fields(files, bone_map: bone.SmplBoneMapCfg, cache_dir: str, log=print) -> None:
+  """EE_FIELDS of an existing human cache, clip by clip in the cache's own order (clips.json)."""
+  bt = bone.BoneMapTensors(bone_map, bone_map.load_calibration(), dtype=torch.float64)
+  by_name = {os.path.basename(f): f for f in files}
+  clips = json.load(open(os.path.join(cache_dir, "clips.json")))
+  shapes = ee_field_shapes(len(bone_map.task_links))
+  t0 = time.time()
+  per = {k: [] for k in shapes}
+  for i, c in enumerate(clips):
+    with np.load(by_name[c["name"]], allow_pickle=True) as d:
+      f = derive_ee_fields(d, bt)
+    T = f["h_task_pos"].shape[0]
+    if T != c["end"] - c["start"]:
+      raise RuntimeError(f"{c['name']}: {T} frames, cache has {c['end'] - c['start']}")
+    for k in shapes:
+      per[k].append(f[k])
+    if (i + 1) % 500 == 0:
+      log(f"[human cache] ee fields {i + 1}/{len(clips)} clips ({time.time() - t0:.0f}s)")
+  tag = f".tmp{os.getpid()}"  # concurrent builders (several runs on one cache) write identical files: atomic renames
+  for k in shapes:
+    np.save(os.path.join(cache_dir, f"{k}{tag}.npy"), np.concatenate(per[k], axis=0))
+    os.replace(os.path.join(cache_dir, f"{k}{tag}.npy"), os.path.join(cache_dir, f"{k}.npy"))
+  with open(os.path.join(cache_dir, f"meta_ee{tag}.json"), "w") as fh:  # renamed last: marks complete EE fields
+    json.dump({"version": EE_VERSION, "task_links": bt.task_names, "build_seconds": time.time() - t0}, fh, indent=2)
+  os.replace(os.path.join(cache_dir, f"meta_ee{tag}.json"), os.path.join(cache_dir, "meta_ee.json"))
+  log(f"[human cache] ee fields of {len(clips)} clips in {time.time() - t0:.0f}s -> {cache_dir}")
+
+
 class HumanMotionLibrary(MotionLibrary):
   """Same timeline / bin / gather interface as MotionLibrary (the reset sampler, replay and windows are shared), with
   the human fields of ``field_shapes``. ``nb`` = 0 (no tracked robot bodies), ``nj`` = robot joints of the reset state."""
@@ -157,11 +208,22 @@ class HumanMotionLibrary(MotionLibrary):
     self.file_frame_end = [int(c["end"]) for c in clips_all]  # (failed files have no entry: prefix logic is approximate)
     self.cache_dir = cdir
     self.fields = {k: torch.from_numpy(np.load(os.path.join(cdir, f"{k}.npy"))) for k in field_shapes(len(bone_map.segments), len(joint_names))}
+    self._files, self._log = files, log
     self.time_step_total = int(meta["frames"])
     self._build_tables(clips_all, bin_seconds, expected_fps, device)
     self.nj = len(self.joint_names)
     self.nb = 0
     log(f"[HumanMotionLibrary] {self.summary()}")
+
+  def ensure_ee(self, bone_map: bone.SmplBoneMapCfg) -> None:
+    """Load (building them on first use) the EE_FIELDS of this cache (end-effector world tracking)."""
+    if all(k in self.fields for k in EE_FIELDS):
+      return
+    marker = os.path.join(self.cache_dir, "meta_ee.json")
+    if not os.path.exists(marker) or json.load(open(marker)).get("version") != EE_VERSION:
+      build_ee_fields(self._files, bone_map, self.cache_dir, self._log)
+    for k in ee_field_shapes(len(bone_map.task_links)):
+      self.fields[k] = torch.from_numpy(np.load(os.path.join(self.cache_dir, f"{k}.npy")))
 
   def summary(self) -> str:
     mb = sum(t.numel() * t.element_size() for t in self.fields.values()) / 1e6
