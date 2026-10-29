@@ -226,3 +226,48 @@ cond = [α, ee_valid, a_x, a_y, δx, δy, δψ, δ̇x, δ̇y, δ̇ψ, steps_to_r
 α = 0 端（H4 回退）用 `scripts/eval_ckpt.py --human_cfg eval_alpha=0` 离线评测。
 
 **待做**：部署导出（§5）、α 偏高时用 EE-IK 姿态重置（目前用骨方向 IK 姿态重置，腕部初始误差约 14 cm）、`eval_paired.py` 的 α 档位。
+
+## 11. 进度报告（10-29）
+
+### 11.1 Supermimic 消融（tag ee1，bj9 八卡，已停止）
+
+10-29 20:00 为了把 GPU 让给 HIM-RGMT，按决定停止。检查点保留在 bj9 `~/supermimic_runs/logs/*ee1_e*`：e1、e3、e4、e5、e7、e8 停在 16500 轮，e6 在 17500 轮，e2（H4 热启动）在 57500 轮。
+
+6000 轮（e2 为 46500 轮）时的离线对比：512 条可行片段，`scripts/human/eval_ee_compare.py`，结果在 bj9 `~/supermimic_runs/cmp1/`。
+
+| | 失败 | 腕误差 | 腕 <5 cm | 腕误差（5 s 后） | torso xy | 腕旋转 | 全局手臂骨方向 |
+|---|---|---|---|---|---|---|---|
+| H4 | 0 | 33.8 cm | 3% | 48.5 cm | 27.9 cm | 16.9° | 6.4° |
+| e2 α=1 | 3 | 2.7 cm | 90% | 2.4 cm | 2.9 cm | 6.4° | 22.1° |
+| e2 α=0 | 0 | 28.0 cm | 4% | 38.5 cm | 22.1 cm | 15.4° | 6.1° |
+
+- **末端对齐了**：所有组 α=1 时腕误差都在 2–3 cm，而且不随时间漂移。
+- **α=0 端不退步**：e2 的 α=0 端与 H4 持平。
+- **代价是手臂姿态**：α=1 时为了够到人手腕位置要外展抬肘，全局手臂骨方向误差在 19–42°。
+- **腕部宽核必须保留**：去掉它的 e4 失败 14 条，腕旋转误差 61°。
+- **e5（style 0.5）异常**：腕旋转误差 107°，原因待查。
+- **e3（窄核放宽）**：手臂姿态最好。
+
+### 11.2 可视化
+
+- `scripts/human/play.py --align ee`：人体按奖励的对齐方式放置（首帧骨盆 xy 对到 env 原点，不缩放、不旋转，画的是奖励目标帧）。叠加 5 个末端目标点、机器人对应连杆和腕部误差线，误差写在画面上。
+- 视频在本机 `videos/ee1/`，被 git 忽略：
+  - `H4_vs_E2_*`：H4 vs E2 的末端对齐视图；
+  - `baseline_vs_H4_*`：baseline vs H4；
+  - `cmp_*`：2×2 拼接。
+
+### 11.3 部署导出
+
+在分支 `claude/great-swartz-3f680e` 上，比 `feat/ee-world-tracking` 多一个提交，可快进合并：
+
+- `scripts/human/export_deploy_human.py`：导出 ONNX、meta json 和逐片段的参考 npz；
+- `supermimic/human/deploy_goal.py`：纯 numpy 的 goal 构造，α 为运行时参数并限速；没有里程计时强制 α=0。
+
+只在本地一个小检查点上验证过。
+
+### 11.4 迁移到 HIM-RGMT（Noetix_GMT，分支 `feat/e2-ee-alpha`）
+
+- **任务**：`Gmt-g1-smpl-e2-v0`，回放用 `Gmt-g1-smpl-e2-play-v0`。
+- **数据**：P1 平地 AMASS 集，7369 条、22.5 h；其中 3782 条（8.6 h）通过 `prepare_ee_ik.py` 筛选，允许 α > 0。
+- **训练**：bj9 八卡，每卡 8192 env，30000 轮，10-29 20:11 启动，每轮约 5.9 s，预计约 49 h。
+- **日志**：bj9 `/home/jinhaogao/noetix_runs/logs/`；TensorBoard 在 bj9 的 127.0.0.1:6113。
