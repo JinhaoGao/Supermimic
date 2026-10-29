@@ -134,8 +134,8 @@ class Evaluator:
       errs = None
       if self.human:  # errors of the live (not yet terminated) steps against the target frame
         errs = heads.metrics(heads.kin(next_state), next_state, dict(zip(heads.step_fields, ref_cur)))
-      elif self.metric_fn is not None:  # e.g. human-side errors of a robot-reference policy (scripts/human/eval_paired.py)
-        errs = self.metric_fn(next_state, frame, cmd.env_clip)
+      if self.metric_fn is not None:  # e.g. human-side errors of a robot-reference policy (scripts/human/eval_paired.py),
+        errs = {**(errs or {}), **self.metric_fn(next_state, frame, cmd.env_clip)}  # EE errors of an H4 policy
       if errs is not None:
         live = env_active & ~env.reset_terminated.bool()
         for k, v in errs.items():
