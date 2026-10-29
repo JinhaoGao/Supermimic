@@ -134,6 +134,46 @@ cond = [α, ee_valid, a_x, a_y, δx, δy, δψ, δ̇x, δ̇y, δ̇ψ, steps_to_r
    - (b) 有外部定位（mocap、SLAM）时不重锚，跟踪真正固定的世界坐标。
 4. **α = 0 且没有里程计时**：EE 块置零、`ee_valid = 0`，部署方式等同 H4。
 
+### 5.1 实现与用法（10-29）
+
+H4 和 ee_mode 检查点用同一条路径（goal 140 / 187 维由检查点的 `goal_layout` 决定）。
+
+**导出**（需要 mjlab，建一个单 env 的 eval 场景读机器人模型、动作项和站立几何）：
+
+```bash
+cd ~/supermimic_ws/mjlab && PYTHONPATH=<repo> uv run python <repo>/scripts/human/export_deploy_human.py \
+    --ckpt ~/supermimic_runs/logs/<run>/model_final.pt --motions <人体 npz 文件或目录> [--motion_list x.txt] --out <dir>
+```
+
+产出（`<dir>/`）：
+
+| 文件 | 内容 |
+|---|---|
+| `policy.onnx` | 输入 `obs_hist [1,10,93]`（旧→新；每帧 q − default、dq、骨盆角速度、骨盆系重力、上一步动作）和 `goal [1,K,G]`，输出 `action [1,29]`（关节目标 = offset + scale × action）。归一化和 clamp 在图里 |
+| `meta.json` | 关节顺序、默认姿态、action scale/offset、PD 增益、G1 SDK 索引映射、K / hist / 维度、`goal_layout`、归一化统计量、heads cfg；goal 构造所需的 FK 表（bone-map 连杆及其祖先）、heading/foot/task 连杆、踝高 |
+| `clips/<name>.npz` | 每个 clip 的参考侧量：`h_feat`、`h_yaw`、`h_task_pos`、`h_task_rot6d`、`h_root_xy`、IK 重置姿态 `init_*`、fps。和训练缓存逐位相同（`derive_fields` / `derive_ee_fields`） |
+| `deploy_goal.py` | `supermimic/human/deploy_goal.py` 的副本，只依赖 numpy |
+
+**机载循环**（50 Hz；q 按 `meta["joint_names"]` 顺序，IMU 四元数 wxyz 为骨盆姿态）：
+
+```python
+from deploy_goal import HumanGoalBuilder
+b = HumanGoalBuilder.from_files("meta.json", "clips/<name>.npz")   # alpha_rate=1.0 /s, realign_on_activate=True
+b.start(f0, q, imu_quat, odom)            # odom = (x, y, yaw) 腿里程计骨盆位姿，或 None
+for f in range(f0, T):
+    goal = b.step(q, imu_quat, f, alpha_cmd, odom)                  # [1,K,G] float32
+    action = sess.run(None, {"obs_hist": obs_hist, "goal": goal})[0]
+```
+
+- **对齐**：`start()` 按"在帧 f0 重置一个 episode"的方式把参考对到机器人上：骨盆 xy 对人体骨盆 xy，骨盆航向对该帧 IK 重置姿态的航向。之后 rel_yaw 和 EE 块都在这个"训练世界"里计算，与训练逐位一致（无漂移）。
+- **航向来源**：有里程计时用里程计 yaw（IMU 只给 roll/pitch），没有时用 IMU 自己的 yaw。来源切换时重选偏置，使 rel_yaw 不跳变。
+- **α**：`alpha_cmd` 被限速到 ≤ `alpha_rate`/s（训练中的切换斜坡是 0.5 s）。`odom is None` 时实际 α 立即置 0、`ee_valid = 0`、EE 块清零（训练里从不出现 α > 0 而 `ee_valid = 0`）。
+- **EE 段开始时重锚**（`realign_on_activate`，默认开）：α 从 0 升起的那一步只重锚 xy，让世界目标从机器人当前位置出发，而不是从 H4 跟踪期间累积漂移后的位置；关掉即保持起始锚点（真正的固定世界坐标）。`realign()` 可随时手动重锚 xy + 航向。
+- **骨盆高度**：EE 块需要 torso_link 的完整 6 自由度位姿。不传 `base_z` 时，用较低踝连杆按站立踝高（0.035 m）反推（脚放平时误差约 1 cm）。
+- **耗时**：goal 构造约 0.4 ms/步，加 ONNX 推理约 1 ms/步（单核 CPU）。
+
+**检查**：`tests/test_human_deploy.py`（H4 与 ee_mode）—— clip npz 等于训练缓存；numpy FK 等于 TorchFK；`goal_world` 等于 `HumanHeads.goal`（随机根位姿、关节、α、`ee_valid`、锚点，最大误差 ~1e-6）；在旋转平移过的里程计坐标系里逐步构造等于训练端 goal；α 限速、里程计丢失、重锚；ONNX 等于 torch。`SUPERMIMIC_CKPT=<model.pt>` 时用该检查点的策略。
+
 ## 6. 动作重新筛选（让 G1 真正能完成）
 
 在现有 1881 对、8.0 h 的配对集上再筛一遍，产出新列表 `ee_list.txt`，`human_list.txt` 保持不动。
@@ -225,4 +265,6 @@ cond = [α, ee_valid, a_x, a_y, δx, δy, δψ, δ̇x, δ̇y, δ̇ψ, steps_to_r
 
 α = 0 端（H4 回退）用 `scripts/eval_ckpt.py --human_cfg eval_alpha=0` 离线评测。
 
-**待做**：部署导出（§5）、α 偏高时用 EE-IK 姿态重置（目前用骨方向 IK 姿态重置，腕部初始误差约 14 cm）、`eval_paired.py` 的 α 档位。
+**部署导出**：已实现，见 §5.1。
+
+**待做**：α 偏高时用 EE-IK 姿态重置（目前用骨方向 IK 姿态重置，腕部初始误差约 14 cm）、`eval_paired.py` 的 α 档位。
