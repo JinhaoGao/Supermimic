@@ -1,140 +1,211 @@
-# 人体动作作为策略输入：Supermimic 实现方案（dev_gjh）
+# 人体动作输入（`--reference human`）设计说明
 
-目标：在 Supermimic 上验证"策略直接以人体动作（SMPL）为输入、奖励直接对人体动作构建、全程不经过逐帧重定向"是否可行，以及它对重定向歧义片段是否有缓解。不追求与 Noetix-RGMT 的 HIM-RGMT / P1–P3 一致，只借用其中已验证的骨方向对应（bone map + T-pose 标定）。
+目标：在 Supermimic 上验证"策略直接以人体动作（SMPL）为输入、奖励直接对人体动作构建、全程不做逐帧重定向"。代码在 `supermimic/human/`。默认 `--reference robot` 时原有路径逐位不变。
 
-范围：第一期只做"风格跟踪"（对应 RGMT P1 的思路，不含任务链接 / 漂移 / alpha）；结构上给第二期（度量任务目标、alpha）留接口。部署导出不在本期。
+世界模型、replay、域随机化 ξ、BPTT + λ-return、优化器、看门狗、多卡都和原版相同，世界模型从不接触参考动作。参考动作只从四处进入：goal、奖励、终止、重置。下文按这四处说明 human 版本的做法，最后是采样器、评测和工具。
+
+本文描述的是当前生效的配置，即 ab2 那次运行所用的配置（见 §8）。
 
 ---
 
-## 1. 现状：参考动作进入 Supermimic 的 4 个入口
+## 1. 人体参考数据
 
-世界模型只学机器人动力学，从不接触参考。参考只出现在：
+### 1.1 原始动作
 
-| 入口 | 代码 | 现在 | 本期改成 |
+来源是 AMASS 的 SMPL-X（stageii）。`scripts/human/prepare_smpl_motion.py` 做以下处理：
+- 用 slerp 重采样到 50 Hz；
+- 坐标系 Z 轴朝上，取足部关节最低高度的 2% 分位数作为地面，令其 z = 0；
+- 每帧存：24 个关节的世界位置（22 个身体关节 + 左右手点）、22 个关节的全局旋转、21 个关节的局部 rot6d、骨盆位姿和速度、足接触标记；
+- 足接触标记：足部关节离地低于 5 cm 且水平速度低于 0.3 m/s，记为接触；
+- 另存该受试者在 T-pose 下的静息骨盆高度 `h_rest`。
+
+### 1.2 骨方向对应（bone map，沿用 Noetix-RGMT P1）
+
+人和机器人都用 20 段**单位方向**来描述姿态，不涉及长度，所以与身高、比例无关。
+
+| 部位 | 骨段（括号内为局部比较时的父坐标系：人体关节 / 机器人连杆） |
+|---|---|
+| 躯干 4 段 | `pelvis_up`、`pelvis_left`（只做全局比较）；`torso_up`、`torso_left`（父：pelvis / pelvis） |
+| 每侧腿 4 段 | `thigh`（父：pelvis）、`shin`（父：hip / hip_yaw_link）、`foot`（父：knee / knee_link）、`foot_side`（脚侧向轴，父同 foot） |
+| 每侧臂 4 段 | `upper_arm`（父：spine3 / torso_link）、`forearm`（父：shoulder / shoulder_yaw_link）、`hand`（父：elbow / elbow_link）、`palm`（手掌法向轴，父同 hand） |
+
+方向有两种取法：
+- **点段**：两个关节或两个连杆原点之间的单位向量。
+- **轴段**：固连在某个关节或连杆上的一根轴，例如手掌法向、脚侧向轴。它们用来约束扭转，这是点段看不到的。
+
+**标定。** 在人和机器人共同的 T-pose 下做一次，结果文件是 `supermimic/human/smpl_bone_calib_g1.json`。它包含三部分：
+- 机器人各轴段在本连杆坐标系里的轴向；
+- 人体各轴段在本关节坐标系里的轴向；
+- 局部比较用的固定父系映射 Q：把机器人父连杆坐标系里的方向，换算到人体父关节坐标系的约定里。
+
+mjlab 的 G1 与 RGMT 的 `g1.xml` 在这些连杆上的零位 FK 完全一致，所以标定文件可以直接复用。核验：机器人处于 IK 重置姿态时，骨方向误差 1.24°，与 IK 求解时报告的误差相同。
+
+**两种比较方式：**
+- **全局**：每副骨架各自转到自己的航向系里比较。航向系由左右髋连线定义：left 轴是髋连线的水平投影，up 轴是 z 轴，forward = left × up。人体用左右髋关节，机器人用左右 `hip_roll_link`。
+- **局部**：每段骨在自己的父坐标系里比较。机器人那一侧先乘上 Q。
+
+### 1.3 尺度比
+
+k = 机器人静息骨盆高 / 人体静息骨盆高。
+- 机器人静息骨盆高：所有铰链关节置 0 时，骨盆到足底最低点的高度，G1 为 0.792 m。运行时根据仿真模型的足部碰撞体计算。
+- k 只用来缩放根速度。所有姿态量都用单位方向，不需要缩放。
+
+### 1.4 训练缓存（`supermimic/human/motions.py`）
+
+建缓存时一次性算好每帧需要的量，训练时只做 gather：
+
+| 字段 | 形状 | 含义 |
+|---|---|---|
+| `h_feat` | 138 | goal 特征（见 §2） |
+| `h_dir` / `h_dir_local` | 20×3 | 人体骨方向：航向系下 / 父关节系下 |
+| `h_root_vel` | 3 | 人体航向系下的骨盆速度（m/s，未缩放） |
+| `h_yaw`、`h_yaw_rate` | 1、1 | 人体航向角（由髋连线算出）、骨盆偏航角速度 |
+| `h_height` | 1 | 骨盆高 / `h_rest` |
+| `h_rest`、`h_contact` | 1、2 | 静息骨盆高、足接触标记 |
+| `init_*` | – | 机器人重置状态：关节位置和速度、根四元数、根高度、IK 误差（见 §5） |
+
+---
+
+## 2. 策略输入
+
+| 部分 | 内容 | 维度 |
+|---|---|---|
+| 本体感知（10 帧历史，与原版相同） | q − q₀、q̇、骨盆系角速度、投影重力、上一步动作 | 93 × 10 |
+| goal（K = 10：当前帧和未来 9 帧，超出片段末尾时取末帧） | 每帧 140 维 | 140 × 10 |
+
+每帧 goal 的 140 维：
+
+| 段 | 计算方式 | 维度 |
+|---|---|---|
+| 重力方向 | 人体骨盆旋转矩阵 R 的转置乘 (0, 0, −1) | 3 |
+| 根线速度 | 人体航向系下的骨盆速度 ÷ `h_rest` | 3 |
+| 根角速度 | Rᵀ 乘骨盆角速度（骨盆系） | 3 |
+| 骨盆高 | z ÷ `h_rest` | 1 |
+| 21 个关节的局部旋转 | 局部旋转矩阵的前两列（rot6d） | 126 |
+| 足接触 | 左、右 | 2 |
+| 相对航向 | cos(Δψ)、sin(Δψ)，其中 Δψ = 人体航向 − 机器人当前航向 | 2 |
+
+前 138 维全部是参考侧的量，和机器人无关，可以直接部署。相对航向是 goal 里唯一与机器人状态有关的一项；没有它，策略无法观测到累积的航向误差。可用 `goal_rel_yaw=0` 关闭。
+
+本体感知训练时加均匀噪声：关节角 ±0.01、关节速度 ±0.5、角速度 ±0.2、重力 ±0.05。
+
+## 3. 网络与输出
+
+与原版相同，只有 goal 维度不同：
+- **策略**：goal 编码器把 10×140 维压成 z ∈ R³²（ELU MLP 2048-1024-512-256，输出经 tanh）；解码器以 z 加 10×93 维本体历史为输入（ELU MLP 2048-1024-512-256），输出 29 维动作。
+- **动作**：各关节目标位置相对默认姿态的偏移，由 mjlab G1 的 PD 执行器跟踪。
+- **输入归一化**：goal 和本体感知各用一个 running mean/std，归一化后截断到 ±50σ（`--fixes` 生效时）。
+- **critic**：输入为世界模型特征、goal 和 ξ，MLP 256-128。
+
+## 4. 奖励
+
+每一项都由状态 s 经可微 TorchFK 算出，所以想象 rollout 里也能对奖励反传。每步奖励 r = Σ 各项 × dt，dt = 0.02。
+
+**骨方向核。** 误差用弦长平方 e = ‖d_h − d_r‖² = 2 − 2cos θ，在小角度下约等于 θ²；核为 exp(−e / σ²)，σ = 0.35。不直接用角度，是因为 atan2 形式的角度在 θ = 0 处梯度为无穷大，反传会出 NaN。组内按骨段权重做加权平均：`foot`、`foot_side`、`hand`、`palm` 权重 0.5，其余 1.0。
+
+| 项 | 计算 | 权重 | 核宽 |
 |---|---|---|---|
-| goal（policy / critic 输入） | `heads.goal`、`fns.goal_from_pack`、`sim_interface.goal_refs` | 参考关节角 / 速度 + 锚点相对 rot6d | 人体逐帧特征 + 人体/机器人相对航向 |
-| 奖励（仿真端 + 想象端） | `heads.reward`、`fns._post / _imagine_step` | body 位置 / 朝向 / 速度（米、四元数） | 骨方向（全局 / 局部）、缩放根速度、yaw rate、归一化骨盆高度、航向 |
-| 终止 | `heads.termination` + `env_cfg` 的 mjlab 终止项 | 锚点高度 / 倾斜 / 末端高度 / 根朝向 | 躯干骨方向误差、归一化骨盆高度误差（仿真与想象同一判据） |
-| 重置 | `MotionLibrary.root_state` → `LibraryMotionCommand._resample_command` | 参考帧的机器人关节与根状态 | 离线骨方向 IK 的机器人姿态（只用于重置） |
+| `bone_global_torso` | 躯干 4 段，航向系 | 1.0 | σ = 0.35 |
+| `bone_global_arm` | 臂 8 段，航向系 | 1.0 | 0.35 |
+| `bone_global_leg` | 腿 8 段，航向系 | 0.5 | 0.35 |
+| `bone_local_torso` | `torso_up`、`torso_left`，父系 | 0.5 | 0.35 |
+| `bone_local_leg` | 腿 8 段，父系 | 1.5 | 0.35 |
+| `bone_local_arm` | 臂 8 段，父系 | 1.0 | 0.35 |
+| `root_vel` | exp(−‖k·v_h − v_r‖² / σ²)；v_r 为机器人骨盆速度，投影到机器人航向系 | 1.0 | 0.5 m/s |
+| `yaw_rate` | exp(−(ω_z,h − ω_z,r)² / σ²) | 0.5 | 1.0 rad/s |
+| `heading` | exp(−(2 − 2cos Δψ) / σ²) | 0.5 | 0.4 |
+| `height` | exp(−(z_r / 0.792 − `h_height`)² / σ²) | 0.5 | 0.1 |
+| `action_rate` | ‖aₜ − aₜ₋₁‖² | −0.1 | – |
+| `joint_limit` | 超出软关节限位的量之和 | −2.0 | – |
+| `contact`、`slip`（可选） | 用足踝离地高度的 sigmoid 作软接触概率，与 `h_contact` 比较；slip 为软接触 × 足水平速度² | 0（关） | – |
 
-不改动：世界模型、replay、DR / ξ、policy / critic 网络（仅 `goal_frame_dim` 变）、BPTT + λ-return、优化器与学习率、按 bin 回报的重置采样、看门狗、DDP、`torch.compile`。
+每步满分为 Σ 正权重 × dt = 8.0 × 0.02。看门狗、采样器和评测都用这个值把奖励归一化。
 
-## 2. 设计决定（带默认值，均可由开关覆盖）
+**为什么四肢同时要全局项和局部项。** 只有局部项时，父连杆绕自身轴线的扭转不受任何约束。实际出现过的情况：上臂被扭过去，前臂、手、手掌在扭过的父系里看起来都对上了，局部误差只有 3–17°，世界坐标里却偏了 45–105°，表现为手臂外甩。全局项约束的是世界里实际看到的姿态，局部项约束相邻关节之间的关系，两者一起用。
 
-**D1 参考表示：离线预计算，库里存"已经算好的人体量"。**
-库不存原始 SMPL 参数，而存每帧直接可用的张量，goal 和奖励都只做 gather + 少量在线运算：
+**机器人侧的航向帧。** 归一化时下限取 0.05：机器人侧躺时髋连线接近竖直，航向没有定义，下限防止梯度爆炸。这种状态已经远远超出躯干终止阈值。
 
-| 字段 | 形状 | 用途 |
+参数覆盖：`--human_cfg key=value,...`，字段即 `HumanHeadsCfg` 的字段。注意 `w_bone_global_arm` 和 `w_bone_global_leg` 在代码里默认为 0，ab2 是显式设成 1.0 / 0.5 的。
+
+## 5. 终止与重置
+
+**终止。** 仿真端是硬阈值；想象端用 sigmoid 软化，再按 noisy-OR 合并。两端调用同一个函数，即 `HumanHeads.termination`。
+
+| 判据 | 硬阈值 | 软化温度 |
 |---|---|---|
-| `h_feat` | [T, 138] | goal：骨盆系重力 3、航向系根速度 / 静息骨盆高 3、骨盆系角速度 3、骨盆高 / 静息高 1、21 关节局部 rot6d 126、足接触 2 |
-| `h_dir` | [T, S, 3] | 奖励 / 终止：人体骨方向（人体航向系） |
-| `h_dir_local` | [T, S, 3] | 奖励：人体骨方向（父关节系） |
-| `h_root_vel` | [T, 3] | 奖励：人体航向系根速度（未缩放） |
-| `h_yaw`、`h_yaw_rate` | [T]、[T] | 奖励：人体航向角（髋连线）与 yaw rate |
-| `h_height` | [T] | 奖励 / 终止：骨盆高 / 人体静息骨盆高 |
-| `h_contact` | [T, 2] | goal（已在 h_feat 内）；接触近似奖励（可选） |
-| `k` | [T] | 机器人静息骨盆高 / 人体静息骨盆高（按片段常数，逐帧存便于 gather） |
-| `init_*` | 关节位置 / 速度 [T, J]、根四元数 [T, 4]、根高度 [T] | 仅重置 |
+| `pelvis_up` 或 `torso_up` 在航向系里的夹角 | > 1.0 rad | 0.05 |
+| 归一化骨盆高误差：\|z_r / 0.792 − `h_height`\| | > 0.3 | 0.02 |
+| 片段播完、满 10 s | 超时（time-out，不算失败） | – |
 
-S = 20 段骨（G1 bone map：躯干 4 + 每侧腿 4 + 臂 4）。每帧约 138·2 + 20·3·2·4 + 若干 ≈ 1.3 KB（fp16 速度类字段可再省），2264 条 / 约 10 h ≈ 2.3 GB，内存放得下。
+**重置。** 起点帧由采样器挑选（见 §6）。机器人状态这样设置：
+- 关节角和根部姿态：取该帧的离线骨方向 IK 解（`scripts/human/prepare_init_states.py`）。IK 逐帧求骨盆 roll / pitch 和 29 个关节角，使各段骨方向在航向系里贴合人体；航向直接取人体航向；骨盆高度在人体有脚着地时让最低的足底落地，否则按人体骨盆高缩放。
+- 噪声：位姿噪声与原版 BeyondMimic 的配置相同，关节角加 ±0.1 rad。
+- 根速度：线速度 = k × 人体根速度（从人体航向系转回世界系），偏航角速度 = 人体的。
+- 根部 xy 放在 env 原点。所有奖励都是航向系量或与尺度无关的量，不需要和人体轨迹在 xy 上对齐。
 
-**D2 goal：参考侧特征 + 一个相对航向项。**
-每帧 goal = `h_feat`（138）+ `[cos Δψ, sin Δψ]`（2），Δψ = 人体航向 − 机器人航向（机器人航向由左右髋连杆在线算，可微）。理由：现在的 goal 里锚点相对 rot6d 是策略纠正航向累积误差的唯一信号；只给参考侧量的话航向误差不可观测。开关 `--human_goal_rel_yaw`（默认开）。K=10 帧窗口与现在一致。
+IK 姿态只用于重置，不进入输入、奖励和评测。
 
-**D3 奖励：全部由状态 s 经 TorchFK 可微得到，没有接触传感器依赖。**
-骨方向误差用弦长平方 ‖d_h − d_r‖² = 2 − 2cos θ（≈ θ²），不用 `atan2` 角度：后者在 θ→0 处梯度奇异，BPTT 会出 NaN。
+## 6. 重置采样器
 
-| 项 | 公式 | 默认权重 / std（起点取 RGMT P1） |
+沿用原版的按回报采样：
+- 片段按 1 s 切成 bin；
+- 每次重置时，起点 bin 的分布 = 0.5 × 均匀 + 0.4 × softmax(−25·G / 10) + 0.1 × 历史；G 是该 bin 回报的 EMA，截断到 [0, 10]。
+
+human 运行额外打开两项：
+- `--sampler_cap 50`：softmax 部分里，每个 bin 的份额最多是均匀份额的 50 倍；
+- `--sampler_boot_mean`：片段播完时，用整段平均奖励而不是最后一步的奖励来估后续回报。
+
+不打开这两项时，采样会集中到片段末尾的短 bin 和少数极难的 bin 上，训练曲线 `train/ep_len` 和 `train/ep_return_norm` 就不再反映策略的真实水平。
+
+## 7. 评测
+
+**训练中的评测**（每 2000 轮）：在固定的 512 条片段上，每条从第 0 帧播一遍；用确定性策略，不加噪声和 DR。报告失败数、归一化回报，以及下面这些人体侧误差（只统计未终止的步）：
+- 骨方向角度（度，按组加权平均）：全局 torso / arm / leg，局部 torso / leg / arm；
+- 根速度误差（m/s，目标为 k 缩放后的值）、偏航角速度误差、航向误差（度）、归一化高度误差。
+
+**配对评测**（`scripts/human/eval_paired.py`）：两种参考训练出的检查点，都在同一批片段上，逐帧对人体动作打分。
+- 基线：在重定向片段上运行，用自己的终止判据；同时额外报告 `fail_human`，即按人体判据会判失败的步数占比。
+- 两套片段的时间偏移由 `pairs.tsv` 中的 lag 给出，按"人体帧 = 机器人帧 + lag"对齐。
+- 只在已对齐的片段上汇总；`--subset` 可单列子集，例如歧义子集。
+
+**重定向参考本身**（`scripts/human/score_retarget.py`）：把重定向片段直接按运动学摆出来，不经过策略，用同样的指标对人体打分。这一列代表基线的训练目标离人体有多远。
+
+## 8. 数据、运行与当前结果
+
+**数据。**
+- 配对集 `~/datasets/paired_amass`，本机和服务器 tencent_bj9 路径相同：1881 对片段，共 8.0 h。
+- 已剔除质量报告中标为 horizontal / elevated / low_pelvis 的片段：躺地、离地、骨盆过低，平地上做不了。
+- 其中 1586 条做过时间对齐，对齐方式是对骨盆水平速度做互相关求 lag。
+- 歧义子集 `ambig_top.txt`：204 条，取 `kp_vs_retarget_err_m` 排前 10% 的片段。
+- 基线使用同一批片段的 holosoma 重定向结果 `smplkp_full/g1_amass_retarget_npz`。
+
+**运行**（单卡 RTX PRO 5000，每卡 4096 个 env，H = 48，`--fixes`，`eval+evalcontact` 版 G1，每轮约 0.75 s）：
+- `ab1`：基线（robot）和 human 各一臂。human 那一臂只有局部四肢项，没有采样器修正。
+- `ab2`：human 一臂，打开全局四肢项（手臂 1.0、腿 0.5）和两项采样器修正。正在训练，本文更新时约在第 15500 轮。
+
+**结果**（1586 条对齐片段上的配对评测，单位为度）：
+
+| | 重定向参考本身 | 基线（ab1，第 40k 轮） | human ab1（第 40k 轮） |
+|---|---|---|---|
+| 失败数 | – | 19 | 17 |
+| 全局：躯干 / 手臂 / 腿 | 9.0 / 19.5 / 11.5 | 9.3 / 19.8 / 11.6 | 3.8 / **53.8** / 9.9 |
+| 局部：躯干 / 臂 / 腿 | 15.2 / 17.0 / 14.5 | 15.9 / 17.8 / 15.2 | 3.7 / 6.8 / 7.8 |
+| 根速度误差（m/s） / 航向误差（°） | – / 6.1 | 0.22 / 6.4 | 0.11 / 1.8 |
+
+- 基线几乎完美地跟住了自己的参考，每一项都只比"重定向参考本身"高不到 1°。所以它相对人体动作的误差，基本上就是重定向带来的误差。
+- human ab1 的躯干、腿、根速度和航向都更贴近人体；手臂是那个已知漏洞造成的（§4）。
+- ab2 只有训练中评测（512 条片段）的数字。第 12k / 14k 轮：失败 0 / 0；全局手臂 7.2 / 7.6，全局躯干 3.8 / 3.7，全局腿 7.3 / 7.2。等收敛后再在 1586 条全量上跑配对评测。
+
+## 9. 脚本
+
+| 脚本 | 作用 | 运行环境 |
 |---|---|---|
-| `bone_global_torso` | 躯干组骨（航向系）exp(−‖Δd‖²/σ²) 加权平均 | 1.0 / 0.35 |
-| `bone_local_{torso,leg,arm}` | 各骨在父连杆系 vs 人体父关节系（经标定 Q 映射） | 0.5 / 1.5 / 1.0，σ 0.35 |
-| `root_vel` | 机器人骨盆航向系线速度 vs k·`h_root_vel` | 1.0 / 0.5 |
-| `yaw_rate` | 骨盆 ω_z vs `h_yaw_rate` | 0.5 / 1.0 |
-| `heading` | Δψ（D2） | 0.5 / 0.4（开关 `--w_heading`，0 = RGMT P1 行为） |
-| `height` | 骨盆高 / 机器人静息高 vs `h_height` | 0.5 / 0.1 |
-| `action_rate`、`joint_limit` | 不变 | −0.1、−2.0 |
-| `contact`（可选） | 足踝离地高度的 sigmoid 作为软接触概率，与 `h_contact` 比较；slip = 软接触 × 足水平速度² | 默认关（`--w_contact`） |
+| `scripts/human/prepare_smpl_motion.py` | AMASS 转人体 npz | 需要 smplx（RGMT 的 `noetix_gmt` conda 环境） |
+| `scripts/human/prepare_init_states.py` | 骨方向 IK，生成重置状态 | 本仓库的 venv |
+| `scripts/human/pair_with_retarget.py` | 与重定向片段配对，求 lag，生成歧义子集 | 任意 python3 |
+| `scripts/human/launch_pair.sh` | 两卡 A/B 启动（各跑一臂，配方相同） | 服务器 |
+| `scripts/human/eval_paired.py`、`score_retarget.py` | 配对评测；给重定向参考本身打分 | venv |
+| `scripts/human/play.py` | 回放策略，叠加 SMPL 骨架（`--viewer` 或输出 mp4） | venv |
+| `scripts/human/view_reference.py` | 运动学回放重定向参考和 IK 参考，叠加 SMPL 骨架（还未提交） | venv |
 
-所有项乘 dt（与现在一致）；`reward_max_per_step` 改成"正权重之和 × dt"，由新 heads 提供，看门狗 / 采样器 / 评测归一化自动跟着变。RGMT 的 `undesired_contacts` 不迁移（想象端没有接触）。
-
-**D4 终止：仿真端与想象端同一函数。**
-- 躯干：`pelvis_up` / `torso_up` 两段骨的航向系弦长对应角 > 1.0 rad；
-- 高度：|骨盆高 / 机器人静息高 − `h_height`| > 0.3；
-- 片段结束：`clip_end`（不变，time-out）。
-
-想象端软终止按现有 noisy-OR + sigmoid 温度（沿用 0.05 / 0.02）。仿真端的 mjlab 终止项直接调用同一个 torch 函数（输入机器人 `body_link_pose_w` 中的 bone-map 连杆），保证 `train/term_mismatch` ≈ 0（已有的日志项，可直接当检验）。
-
-**D5 重置：离线骨方向 IK，只用于重置。**
-移植 RGMT 的 `prepare_smpl_init_states.py`：逐帧求骨盆 roll / pitch + 关节角使骨方向贴合人体，航向取人体髋连线，骨盆高度让最低足底落地。重置时根 xy 放在 env 原点（所有奖励都是航向系 / 尺度无关量，xy 无需对齐），根线速度 = k·v_human、角速度 = 人体。IK 姿态不进入输入、奖励、评测。备选（开关）：只从第 0 帧默认站姿开始（最纯粹，但无法中途采样，作对照用）。
-
-**D6 机器人参考路径保持原样（bitwise）。**
-全局开关 `--reference {robot,human}`，默认 `robot`。现有 16 个测试必须在改动后原样通过；另加一个回归测试确认 robot 模式的 goal / reward / termination 与改动前逐位一致。
-
-## 3. 标定资产：可直接复用 RGMT 的 G1 标定
-
-已核对：mjlab 的 G1（`asset_zoo/robots/unitree_g1`）与 RGMT 的 `g1.xml` 在 bone map 涉及的 11 个连杆上零位 FK 的位置与旋转完全一致，关节顺序也一致。所以 `smpl_bone_calib_g1.json`（robot_axes / human_axes / parent_q）可以直接拿来用。只有两项和碰撞几何有关，要用 Supermimic 实际训练的模型（`eval+evalcontact` 变体）重算：`robot_rest_pelvis_height`（足底到骨盆高度）和 IK 重置时的足底高度。
-
-## 4. 代码改动清单
-
-新增 `supermimic/human/`（与机器人参考路径隔离）：
-
-| 文件 | 内容 | 约行数 |
-|---|---|---|
-| `human/bone_map.py` | 移植 `smpl_bone_map.py`（纯 torch）；`BoneMapTensors` 加 TorchFK 连杆下标 | 250（大部分照搬） |
-| `human/calib_g1.json` | RGMT 标定 + 重算的静息高度 / 踝高 | — |
-| `human/heads.py` | `HumanHeads`：与 `AnalyticHeads` 同接口（`kin / proprio / goal / reward / termination / state_features / goal_layout / reward_max_per_step`），`proprio` 直接复用 | 300 |
-| `human/command.py` | `HumanMotionCommand`（mjlab `CommandTerm`）：当前帧缓存、IK 重置、clip_end；回报采样复用 `LibraryMotionCommand` 的采样代码（先把采样部分抽成 mixin，robot 路径行为不变） | 200 |
-| `human/terms.py` | 仿真端终止项（调用 `HumanHeads` 的同一函数） | 50 |
-
-修改：
-
-| 文件 | 改动 |
-|---|---|
-| `motions.py` | 字段表参数化：`FIELD_DTYPES / NPZ_KEYS` → 由调用方传入 schema；人体 schema 不做关节 / 刚体名映射，缓存键包含 schema 名 |
-| `fns.py` | 6 个参考张量（`p_q … p_bav`）→ 一个参考 dict；`goal_from_pack / _imagine_step / _post / _act` 改签名，由 heads 声明自己需要的字段（`heads.ref_fields`） |
-| `trainer.py` | `update_policy` 的 pack 用 `heads.ref_fields`；`collect_step` 走 dict；`root_ori` / `ee` / `FailureWatch` 在 human 模式关闭；`_graft_inputs / _calibrate_goal_norm` 在 human 模式不适用（报错而不是静默） |
-| `sim_interface.py` | `goal_refs / current_ref` 返回 dict；human 模式建 `HumanHeads`、FK 的 needed_bodies = bone-map 连杆 |
-| `env_cfg.py` | `make_env_cfg(reference="human")`：换 command、去掉 mjlab 跟踪奖励（训练器不用）、换终止项 |
-| `evaluate.py` | human 指标：失败数、归一化回报、骨方向误差（全局躯干 / 局部腿 / 局部臂，度）、根速度误差、高度误差、航向误差 |
-| `scripts/train.py` | `--reference human`、`--human_*` 奖励 / 终止开关；cfg 写进 ckpt，`_resume_diffs` 报告 |
-
-新增脚本（离线，跑在 `noetix_gmt` conda 环境，或给 venv 装 `smplx`）：
-
-| 脚本 | 内容 |
-|---|---|
-| `scripts/human/prepare_smpl_motion.py` | AMASS → 人体 npz（移植 RGMT，加上 D1 的预计算字段） |
-| `scripts/human/prepare_init_states.py` | 骨方向 IK 重置状态（移植，改用 mjlab G1 模型） |
-| `scripts/human/pair_with_retarget.py` | 人体 npz 与 `g1_amass_retarget_npz` 逐帧对齐（见 §5），输出配对清单 |
-| `scripts/human/eval_human_metrics.py` | 对任一策略（robot 或 human 模式训练的）在配对片段上算人体侧指标，用于公平对比 |
-
-合计新增 / 修改约 1000 行。
-
-测试（`tests/`，CPU）：bone map 在 T-pose 上误差为 0；`HumanHeads` 的奖励 / 终止对 s 的梯度有限（含 θ=0、躺倒、髋连线竖直等边界）；仿真端终止项与想象端硬终止逐位一致；robot 模式回归（D6）。
-
-## 5. 数据
-
-- 人体：`~/AMASS`（ACCAD / CMU / SFU，2402 条 stageii），SMPL-X 模型 `~/models/smplx_v1_1`。
-- 配对的重定向数据（基线用）：`~/datasets/smplkp_full/g1_amass_retarget_npz`（2264 条，50 Hz，G1 37 刚体）。
-- 歧义子集（实施时修正）：质量报告里的 `kp_vs_rt` 标记几乎都和 `horizontal / elevated / low_pelvis` 同时出现，这些片段平地上做不了，两臂都剔除，所以这个标记用不上。改用连续列 `kp_vs_retarget_err_m`：配对片段里排前 10% 的作为歧义子集（`ambig_top.txt`）。
-- 对齐（实施时修正）：重定向管线是"源 → 30 Hz → 重定向 → 50 Hz 插值"，人体 npz 是"源 → 50 Hz"，抽样里约一半片段相差 1–4 帧。训练不受影响，因为各臂只用自己的数据。`pair_with_retarget.py` 用骨盆水平速度的互相关求偏移，写进 `pairs.tsv`，`eval_paired.py` 按"人体帧 = 机器人帧 + lag"对齐。相关 < 0.8 的片段（多是手势 / 站姿这类几乎不走动的片段，速度信号只是噪声）照样进训练，但标为未对齐，配对评测只在已对齐的片段上打分。全量结果：1881 对（8.0 h），1586 条已对齐，歧义子集 204 条。
-- 先用 RGMT 已有的 15 条 pilot（`~/datasets/smpl_motion_pilot_50hz`，已含 IK 重置状态）打通流程。
-
-## 6. 里程碑
-
-| 阶段 | 内容 | 验收 |
-|---|---|---|
-| M0 | 管线重构：参考 dict、motions schema、采样 mixin（仍只有 robot 模式） | 16 个旧测试 + robot 回归测试通过；LAFAN1 短训练（2k 轮）曲线与 main 一致 |
-| M1 | `human/` 模块 + 离线脚本 + 单元测试 | T-pose 误差 0；梯度测试通过 |
-| M2 | 15 条 pilot 上训练 human 模式 | `term_mismatch` ≈ 0；想象奖励与真实奖励同量级；能稳定站立并跟上走路类片段；肉眼回放动作像人体参考 |
-| M3 | 全量配对数据：基线（robot 模式，重定向参考）vs human 模式，同片段、同轮数、同 H / 网络 | 两者都用 `eval_human_metrics.py` 评：失败率、骨方向误差、根速度误差；单列 `kp_vs_rt` 歧义子集 |
-| M4（可选） | 消融：去掉相对航向 goal / 去掉 heading 奖励 / 开接触近似 / 第 0 帧重置 | 看各项对失败率与骨误差的影响 |
-
-M0 是纯重构，可先合入 dev_gjh 并单独验收；M1 与 M0 互不依赖，可以并行写。
-
-## 7. 主要风险
-
-- **航向漂移**：RGMT P1 不奖励绝对航向，只奖励 yaw rate。Supermimic 想象 H=48 步，航向误差会在 rollout 内累积。D2 / D3 的航向项默认打开，消融时再关。
-- **骨方向奖励的梯度质量**：弦长形式可微，但躺倒 / 倒立时髋连线接近竖直，航向帧会退化。航向帧加 eps，并在梯度测试里覆盖这种情况。
-- **奖励尺度**：项数和权重都与 BeyondMimic 不同。看门狗按 `reward_max_per_step` 归一化，阈值（`wd_drop` 0.2）可能要重调。先用 bj27 单卡那套风格（`--wd_sustain 200 --wd_warmup 1500 --wd_signal imagined_reward_robust`）避免误回滚。
-- **IK 重置质量**：IK 误差大的帧（RGMT 有 `init_g1_ik_err_deg`）可能导致重置后立刻摔倒，拖累采样器。重置时跳过误差超过阈值的帧（`bin` 级屏蔽）。
-- **基线对比的公平性**：基线的奖励目标是重定向结果，用人体侧指标评它，对它略不利；所以 M3 同时报告机器人侧 MPJPE（只对基线有意义）作参考，结论以失败率 + 歧义子集为主。
+单测：`tests/test_human_heads.py`。覆盖 IK 姿态下的标定一致性，以及在完全贴合、侧躺、倒立几种状态下梯度是否有限。
